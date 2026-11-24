@@ -454,6 +454,24 @@ fn reads_mask_as_data(st: &Structured, i: &Inst) -> bool {
     })
 }
 
+/// Whether only the SCC of `inst` is read, not its SGPR result.
+fn only_scc_read(p: &Program, inst: &Inst) -> bool {
+    let out: Vec<Value> = inst
+        .writes
+        .iter()
+        .filter(|w| matches!(w.0, Reg::S(_)))
+        .map(|w| w.1)
+        .collect();
+    !p.blocks.iter().any(|b| {
+        b.phis
+            .iter()
+            .any(|f| f.args.iter().any(|a| out.contains(a)))
+            || b.insts
+                .iter()
+                .any(|i| i.reads.iter().any(|r| out.contains(&r.1)))
+    })
+}
+
 /// Where half `h` (dword h / 2, the high half when odd) of a parameter
 /// packing 16-bit rows `a` and `b` two per dword comes from: a row and
 /// channel of `elements`, none for padding. Channel c of `a` is half c;
@@ -2757,7 +2775,10 @@ impl<'a> Lower<'a> {
                         "s_cmp_eq_u32" | "s_cmp_lg_u32" | "s_cmp_eq_u64" | "s_cmp_lg_u64"
                     )
             }
-            MaskData::None => false,
+            // Whether a mask has a lane (WaveActiveAnyTrue, AllEqual): the
+            // same over the host's wave, as the first lane read is the
+            // host's. Not the count, which is the console wave's.
+            MaskData::None => name.starts_with("s_bcnt1_i32_") && only_scc_read(self.x.p, inst),
         };
         let effect = matches!(inst.fields, Fields::Exp { .. })
             || matches!(inst.fields, Fields::Flat { .. }) && !name.starts_with("global_load_")
