@@ -1759,8 +1759,9 @@ fn host_texture(
         d.format = family(d.format);
     }
     // The clear value names the format too: format, then color or depth
-    // and stencil (5 words).
-    let clear_value = (!clear.is_null()).then(|| {
+    // and stencil (5 words). The host refuses one for a texture that is
+    // neither a render target nor a depth target (port of PR #1040).
+    let clear_value = (!clear.is_null() && d.flags & (TARGET | DEPTH) != 0).then(|| {
         // SAFETY: the title passes a whole clear value.
         let mut value = unsafe { clear.cast::<[u32; 5]>().read_unaligned() };
         value[0] = pc_format(value[0]);
@@ -2345,6 +2346,31 @@ static RESOURCE_FUNCTIONS: Table<32> = {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A clear value given for a texture that is neither a render target
+    /// nor a depth target is left out: the host would refuse the texture.
+    #[cfg(windows)]
+    #[test]
+    fn a_clear_value_for_an_unordered_only_texture_is_left_out() {
+        if crate::host::host().is_none() {
+            return; // no host GPU here
+        }
+        let desc = ResourceDesc {
+            dimension: 3, // 2D
+            alignment: 0,
+            width: 64,
+            height: 64,
+            depth_or_array_size: 1,
+            mip_levels: 1,
+            format: 28,
+            sample_count: 1,
+            sample_quality: 0,
+            layout: 0,
+            flags: 4, // unordered access only
+        };
+        let clear = [28u32, 0, 0, 0, 0];
+        assert!(host_texture(&desc, 0, clear.as_ptr().cast()).is_some());
+    }
     use crate::object::slot;
 
     #[test]
