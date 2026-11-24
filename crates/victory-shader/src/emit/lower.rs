@@ -8827,6 +8827,75 @@ mod tests {
         })
     }
 
+    /// The modes of the `barrier` calls of a compute program of 64 threads
+    /// whose v0 is the thread's id, lowered per lane or in the console flow.
+    fn barrier_modes(words: &[u32], console_cf: bool) -> Vec<Option<i64>> {
+        const BARRIER: u32 = 80;
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: console_cf,
+            vgprs: 256,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 1 << 11, // one component of the thread id, in v0
+                threads: [64, 1, 1],
+            }),
+            code,
+        };
+        let p = ir::build(&native.code, native.wave64, 256).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        lower(&Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: vec![],
+            outputs: vec![],
+            prims: vec![],
+            mesh_stride: 0,
+            target: super::super::Target::ANY,
+            console_cf,
+            per_lane_only: false,
+        })
+        .unwrap_or_else(|e| panic!("{e}"));
+        super::super::shader::last_calls()
+            .into_iter()
+            .filter(|c| c.0 == BARRIER)
+            .map(|c| c.1)
+            .collect()
+    }
+
+    /// A barrier only some lanes reach (it sits under a branch on the
+    /// thread's id): per lane, the lanes that skip the block never arrive
+    /// at a thread-group sync the others wait in, so the sync bit (1) is
+    /// left out and the shared-memory fence (8) stays. A barrier every lane
+    /// reaches keeps the sync, and so does the console flow, where the
+    /// lanes of a wave come to every block together.
+    #[test]
+    fn a_barrier_only_some_lanes_reach_is_a_fence_without_the_group_sync() {
+        let under_a_lane_branch = [
+            0x7D84_0080, // v_cmp_eq_u32 vcc, 0, v0
+            0xBE80_3C6A, // s_and_saveexec_b32 s0, vcc_lo
+            0xBF88_0002, // s_cbranch_execz -> the s_or
+            0xBF8A_0000, // s_barrier
+            0x7E02_0280, // v_mov_b32 v1, 0
+            0x887E_007E, // s_or_b32 exec_lo, exec_lo, s0
+            S_ENDPGM,
+        ];
+        assert_eq!(barrier_modes(&under_a_lane_branch, false), [Some(8)]);
+        let every_lane = [
+            0xBF8A_0000, // s_barrier
+            0x7E02_0280, // v_mov_b32 v1, 0
+            S_ENDPGM,
+        ];
+        assert_eq!(barrier_modes(&every_lane, false), [Some(9)]);
+    }
+
     /// Lowers a compute program of constants: whether it translates.
     fn lowers(words: &[u32]) -> Result<(), crate::ShaderError> {
         lower_words(words).map(|_| ())
