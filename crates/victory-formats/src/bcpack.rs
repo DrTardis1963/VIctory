@@ -119,9 +119,38 @@ impl Reader<'_> {
 }
 
 impl Tables {
-    /// The tables VIctory ships with.
+    /// Reads BCPack tables from `path`.
+    pub fn from_file(path: &std::path::Path) -> Result<Tables, Error> {
+        let bytes = std::fs::read(path).map_err(|_| Error("cannot read BCPack tables file"))?;
+        Tables::parse(&bytes)
+    }
+
+    /// Reads BCPack tables from `VICTORY_BCPACK_TABLES`, if set and non-empty.
+    pub fn from_env() -> Result<Option<Tables>, Error> {
+        match std::env::var_os("VICTORY_BCPACK_TABLES") {
+            Some(path) if !path.is_empty() => {
+                Tables::from_file(std::path::Path::new(&path)).map(Some)
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// The tables VIctory uses by default (`VICTORY_BCPACK_TABLES` if set,
+    /// otherwise the built-in tables when compiled with `builtin-bcpack-tables`).
     pub fn builtin() -> Result<Tables, Error> {
-        Tables::parse(include_bytes!("bcpack-tables.bin"))
+        if let Some(tables) = Tables::from_env()? {
+            return Ok(tables);
+        }
+        #[cfg(feature = "builtin-bcpack-tables")]
+        {
+            Tables::parse(include_bytes!("bcpack-tables.bin"))
+        }
+        #[cfg(not(feature = "builtin-bcpack-tables"))]
+        {
+            Err(Error(
+                "built without built-in BCPack tables; set VICTORY_BCPACK_TABLES",
+            ))
+        }
     }
 
     /// Reads the table file: 128 x 9 u16 model frequencies (per bucket, the
@@ -1160,9 +1189,33 @@ fn bc6<'a>(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "builtin-bcpack-tables")]
     #[test]
     fn the_shipped_tables_parse() {
         assert!(super::Tables::builtin().is_ok());
+    }
+
+    #[cfg(not(feature = "builtin-bcpack-tables"))]
+    #[test]
+    fn builtin_without_feature_requires_env_tables() {
+        if std::env::var_os("VICTORY_BCPACK_TABLES").is_none() {
+            assert!(super::Tables::builtin().is_err());
+        }
+    }
+
+    #[test]
+    fn loads_tables_from_file_and_rejects_invalid_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let valid = dir.path().join("tables.bin");
+        std::fs::write(&valid, tables()).unwrap();
+        assert!(super::Tables::from_file(&valid).is_ok());
+
+        let missing = dir.path().join("missing.bin");
+        assert!(super::Tables::from_file(&missing).is_err());
+
+        let truncated = dir.path().join("truncated.bin");
+        std::fs::write(&truncated, [0u8; 32]).unwrap();
+        assert!(super::Tables::from_file(&truncated).is_err());
     }
 
     use super::*;
@@ -1402,11 +1455,13 @@ mod tests {
                 narrow[(m * BUCKETS + b) * 2..][..2].copy_from_slice(&(f as u16).to_le_bytes());
             }
         }
-        for t in [
-            Tables::builtin().unwrap(),
+        let cases = [
             Tables::parse(&tables()).unwrap(),
             Tables::parse(&narrow).unwrap(),
-        ] {
+        ]
+        .into_iter()
+        .chain(cfg!(feature = "builtin-bcpack-tables").then(|| Tables::builtin().unwrap()));
+        for t in cases {
             for model in 0..MODELS as u8 {
                 let start = &t.start[usize::from(model)];
                 for slot in 0..1u32 << 16 {
@@ -1452,10 +1507,9 @@ mod tests {
     /// every model and slot of the shipped tables and ours, at assorted states.
     #[test]
     fn payload_step_matches_the_reference_decode() {
-        for t in [
-            Tables::builtin().unwrap(),
-            Tables::parse(&tables()).unwrap(),
-        ] {
+        let cases = std::iter::once(Tables::parse(&tables()).unwrap())
+            .chain(cfg!(feature = "builtin-bcpack-tables").then(|| Tables::builtin().unwrap()));
+        for t in cases {
             for model in 0..MODELS as u8 {
                 for high in [0x100u32, 0x1234, 0xffff] {
                     for slot in 0..1u32 << 16 {

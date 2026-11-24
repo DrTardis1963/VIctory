@@ -7,5 +7,12 @@ rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 
+[features]
+default = ["builtin-bcpack-tables"]
+builtin-bcpack-tables = []
+
+[dev-dependencies]
+tempfile.workspace = true
+
 [lints]
 workspace = true
