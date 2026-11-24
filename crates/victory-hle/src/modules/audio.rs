@@ -157,7 +157,7 @@ pub extern "system" fn ApuMapApuAddress(apu: u32) -> *mut c_void {
 fn heap_map(ptr: usize) -> u32 {
     let heap = lock(&HEAP);
     match heap.blocks.range(..=ptr).next_back() {
-        Some((&start, block)) if ptr < start + block.size.max(1) => {
+        Some((&start, block)) if ptr < start.saturating_add(block.size.max(1)) => {
             block.apu + (ptr - start) as u32
         }
         _ => 0,
@@ -179,7 +179,9 @@ fn heap_bytes<'a>(apu: u32, len: usize) -> Option<&'a mut [u8]> {
     let heap = lock(&HEAP);
     let (&start, &host) = heap.by_apu.range(..=apu).next_back()?;
     let offset = (apu - start) as usize;
-    (offset + len <= heap.blocks[&host].size)
+    offset
+        .checked_add(len)
+        .is_some_and(|end| end <= heap.blocks[&host].size)
         // SAFETY: inside a live heap block, which the title and the audio
         // hardware share like on the console.
         .then(|| unsafe { std::slice::from_raw_parts_mut((host + offset) as *mut u8, len) })
@@ -1163,5 +1165,22 @@ mod tests {
         assert_eq!((m.message_count)(acp), 1, "disconnected");
         (m.release)(acp);
         assert_eq!(AcpHalReleaseShapeContexts(), S_OK);
+    }
+
+    #[test]
+    fn heap_bytes_rejects_overflowing_length() {
+        struct Guard(*mut u8);
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                heap_free(self.0);
+            }
+        }
+
+        let (ptr, apu) = heap_alloc(64, 16).unwrap();
+        let _guard = Guard(ptr);
+        assert!(heap_bytes(apu + 16, 48).is_some());
+        assert!(heap_bytes(apu + 16, 49).is_none());
+        assert!(heap_bytes(apu + 16, usize::MAX).is_none());
+        assert!(heap_bytes(apu + 16, usize::MAX - 15).is_none());
     }
 }
