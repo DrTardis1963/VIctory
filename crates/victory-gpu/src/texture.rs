@@ -68,6 +68,20 @@ struct Last {
     hash: Option<blake3::Hash>,
     asked: u64,
     read: Vec<u8>,
+    /// Hashed memory: the presented frame and runtime-write count it was
+    /// last read at ([`refresh_now`] reads it again only when one moved).
+    ///
+    /// [`refresh_now`]: Staging::refresh_now
+    checked: Option<(u64, u64)>,
+}
+
+/// Title memory writes the runtime made at submission (title copies), after
+/// which hashed textures are read again within the frame.
+static RUNTIME_WRITES: AtomicU64 = AtomicU64::new(0);
+
+/// The runtime is about to write title memory (a title copy at submission).
+pub(crate) fn runtime_writes_title() {
+    RUNTIME_WRITES.fetch_add(1, Relaxed);
 }
 
 // SAFETY: the staging mapping is written only at submission, under
@@ -243,6 +257,19 @@ impl Staging {
             );
             return 0;
         }
+        // Hashing reads the whole texture: once per presented frame (a
+        // world frame spans ~17 submissions that each checked it), unless the
+        // runtime wrote title memory since.
+        // shortcut: a title CPU write into a hashed texture between two
+        // submissions of one frame shows from the next frame; if a frame
+        // draws such a texture stale, key this on the submission instead.
+        let now = (crate::queue::presented(), RUNTIME_WRITES.load(Relaxed));
+        if last.hash.is_some() && last.checked == Some(now) {
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::TexFrameSkips, 1);
+            return 0;
+        }
+        last.checked = Some(now);
         // Read through the kernel, as above: the title may unmap the pages
         // (evicting a texture a big table lists) while we read them, and a
         // direct read would fault. The copy is reused, not kept per texture.

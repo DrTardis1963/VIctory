@@ -35,13 +35,69 @@ struct Journal {
     written: BTreeMap<usize, u64>,
     /// Room for the kernel's answer.
     found: Vec<usize>,
+    /// Page runs (first → end) already asked in this submission.
+    round: BTreeMap<usize, usize>,
 }
 
 static JOURNAL: Mutex<Journal> = Mutex::new(Journal {
     asked: 0,
     written: BTreeMap::new(),
     found: Vec::new(),
+    round: BTreeMap::new(),
 });
+
+/// A submission's preparation begins: [`writes_once`] asks the kernel again.
+pub(crate) fn new_round() {
+    JOURNAL.lock().unwrap_or_else(|e| e.into_inner()).round.clear();
+}
+
+/// Whether pages `first..last` are all in `runs` (disjoint, merged).
+fn covered(runs: &BTreeMap<usize, usize>, first: usize, last: usize) -> bool {
+    runs.range(..=first)
+        .next_back()
+        .is_some_and(|(_, &end)| end >= last)
+}
+
+/// Adds pages `first..last` to `runs`, merging the runs it touches.
+fn cover(runs: &mut BTreeMap<usize, usize>, mut first: usize, mut last: usize) {
+    if let Some((&a, &e)) = runs.range(..=first).next_back()
+        && e >= first
+    {
+        first = a;
+        last = last.max(e);
+    }
+    let touched: Vec<usize> = runs.range(first..=last).map(|(&a, _)| a).collect();
+    for a in touched {
+        last = last.max(runs.remove(&a).unwrap_or(last));
+    }
+    runs.insert(first, last);
+}
+
+/// [`writes`], but pages this submission already asked about are answered
+/// from the journal: a world submission refreshes the same buffers from
+/// many lists and bindless heaps, and each kernel asking walks its pages.
+/// A write between two askings of one submission shows at the next.
+pub(crate) fn writes_once(
+    start: usize,
+    end: usize,
+    guarded: bool,
+) -> Option<(u64, Vec<(usize, u64)>)> {
+    let (first, last) = (start / PAGE, end.div_ceil(PAGE));
+    {
+        let j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+        if first < last && covered(&j.round, first, last) {
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::WatchSaved, 1);
+            return Some((
+                j.asked,
+                j.written.range(first..last).map(|(&p, &w)| (p, w)).collect(),
+            ));
+        }
+    }
+    let answer = writes(start, end, guarded)?;
+    cover(&mut JOURNAL.lock().unwrap_or_else(|e| e.into_inner()).round, first, last);
+    Some(answer)
+}
 
 /// The pages of `[start, end)` (whole pages) as last written, for pages
 /// written since tracking began: `(page number, asking)` in page order, and

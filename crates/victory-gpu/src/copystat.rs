@@ -80,8 +80,12 @@ pub(crate) enum C {
     WatchKernelUs,
     WatchGuardUs,
     WatchPages,
+    /// Hashed texture checks skipped: already read this frame.
+    TexFrameSkips,
+    /// Write-watch askings answered from this submission's earlier ones.
+    WatchSaved,
 }
-const COUNTERS: usize = 47;
+const COUNTERS: usize = 49;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -204,10 +208,14 @@ pub(crate) fn log(frames: f64) {
         ms(c[C::PlanFindUs as usize]),
     );
     tracing::info!(
-        "write watch per frame: kernel {:.1} ms, view guards {:.1} ms, {:.0} pages asked",
+        "write watch per frame: kernel {:.1} ms, view guards {:.1} ms, {:.0} pages asked, \
+         {:.0} askings answered from the submission's; {:.0} hashed texture checks skipped \
+         (read this frame)",
         ms(c[C::WatchKernelUs as usize]),
         ms(c[C::WatchGuardUs as usize]),
         c[C::WatchPages as usize],
+        c[C::WatchSaved as usize],
+        c[C::TexFrameSkips as usize],
     );
     tracing::info!(
         "texture uploads per frame: {:.0} copied {:.1} MB, {:.0} skipped unchanged {:.1} MB",

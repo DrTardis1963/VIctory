@@ -1042,6 +1042,7 @@ impl Host {
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        crate::watch::new_round();
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::Submissions, 1);
 
@@ -2576,6 +2577,7 @@ impl Batch {
     fn title_written(&mut self) {
         self.flush();
         self.textures.clear();
+        crate::texture::runtime_writes_title();
     }
 
     fn flush(&mut self) {
