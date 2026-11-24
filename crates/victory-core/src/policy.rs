@@ -6,6 +6,7 @@
 //! [`ensure_outside_repo`] on the destination first. The static half of the
 //! rule is `cargo xtask policy`, which checks what git tracks.
 
+use std::ffi::OsString;
 use std::path::{Component, Path, PathBuf};
 
 /// Marker file at the root of the source tree.
@@ -62,6 +63,11 @@ pub fn ensure_outside_repo(path: &Path) -> Result<(), PolicyError> {
     Ok(())
 }
 
+enum Tail {
+    Normal(OsString),
+    Parent,
+}
+
 /// Canonicalizes the longest existing prefix of `path` and re-appends the
 /// rest, so that paths which do not exist yet can still be compared.
 fn resolve(path: &Path) -> Result<PathBuf, PolicyError> {
@@ -76,46 +82,61 @@ fn resolve(path: &Path) -> Result<PathBuf, PolicyError> {
             .join(path)
     };
 
-    let mut existing = absolute.as_path();
-    let mut rest = Vec::new();
-    loop {
-        match std::fs::canonicalize(existing) {
-            Ok(canon) => {
-                let mut out = canon;
-                for component in rest.iter().rev() {
-                    out.push(component);
-                }
-                return Ok(normalize(&out));
-            }
-            Err(source) => match (existing.parent(), existing.file_name()) {
-                (Some(parent), Some(name)) => {
-                    rest.push(name.to_os_string());
-                    existing = parent;
-                }
-                _ => {
-                    return Err(PolicyError::Io {
-                        path: path.to_path_buf(),
-                        source,
-                    });
-                }
-            },
-        }
-    }
+    let (resolved, saw_parent) = canonicalize_prefix(path, &absolute)?;
+    // Collapsing `..` past missing segments can reveal an existing folder or
+    // reparse point with a different canonical path or Windows casing.
+    let resolved = if saw_parent {
+        canonicalize_prefix(path, &resolved)?.0
+    } else {
+        resolved
+    };
+    Ok(resolved)
 }
 
-/// Removes `.` and resolves `..` lexically (only used on the non-existing tail).
-fn normalize(path: &Path) -> PathBuf {
-    let mut out = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                out.pop();
+fn canonicalize_prefix(original: &Path, path: &Path) -> Result<(PathBuf, bool), PolicyError> {
+    let mut existing = path;
+    let mut rest: Vec<Tail> = Vec::new();
+    let mut saw_parent = false;
+    loop {
+        match std::fs::canonicalize(existing) {
+            Ok(mut out) => {
+                for segment in rest.iter().rev() {
+                    match segment {
+                        Tail::Normal(name) => out.push(name),
+                        Tail::Parent => {
+                            if matches!(out.components().next_back(), Some(Component::Normal(_))) {
+                                out.pop();
+                            }
+                        }
+                    }
+                }
+                return Ok((out, saw_parent));
             }
-            c => out.push(c),
+            Err(source) => {
+                let mut comps = existing.components();
+                match comps.next_back() {
+                    Some(Component::Normal(name)) => {
+                        rest.push(Tail::Normal(name.to_os_string()));
+                        existing = comps.as_path();
+                    }
+                    Some(Component::ParentDir) => {
+                        saw_parent = true;
+                        rest.push(Tail::Parent);
+                        existing = comps.as_path();
+                    }
+                    Some(Component::CurDir) => {
+                        existing = comps.as_path();
+                    }
+                    Some(Component::RootDir | Component::Prefix(_)) | None => {
+                        return Err(PolicyError::Io {
+                            path: original.to_path_buf(),
+                            source,
+                        });
+                    }
+                }
+            }
         }
     }
-    out
 }
 
 #[cfg(test)]
@@ -155,5 +176,86 @@ mod tests {
     fn accepts_unrelated_directories() {
         let tmp = tempfile::tempdir().unwrap();
         ensure_outside_repo(&tmp.path().join("does").join("not").join("exist")).unwrap();
+    }
+
+    #[test]
+    fn accepts_nonexistent_parent_traversal_outside_repo() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("missing1").join("missing2").join("..").join("out");
+        ensure_outside_repo(&path).unwrap();
+    }
+
+    #[test]
+    fn rejects_nonexistent_parent_traversal_inside_repo() {
+        let root = compiled_workspace_root();
+        assert!(matches!(
+            ensure_outside_repo(&root.join("missing1").join("missing2").join("..")),
+            Err(PolicyError::InsideRepo { .. })
+        ));
+        assert!(matches!(
+            ensure_outside_repo(
+                &root.join("missing1").join("missing2").join("..").join("cache")
+            ),
+            Err(PolicyError::InsideRepo { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_traversal_into_other_clone_past_missing_dirs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let clone = tmp.path().join("clone");
+        std::fs::create_dir_all(&clone).unwrap();
+        std::fs::write(clone.join(ROOT_MARKER), "").unwrap();
+        let path = clone
+            .join("missing1")
+            .join("missing2")
+            .join("..")
+            .join("cache");
+        assert!(matches!(
+            ensure_outside_repo(&path),
+            Err(PolicyError::InsideRepo { .. })
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn recanonicalizes_existing_dir_revealed_after_parent_traversal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let clone = tmp.path().join("MixedCaseClone");
+        let work = tmp.path().join("work");
+        std::fs::create_dir_all(&clone).unwrap();
+        std::fs::create_dir_all(&work).unwrap();
+        std::fs::write(clone.join(ROOT_MARKER), "").unwrap();
+        let path = work
+            .join("missing1")
+            .join("missing2")
+            .join("..")
+            .join("..")
+            .join("..")
+            .join("mixedcaseclone")
+            .join("missing3")
+            .join("missing4")
+            .join("..")
+            .join("cache");
+        assert!(
+            resolve(&path)
+                .unwrap()
+                .starts_with(std::fs::canonicalize(&clone).unwrap())
+        );
+        assert!(matches!(
+            ensure_outside_repo(&path),
+            Err(PolicyError::InsideRepo { .. })
+        ));
+    }
+
+    #[test]
+    fn excess_parent_dirs_clamp_at_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut path = tmp.path().join("missing1").join("missing2");
+        for _ in 0..32 {
+            path.push("..");
+        }
+        path.push("out");
+        assert!(resolve(&path).is_ok());
     }
 }
