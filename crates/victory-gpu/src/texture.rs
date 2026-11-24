@@ -590,12 +590,17 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
     use std::sync::atomic::Ordering::Relaxed;
     staging.used.store(crate::host::moment(), Relaxed);
     // The host texture has the staging buffer's contents: only the check
-    // at submission is left, and what it finds changed the next list that
-    // samples the texture uploads (a frame late where every list of the
-    // frame was recorded before that check).
+    // at submission is left, and what it finds changed the list's prelude
+    // copies in, just before the list runs. (The next list that sampled
+    // the texture uploaded it instead: a frame late, and with the boot
+    // video's ring of frame textures an older frame shown after a newer
+    // one, each texture of the ring a turn behind.)
     if staging.uploaded.load(Relaxed) && !staging.dirty.load(Relaxed) {
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexSkipped, 1);
+        if let Some(copy) = crate::resource::host_copy(resource) {
+            list.defer_upload(staging.clone(), copy);
+        }
         list.defer_texture(staging);
         return;
     }
@@ -633,24 +638,9 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
                 (gpu + footprint.Offset, len),
             );
         }
-        let to = D3D12_TEXTURE_COPY_LOCATION {
-            // SAFETY: a borrowed pointer the location never releases.
-            pResource: unsafe { std::mem::transmute_copy(texture) },
-            Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
-            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-                SubresourceIndex: i as u32,
-            },
-        };
-        let from = D3D12_TEXTURE_COPY_LOCATION {
-            // SAFETY: as above.
-            pResource: unsafe { std::mem::transmute_copy(&staging.buffer) },
-            Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
-            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-                PlacedFootprint: *footprint,
-            },
-        };
-        // SAFETY: an open list; both locations name live resources.
-        unsafe { list.list.CopyTextureRegion(&to, 0, 0, 0, &from, None) };
+        #[cfg(not(feature = "diagnostics"))]
+        let _ = footprint;
+        staging.record_copy_of(&list.list, texture, i);
     }
     // When the list is submitted, its copy takes what the staging buffer
     // holds by then: noted before the check below, which sets `dirty`
@@ -667,6 +657,45 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
 }
 
 impl Staging {
+    /// Records the copy of the staging buffer into `texture`, its host
+    /// copy, which is in the copy destination state.
+    pub(crate) fn record_copy(&self, list: &ID3D12GraphicsCommandList, texture: &ID3D12Resource) {
+        for i in 0..self.footprints.len() {
+            self.record_copy_of(list, texture, i);
+        }
+    }
+
+    /// As [`Staging::record_copy`], for subresource `i`.
+    fn record_copy_of(&self, list: &ID3D12GraphicsCommandList, texture: &ID3D12Resource, i: usize) {
+        let to = D3D12_TEXTURE_COPY_LOCATION {
+            // SAFETY: a borrowed pointer the location never releases.
+            pResource: unsafe { std::mem::transmute_copy(texture) },
+            Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                SubresourceIndex: i as u32,
+            },
+        };
+        let from = D3D12_TEXTURE_COPY_LOCATION {
+            // SAFETY: as above.
+            pResource: unsafe { std::mem::transmute_copy(&self.buffer) },
+            Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                PlacedFootprint: self.footprints[i],
+            },
+        };
+        // SAFETY: an open list; both locations name live resources.
+        unsafe { list.CopyTextureRegion(&to, 0, 0, 0, &from, None) };
+    }
+
+    /// At submission, after the check ([`Staging::refresh`]): takes the
+    /// note that the staging buffer was detiled since a list last uploaded
+    /// it, for a prelude that uploads it now, in queue order. `false` if
+    /// nothing changed since.
+    pub(crate) fn take_change(&self) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.uploaded.load(Relaxed) && self.dirty.swap(false, Relaxed)
+    }
+
     /// The title memory the texture is read from: address and bytes.
     pub(crate) fn memory(&self) -> (usize, usize) {
         (self.memory as usize, self.layout.size as usize)

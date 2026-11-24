@@ -1732,6 +1732,10 @@ struct Deferred {
     backs: Vec<(ID3D12Resource, usize, [usize; 3])>,
     /// Whether a step zeroes the indirect-work budget.
     budget_zeroed: bool,
+    /// Textures the list samples without recording their upload (their
+    /// host copies held what their staging buffers held): what the check
+    /// at submission finds changed, the prelude uploads.
+    late_uploads: Vec<(std::sync::Arc<crate::texture::Staging>, std::sync::Arc<crate::resource::HostTexture>)>,
 }
 
 impl Deferred {
@@ -4903,6 +4907,16 @@ impl HostList {
         const COPY_DEST: u32 = 0x400;
         const COPY_SOURCE: u32 = 0x800;
         let host_state = |state: u32| D3D12_RESOURCE_STATES(state as i32);
+        // Textures the list samples whose staging buffers the check at
+        // submission (run just before) found changed: uploaded here, in the
+        // queue's order, so the list samples what the title wrote.
+        let uploads: Vec<_> = self
+            .deferred()
+            .late_uploads
+            .iter()
+            .filter(|(staging, _)| staging.take_change())
+            .cloned()
+            .collect();
         let states = self.states.lock().unwrap_or_else(|e| e.into_inner());
         // The copies (depth texture, twin, whether into the twin); the
         // sides are then as this list leaves them.
@@ -4928,29 +4942,33 @@ impl HostList {
         let mut to_copy = Vec::new();
         let mut barriers = Vec::new();
         let mut copying = std::collections::HashMap::new();
-        for (depth, twin, colour) in &syncs {
-            let (from, to) = if *colour {
-                (depth, &twin.colour)
-            } else {
-                (&twin.colour, depth)
-            };
-            for (texture, state) in [(from, COPY_SOURCE), (to, COPY_DEST)] {
-                let key = std::sync::Arc::as_ptr(texture) as usize;
-                let real = texture.state.load(Ordering::Relaxed);
-                copying.insert(key, state);
-                if real != state {
-                    to_copy.push(transition(
+        let moves = syncs
+            .iter()
+            .flat_map(|(depth, twin, colour)| {
+                let (from, to) = if *colour {
+                    (depth, &twin.colour)
+                } else {
+                    (&twin.colour, depth)
+                };
+                [(from, COPY_SOURCE), (to, COPY_DEST)]
+            })
+            .chain(uploads.iter().map(|(_, copy)| (copy, COPY_DEST)));
+        for (texture, state) in moves {
+            let key = std::sync::Arc::as_ptr(texture) as usize;
+            let real = texture.state.load(Ordering::Relaxed);
+            copying.insert(key, state);
+            if real != state {
+                to_copy.push(transition(
+                    &texture.texture,
+                    host_state(real),
+                    host_state(state),
+                ));
+                if !states.contains_key(&key) {
+                    barriers.push(transition(
                         &texture.texture,
-                        host_state(real),
                         host_state(state),
+                        host_state(real),
                     ));
-                    if !states.contains_key(&key) {
-                        barriers.push(transition(
-                            &texture.texture,
-                            host_state(state),
-                            host_state(real),
-                        ));
-                    }
                 }
             }
         }
@@ -4960,7 +4978,7 @@ impl HostList {
             (real != *first)
                 .then(|| transition(&copy.texture, host_state(real), host_state(*first)))
         }));
-        if barriers.is_empty() && syncs.is_empty() {
+        if barriers.is_empty() && syncs.is_empty() && uploads.is_empty() {
             return None;
         }
         let Some((allocator, list)) = self
@@ -4980,6 +4998,9 @@ impl HostList {
                 }
                 for (depth, twin, colour) in &syncs {
                     record_twin_copy(list, &depth.texture, twin, *colour);
+                }
+                for (staging, copy) in &uploads {
+                    staging.record_copy(list, &copy.texture);
                 }
                 if !barriers.is_empty() {
                     list.ResourceBarrier(&barriers);
@@ -5292,6 +5313,16 @@ impl HostList {
     /// As [`HostList::defer`], for work that writes only host memory.
     pub(crate) fn defer_host(&self, work: impl Fn() + Send + 'static) {
         self.deferred().copies.push(Step::Host(Box::new(work)));
+    }
+
+    /// Uploads a texture's staging buffer into its host copy `copy` in
+    /// the list's prelude if the check at submission finds it changed.
+    pub(crate) fn defer_upload(
+        &self,
+        staging: std::sync::Arc<crate::texture::Staging>,
+        copy: std::sync::Arc<crate::resource::HostTexture>,
+    ) {
+        self.deferred().late_uploads.push((staging, copy));
     }
 
     /// Brings a texture's staging buffer up to date when the list is
