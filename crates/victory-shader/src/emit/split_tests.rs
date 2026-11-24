@@ -414,6 +414,18 @@ fn first_lane_reads_of_uniform_values_stay_split() {
     console_flow_case("v_readfirstlane after a partial EXEC", &partial, 64, |_| 9);
 }
 
+/// A `v_readfirstlane` of a value lanes hold their own of, and no other
+/// lane operation (#1132): lane 0's, in the upper half too. Per lane on a
+/// 32-lane host, lanes 32-63 read lane 32's.
+#[test]
+fn a_lone_first_lane_read_is_the_console_waves() {
+    let body = [
+        0x7E12_0500, // v_readfirstlane_b32 s9, v0
+        0x7E04_0209, // v_mov_b32 v2, s9
+    ];
+    console_flow_case("a lone v_readfirstlane", &body, 64, |_| 0);
+}
+
 /// `v_writelane` ignores EXEC: inside a branch only lanes below 20 take,
 /// it still writes lane 40. The per-lane form never had lane 40 there.
 #[test]

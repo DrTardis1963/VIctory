@@ -943,9 +943,16 @@ impl<'a> Lower<'a> {
             // (masks read whole, lanes of the other half) or to share LDS in
             // the console's instruction order: the console flow, for a group
             // of one console wave. What keeps a program out of it is the
-            // reason it stops with.
+            // reason it stops with. So do first-lane reads of values that
+            // may differ between lanes, where the host runs 32-lane waves:
+            // each half's own first lane is not the console's (#1132). Where
+            // the console flow cannot take them they keep the per-lane form.
+            let first_lane_varies =
+                || x.native.wave64 && !x.target.runs(64) && x.target.runs(32) && first_lane_reads();
             let needs_wave64 =
-                (console_lanes || one_wave && s.lds_dwords > 0) && !split && x.native.wave64;
+                (console_lanes || one_wave && s.lds_dwords > 0 || first_lane_varies())
+                    && !split
+                    && x.native.wave64;
             if needs_wave64 && !x.target.runs(64) {
                 no_console_flow = if cs.threads.iter().product::<u32>() > 64 {
                     Some(
