@@ -692,7 +692,7 @@ impl State {
         for stage in &p.stages {
             let t = stage.translated();
             self.table_failed = false;
-            let made = self.tables(list, &t.used, compute);
+            let made = self.tables(list, &t.used, &t.host.table_views, p, compute);
             if self.table_failed {
                 static DROPPED_TABLES: AtomicU64 = AtomicU64::new(0);
                 NOT_MADE.fetch_add(1, Ordering::Relaxed);
@@ -962,7 +962,7 @@ impl State {
         }
     }
 
-    fn table_entry(&self, list: &HostList, u: &UsedResource, compute: bool) {
+    fn table_entry(&self, list: &HostList, u: &UsedResource, p: &HostPipeline, compute: bool) {
         let Some(Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot)) else {
             return;
         };
@@ -973,16 +973,46 @@ impl State {
         let (Some(host), Some(index)) = (heap.host(), heap.index(handle)) else {
             return;
         };
-        if let Some(view) = host.mirror(index, handle, true) {
+        let props = table_view_props(p, u.slot, u.table_offset_dwords);
+        if let Some(view) = host.mirror_for_draw(index, handle, props) {
             readable(list, u, &view);
         }
+    }
+
+    /// A table slot the shaders annotate but no used-resource entry names
+    /// (a later element of a descriptor range): a typed null when the title
+    /// has no view there. Slots with a view are left as before; making one
+    /// here would skip what `readable` does for it.
+    fn table_view_entry(&self, slot: u8, dword: u32, p: &HostPipeline, compute: bool) {
+        let Some(Root::Table(table)) = self.roots_ref(compute).get(usize::from(slot)) else {
+            return;
+        };
+        let handle = table + u64::from(dword) * 4;
+        let Some(heap) = self.heap_of(handle) else {
+            return;
+        };
+        let (Some(host), Some(index)) = (heap.host(), heap.index(handle)) else {
+            return;
+        };
+        if crate::descriptor::view(handle).is_some() {
+            return;
+        }
+        let props = table_view_props(p, slot, dword);
+        let _ = host.mirror_for_draw(index, handle, props);
     }
 
     /// Gives tables with shader resources or constants slots owned by the
     /// command list. Later title descriptor writes cannot change what a
     /// recorded draw samples. Constants also get 256-byte-aligned storage,
     /// filled at submission. Identical descriptors share slots within a list.
-    fn tables(&mut self, list: &HostList, used: &[UsedResource], compute: bool) -> Vec<(u8, u32)> {
+    fn tables(
+        &mut self,
+        list: &HostList,
+        used: &[UsedResource],
+        stage_views: &[victory_shader::emit::TableView],
+        p: &HostPipeline,
+        compute: bool,
+    ) -> Vec<(u8, u32)> {
         let tables = |u: &&UsedResource| u.root == RootType::Table;
         let mut fresh: Vec<u8> = used
             .iter()
@@ -994,14 +1024,19 @@ impl State {
         // host's limit, 1,000,000 views on NVIDIA, 2,048 samplers anywhere)
         // are made afresh too: the title's slots there have no host slot of
         // their own.
-        for u in used.iter().filter(tables) {
-            if fresh.contains(&u.slot) {
+        for (slot, dword) in used
+            .iter()
+            .filter(tables)
+            .map(|u| (u.slot, u.table_offset_dwords))
+            .chain(stage_views.iter().map(|v| (v.slot, v.dword)))
+        {
+            if fresh.contains(&slot) {
                 continue;
             }
-            let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot)) else {
+            let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(slot)) else {
                 continue;
             };
-            let end = table + u64::from(u.table_offset_dwords) * 4;
+            let end = table + u64::from(dword) * 4;
             let Some(heap) = self.heap_of(table) else {
                 continue;
             };
@@ -1009,15 +1044,27 @@ impl State {
                 continue;
             };
             if index >= host.count() {
-                fresh.push(u.slot);
+                fresh.push(slot);
             }
         }
         fresh.sort_unstable();
         fresh.dedup();
         for u in used.iter().filter(tables) {
             if !fresh.contains(&u.slot) {
-                self.table_entry(list, u, compute);
+                self.table_entry(list, u, p, compute);
             }
+        }
+        for tv in stage_views {
+            if fresh.contains(&tv.slot)
+                || used.iter().any(|u| {
+                    u.root == RootType::Table
+                        && u.slot == tv.slot
+                        && u.table_offset_dwords == tv.dword
+                })
+            {
+                continue;
+            }
+            self.table_view_entry(tv.slot, tv.dword, p, compute);
         }
         let mut made = Vec::new();
         for slot in fresh {
@@ -1038,23 +1085,38 @@ impl State {
             let n = entries
                 .iter()
                 .map(|u| u.table_offset_dwords / 8 + 1)
+                .chain(
+                    p.stages
+                        .iter()
+                        .flat_map(|s| &s.translated().host.table_views)
+                        .filter(|v| v.slot == slot)
+                        .map(|v| v.dword / 8 + 1),
+                )
                 .max()
                 .unwrap_or(1);
             let last = table + u64::from(n - 1) * 32;
             if heap.index(last).is_none() {
                 for u in entries {
-                    self.table_entry(list, u, compute);
+                    self.table_entry(list, u, p, compute);
                 }
                 continue;
             }
-            // The table and what its entries hold (record words).
+            // The table, what its entries hold (record words), and the null
+            // annotations empty slots need.
             let key = {
                 use std::hash::{Hash, Hasher};
                 let mut h = std::collections::hash_map::DefaultHasher::new();
+                n.hash(&mut h);
                 for k in 0..n {
                     let at = table + u64::from(k) * 32;
-                    // SAFETY: a descriptor slot in title memory.
-                    unsafe { (at as *const [u32; 3]).read_unaligned() }.hash(&mut h);
+                    let words = if heap.index(at).is_some() {
+                        // SAFETY: a descriptor slot in title memory.
+                        unsafe { (at as *const [u32; 3]).read_unaligned() }
+                    } else {
+                        [0; 3]
+                    };
+                    words.hash(&mut h);
+                    table_view_props(p, slot, k * 8).hash(&mut h);
                 }
                 (table, h.finish())
             };
@@ -1085,27 +1147,27 @@ impl State {
             for k in 0..n {
                 let index = first + k;
                 let used = entries.iter().find(|u| u.table_offset_dwords / 8 == k);
-                match crate::descriptor::view(table + u64::from(k) * 32) {
+                let at = table + u64::from(k) * 32;
+                let props = table_view_props(p, slot, k * 8);
+                match heap.index(at).and_then(|_| crate::descriptor::view(at)) {
                     Some(View::Constant(address, size)) => {
                         let Some((gpu, to)) = list.scratch(u64::from(size)) else {
-                            host.make_null_kind(index, ResourceType::Cbv, 4);
+                            make_null(host, index, props, Some((ResourceType::Cbv, 4)));
                             continue;
                         };
                         list.defer_fill(to, address as *const u8, size as usize);
                         host.constant_at(index, gpu, size);
                     }
                     Some(view) => {
-                        host.make_at(index, &view);
+                        host.make_at(index, &view, props);
                         if let Some(u) = used {
                             readable(list, u, &view);
                         }
                     }
                     None => {
-                        if let Some(u) = used {
-                            host.make_null_kind(index, u.kind, u.dwords);
+                        make_null(host, index, props, used.map(|u| (u.kind, u.dwords)));
+                        if used.is_some() {
                             once!(slot, "a table entry without a view");
-                        } else {
-                            host.make_null(index);
                         }
                     }
                 }
@@ -1158,6 +1220,7 @@ impl State {
     /// builds).
     #[cfg(feature = "diagnostics")]
     fn reads(&self, compute: bool) -> Vec<String> {
+        use std::fmt::Write;
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
             return vec!["no host pipeline".into()];
         };
@@ -1168,7 +1231,16 @@ impl State {
                 let what = match (u.root, self.roots_ref(compute).get(usize::from(u.slot))) {
                     (RootType::Table, Some(Root::Table(table))) => {
                         let handle = table + u64::from(u.table_offset_dwords) * 4;
-                        describe(crate::descriptor::view(handle).as_ref())
+                        let mut what = describe(crate::descriptor::view(handle).as_ref());
+                        // What an empty slot here gets: a null of the kind the
+                        // shaders annotate, or the plain null 2D view.
+                        match table_view_props(p, u.slot, u.table_offset_dwords) {
+                            Some((kind, more)) => {
+                                let _ = write!(what, " [annotated {kind:#x} {more:#x}]");
+                            }
+                            None => what.push_str(" [not annotated]"),
+                        }
+                        what
                     }
                     (root, _) => format!("{root:?}"),
                 };
@@ -1512,6 +1584,42 @@ fn host_signature(kind: u32, stride: u32) -> Option<ID3D12CommandSignature> {
     let signature = signature?;
     made.push(((kind, stride), signature.clone()));
     Some(signature)
+}
+
+/// The DXIL resource properties the bound pipeline's shaders annotate table
+/// slot `(slot, dword)` with, preferring UAV annotations when stages disagree.
+fn table_view_props(p: &HostPipeline, slot: u8, dword: u32) -> Option<(u32, u32)> {
+    let mut best: Option<(u32, u32)> = None;
+    for stage in &p.stages {
+        let views = &stage.translated().host.table_views;
+        if let Ok(i) = views.binary_search_by_key(&(slot, dword), |v| (v.slot, v.dword)) {
+            let props = views[i].props;
+            best = Some(match best {
+                Some(cur) => {
+                    let key = |x: (u32, u32)| (x.0 & 0x1000 != 0, x);
+                    if key(props) > key(cur) { props } else { cur }
+                }
+                None => props,
+            });
+        }
+    }
+    best
+}
+
+/// Writes a typed null matching `props` at dynamic slot `index`; without an
+/// annotation, the null of the used-resource kind `kind` names, else the
+/// default null view.
+fn make_null(
+    host: &crate::descriptor::host::HostHeap,
+    index: u32,
+    props: Option<(u32, u32)>,
+    kind: Option<(ResourceType, u8)>,
+) {
+    match (props.and_then(crate::descriptor::host::null_desc_for_props), kind) {
+        (Some(desc), _) => host.make_typed_null(index, &desc),
+        (None, Some((kind, dwords))) => host.make_null_kind(index, kind, dwords),
+        (None, None) => host.make_null(index),
+    }
 }
 
 /// Gets what a shader reads or writes through a view ready: buffer data

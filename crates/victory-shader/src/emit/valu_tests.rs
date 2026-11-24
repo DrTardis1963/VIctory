@@ -168,6 +168,7 @@ fn lower_compute(native: &NativeProgram) -> HostShader {
         static_samplers: Vec::new(),
         root_cbvs: lowered.root_cbvs,
         root_srvs: lowered.root_srvs,
+        table_views: lowered.table_views,
     };
 
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
@@ -1452,6 +1453,7 @@ fn build_lanes(body: &[u32], wave64: bool) -> Result<HostShader, String> {
         static_samplers: Vec::new(),
         root_cbvs: lowered.root_cbvs,
         root_srvs: lowered.root_srvs,
+        table_views: Vec::new(),
     })
 }
 
