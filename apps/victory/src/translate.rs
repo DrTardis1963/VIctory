@@ -305,6 +305,14 @@ pub fn run(
     // is moving (the summary only comes at the end).
     let done = AtomicUsize::new(0);
     let started = std::time::Instant::now();
+    // The last walk's count gives the line a percentage (a walk only knows
+    // its total at the end).
+    let count_file = cache.as_ref().map(|(dir, _)| dir.join("last-walk-count.txt"));
+    let expected: Option<usize> = count_file
+        .as_ref()
+        .and_then(|f| std::fs::read_to_string(f).ok())
+        .and_then(|s| s.trim().parse().ok())
+        .filter(|&n| n > 0);
 
     std::thread::scope(|s| {
         for _ in 0..threads {
@@ -342,10 +350,14 @@ pub fn run(
                             translate(&source, &batch.path, &seen, &mut t, &mut checks);
                             let n = done.fetch_add(1, Ordering::Relaxed) + 1;
                             if n.is_multiple_of(100) {
-                                eprint!(
-                                    "\r  {n} shaders checked ({:.0} s)   ",
-                                    started.elapsed().as_secs_f64()
-                                );
+                                let secs = started.elapsed().as_secs_f64();
+                                match expected {
+                                    Some(e) => eprint!(
+                                        "\r  {n} / {e} shaders ({}%, {secs:.0} s)   ",
+                                        (n * 100 / e).min(99)
+                                    ),
+                                    None => eprint!("\r  {n} shaders checked ({secs:.0} s)   "),
+                                }
                             }
                         }
                     } else {
@@ -384,6 +396,11 @@ pub fn run(
         }
         queue.close();
     });
+    eprintln!();
+    if let Some(f) = &count_file {
+        // shortcut: a failed write only loses the next walk's percentage.
+        let _ = std::fs::write(f, done.load(Ordering::Relaxed).to_string());
+    }
     let t = total.into_inner().unwrap_or_else(|e| e.into_inner());
     println!(
         "containers   {} ({} duplicates skipped)",
