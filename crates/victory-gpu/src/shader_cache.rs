@@ -65,6 +65,7 @@ fn build() -> [u8; 32] {
         for name in [
             "VICTORY_WAVE_WIDE",
             "VICTORY_WAVE_DEEP_SKIPS",
+            "VICTORY_WAVE_GROUP_BARRIERS",
             "VICTORY_WAVE_OWN_BITS",
             "VICTORY_WAVE_LOCAL",
             "VICTORY_F16_NEAREST",
