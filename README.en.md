@@ -1,0 +1,269 @@
+# VIctory
+
+Runs Grand Theft Auto VI (Xbox Series X|S) natively on Windows, from files
+the user supplies.
+
+The title's x86-64 code runs unchanged inside our process; VIctory supplies
+the platform underneath it and converts the title's data, ahead of time where
+it can and on first use where it must (shaders). See
+[docs/architecture.md](docs/architecture.md).
+
+The Windows executable can also be launched under Proton on x86-64 Linux. See
+[Running with the Proton launcher](docs/proton-launcher.md).
+
+## Progress on NVIDIA (this fork)
+
+<!-- progress:start -->
+![shaders: 88.8%](https://img.shields.io/badge/shaders-88.8%25-yellow)
+![Mesh shaders: 97.5%](https://img.shields.io/badge/Mesh%20shaders-97.5%25-green)
+![Vertex/pixel shaders: 88.8%](https://img.shields.io/badge/Vertex%2Fpixel%20shaders-88.8%25-yellow)
+![Compute shaders: 59.9%](https://img.shields.io/badge/Compute%20shaders-59.9%25-orange)
+![measured: 2026-11-24](https://img.shields.io/badge/measured-2026--11--24-blue)
+
+| Part | Progress | % | Count |
+|---|---|---|---|
+| **All shaders** | `██████████████████░░` | **88.8%** | 22519 / 25334 |
+| Mesh shaders | `████████████████████` | 97.5% | 8501 / 8713 |
+| Vertex/pixel shaders | `██████████████████░░` | 88.8% | 12469 / 14039 |
+| Compute shaders | `████████████░░░░░░░░` | 59.9% | 1549 / 2582 |
+| **Game stages working** | `██████████░░░░░░░░░░` | **50.0%** | 3 / 6 |
+
+| Game stage | State | Measured |
+|---|---|---|
+| Boot and first-boot screens | ✅ | 30 fps |
+| Intro video with sound | ✅ | 30 fps, 33.3 ms per frame |
+| Start screen and menus | ✅ | 30 fps |
+| First loading screen | ⚠️ | 1-2 fps; ~2.5 min without a frame while the driver makes the world's pipelines (cold cache) |
+| First cutscene | ⚠️ | reached; 90-160 s per frame; some runs lose the device after 2-4 min |
+| Free roam | ❌ | not reached |
+
+*Measured 2026-11-24 on NVIDIA GeForce RTX 4060 Ti 8 GB, Intel Core i7-13700K, Windows 11 (`d3a24ce9`). Shader counts are the console shaders of the Xbox Series 1.0.2.1 dump that translate for this host (`victory translate`); game stages are what a run reached. Regenerate with `cargo xtask progress` after editing `docs/progress/progress.json`.*
+<!-- progress:end -->
+
+## Status (2026-11-23)
+
+**Not playable yet.** The title boots, runs its menus at its own 30 fps and
+loads the world, where rendering fails.
+
+| Stage | State |
+|-------|-------|
+| Boot, first-boot screens (accessibility, language, settings, legal) | works, 30 fps |
+| Intro video with sound | works |
+| Start screen, profile and saves | works |
+| Loading into the world (about 50 s) | works |
+| The world (first mission's intro) | reached and runs with indirect draws; its title card renders, the scene after it is still dark; 0.5-1.8 s per frame |
+
+Tested on one machine: Windows 11, AMD RX 6700 XT.
+
+> **Warning.** Entering the world on a real GPU can currently hang it, and
+> Windows then resets the display driver (every monitor goes black for a
+> moment). To look further, use a diagnostics build with
+> `VICTORY_D3D12_WARP=1`, which renders on the software adapter.
+
+What each part does today and what it still needs:
+
+| Subsystem | Today | Needs |
+|-----------|-------|-------|
+| Loader | Runs the title's executable and its DLLs in our process; crash reports name the faulting code and are kept in `crashes.log` | – |
+| Runtime services | One signed-in offline user, licences, packages, saves that survive a kill at any step, text entry dialog | Speech is silent; the dialog and relaunch are untested live |
+| Network | Offline by design: the title cannot reach the network | – |
+| Files and streaming | Archives and streamed data read, zlib and BCPack decoded in parallel | Loading is limited by writes into title memory |
+| Input | XInput pads, keyboard, keyboard stand-in pad, rumble | – |
+| Audio | Menu, video and loading sound; XMA voices and Opus streams decode | Reverb is silent; Opus results unverified against the title |
+| GPU: menus | Draws, compute and presentation on host D3D12; only changed title memory is copied | Frame pacing drifts on one screen in release builds |
+| GPU: world | Mesh pipelines, shader-written buffers, descriptor lifetimes, indirect execution (arguments clamped), pipelines made by worker threads and kept on disk, depth bounds on supporting adapters (synthetic tests) | Most of the scene is still missing (untranslated shaders drop draws); frames take seconds; real queries, HDR and scaling are missing |
+| Shaders | Console GPU code recompiled to DXIL at first use, cached on disk. Menus: all. World: mesh 8,191 of 8,506, vertex/pixel 10,617 of 12,346, compute 1,643 of 2,539 | Merged geometry stages, the ray-tracing builder's shaders; some compute programs need a GPU with 64-lane waves |
+| Textures | Console tiled layouts and detiling for the modes the title uses | Render-target metadata planes |
+| Series S mode | Runs through the menus to the loading screen | The world, as above |
+
+In an offline scan of `shaders.rpf`, SM 6.6 texture atomics recovered
+520 shader translations. Specializing proven branch outcomes recovered
+another 108 by keeping descriptor words off paths that consume buffer data.
+Microsoft's DXIL validator accepted all 628 shaders. Game rendering with
+these shader changes still needs a Windows D3D12 run.
+
+## Getting started
+
+Requirements: Windows 10/11 x64, a CPU with AVX2, a Direct3D 12 GPU with
+shader model 6.6 (and mesh shaders for the world), Rust (pinned in
+`rust-toolchain.toml`). On Linux, see
+[docs/linux-proton.md](docs/linux-proton.md) for which crates build and test
+natively today, cross-building `victory.exe` and running it under Proton.
+
+Under Wine or Proton, indirect execution also needs DXC's `dxcompiler.dll` (with
+its `dxil.dll`): Wine's `d3dcompiler_47` cannot compile the indirect-argument
+clamp. It is looked for in `VICTORY_DXC` (the DLL or its folder), beside the
+`dxil.dll` that shader validation finds, then the executable's folder and System32.
+
+The title also needs several GiB of available Windows commit at startup.
+Check **Committed** under **Task Manager → Performance → Memory**. If
+`crashes.log` reports Windows error 1455, close other applications or increase
+the Windows paging file size, then retry.
+
+Keep the game folder on an SSD if you can. From a hard drive the first
+screen stays black, at 30 fps and about 3 draws/frame, for a minute and a
+half or more while the title reads its files: the drive stays 100% busy with
+small random reads, and nothing shows until they finish. Wait for it rather
+than closing the window. A later launch is faster while Windows still holds
+the files in its cache.
+
+```powershell
+cargo xtask install-hooks                # asset-policy check on every commit
+copy victory.example.toml victory.toml   # then set your paths (outside the repo)
+cargo test --workspace                   # needs no game data
+cargo run -p victory -- config           # check your paths
+```
+
+Run the title, replacing the example path with the full path to your game's executable:
+
+```powershell
+cargo build --release -p victory
+.\target\release\victory.exe run 'D:\Xbox Games\GTA VI\title.exe' --execute
+```
+
+### Selecting the Series S profile
+
+GTA VI chooses its render configuration from the console model, not from the
+display modes VIctory advertises through DXGI. To use the lower-resolution
+profile, pass `--console series-s` when starting the title:
+
+```powershell
+target\release\victory.exe run <game dir>\<the title's exe> --execute --console series-s
+```
+
+In a reported diagnostic run, the Series X profile used a 3840×2160 scene
+with 2560×1440 internal targets; the Series S profile used a 1920×1080 scene
+with 1280×720 internal targets. The UI can still use a separate 3840×2160
+presentation plane, so selecting Series S does not necessarily make the
+window or every render target 1080p. Changing the DXGI mode list alone does
+not change the scene resolution ([issue #203](https://github.com/Marvisak/VIctory/issues/203));
+Series S multi-plane presentation is covered separately by
+[PR #211](https://github.com/Marvisak/VIctory/pull/211).
+
+The same report measured about 3.9 GB less committed process memory in the
+menus/intro and about 3.6 GB less at the world peak with Series S enabled.
+However, peak committed memory was still about 17.7 GB, and whole-system
+GPU memory use still reached about 7.3 of 8 GB. Both profiles also lost the
+GPU device 30–45 seconds after entering the world. These are measurements
+from one Windows 10 / RTX 2070 SUPER 8 GB / 32 GB RAM diagnostic setup
+(base commit `d2a4bae`, with PRs #175 and #211 applied), not general
+requirements or a guarantee of stability. Series S can reduce memory
+pressure, but it does not make a 16 GB RAM / 8 GB VRAM system reliably fit
+the world or resolve the current GPU hang.
+The window caption shows the framerate. Saves, settings and `crashes.log`
+are kept under the data folder (default `%LOCALAPPDATA%\victory\data`), derived
+data under the cache folder.
+
+Input: XInput pads. A DualSense or DualSense Edge (USB or Bluetooth) is read
+over HID as well and plays as the first pad when no XInput pad answers. With
+no pad connected the keyboard is a pad while the title's window has focus:
+
+| Keys | Pad |
+|------|-----|
+| W A S D / I J K L | left / right stick |
+| arrows | D-pad |
+| Enter, O | A, B |
+| Backspace, X, Y | B, X, Y |
+| Q / E, Z / C | shoulders, triggers |
+| F / H | stick clicks |
+| Esc, Tab | Menu, View |
+
+## Commands
+
+```
+victory inspect <exe|dll> [--imports] [--exports]
+victory census [paths...] [--missing] [--strict]
+victory lib-exports <import.lib> [--list]
+victory shader-info [paths...] [--verbose] [--disasm]
+victory translate [paths...] [--validate] [--pipelines] [--list] [--jobs N]
+victory run <exe> [--execute] [--unimplemented trap|zero] [--strict]
+            [--console series-x|series-s] [-- <title arguments>]
+victory config
+```
+
+Logging: `VICTORY_LOG=victory_loader=trace,info` (a release build logs
+info and above).
+
+For structured failure reports, see [Dependency diagnostics](docs/dependency-diagnostics.md).
+
+## Debugging
+
+A release build has no debugging aids. Build them in with
+
+```powershell
+cargo build --profile diag -p victory --features diagnostics   # target\diag\victory.exe
+```
+
+| Variable | Effect |
+|----------|--------|
+| `VICTORY_LOG=<target>=debug,...` | debug and trace output |
+| `VICTORY_STACKS=20,60` | every thread's stack at those seconds |
+| `VICTORY_WATCH=<rva>,...` | logs a title u32 when it changes |
+| `VICTORY_KEYS=30:Enter,35:X` | presses keys at those seconds, focus or not |
+| `VICTORY_CRASH_BREAKPOINTS=1` | appends first-chance breakpoints to `crashes.log`, including ones a handler may recover from |
+| `VICTORY_CRASH_SAVE=<rva>:<len>,...` | saves title memory to the cache folder on a crash |
+| `VICTORY_CAPTURE=<dir>` | saves presented frames (powers of two, or `VICTORY_CAPTURE_FRAMES=<list>`) |
+| `VICTORY_DUMP_TARGETS=1` | with the two above, saves every render target of those frames |
+| `VICTORY_D3D12_DEBUG=1` | host debug layer |
+| `VICTORY_D3D12_GBV=1` | with the above, GPU-based validation (bad descriptor use reported, not faulted; slow) |
+| `VICTORY_D3D12_DRED=1` | on a GPU failure, the allocation hit and the commands in flight |
+| `VICTORY_FPS=60` | a frame at most every 1/60 s when the title asks for fewer (Grand Theft Auto VI's intro asks for 30); works in release builds too |
+| `VICTORY_DYNAMIC_SLOTS=<n>` | on a host whose view heap is capped at 1,000,000 (NVIDIA), `n` of its slots (4096 to 500000, default 65536) hold the tables draws make afresh and the rest mirror the title's first slots; the 5-second `dynamic descriptor slots` line says how many were taken at most and how many tables were not made |
+| `VICTORY_SKIP_PIPELINES=<hash>,...` | omit draws and dispatches, including indirect ones, whose pipeline contains a listed 16-digit shader hash |
+| `VICTORY_SKIP_WAVE64=mesh,compute` | omit draws and dispatches whose pipeline has a program of a listed stage written for 64-lane waves (on hosts with 32-lane waves, such as NVIDIA's, these can hang the GPU) |
+| `VICTORY_GPU_TIMING=1` | with the above, each list of a submission run and timed on its own; slow lists logged with their slowest commands |
+| `VICTORY_D3D12_WARP=1` | host device on the software adapter (slow; cannot reset the driver) |
+| `VICTORY_SHADER_DUMP=<dir>` | writes each shader container and its DXIL as `<hash>.bin` / `<hash>.dxil` when it is translated, for the hashes DRED and timing lines name (`dxc -dumpbin <hash>.dxil`) |
+| `VICTORY_SHADER_LOOP_LIMIT=<n>` | translated shader loops stop after `n` iterations per lane instead of 2^20 (own shader cache entries; works in release builds too); if a lower `n` makes world frames much faster, loops hitting the limit are what makes them slow |
+| `VICTORY_SHADER_SPIN_LIMIT=<n>` | loops that only reread memory until another workgroup or queue changes it (spin waits) stop after `n` iterations per lane instead of 4096 (own shader cache entries); `1048576` restores the general limit for them |
+| `VICTORY_AUDIO_CAPTURE=<file.wav>` | records what the title plays (our process only) |
+| `VICTORY_XMA_DUMP=<dir>` | saves the first 32 XMA voices' context and input |
+
+Every build appends unhandled exceptions, panics, and host GPU failures to
+`crashes.log` in the title's data folder.
+
+For a startup breakpoint (`0x80000003`), run the diagnostics build with
+`VICTORY_CRASH_BREAKPOINTS=1`. Keep the console output along with the new
+`crashes.log` entries. A host DLL refusal includes the caller stack in the
+console output. The refusal is expected for DLLs outside the host policy,
+including `rpcrt4.dll`.
+
+On Series 1.0.2.1, a missing `appdata0.rpf` reproduced the breakpoint at
+`+0x2237178` before the first window. Restore the archive from the same
+package beside the title executable. `run --execute` checks that it can
+read the RPF9 header before starting this build.
+
+To compare hardware and software rendering, repeat with
+`VICTORY_D3D12_WARP=1` and check the console for
+`host device on the software adapter (WARP)` to confirm the WARP device was
+created. Compare the exception's module and offset, stack frames, and
+preceding messages across the two runs.
+
+### Reporting a GPU failure
+
+A host device removal, a hang, or a frame that comes out wrong is much easier
+to place with these next to it:
+
+* the adapter and the driver, as the title's own window sees them (GPU model,
+  the Adrenalin or GeForce version, and the Windows build number - a driver
+  update between two reports changes what is worth comparing);
+* whether `VICTORY_D3D12_WARP=1` reproduces it: a failure that survives the
+  software adapter is ours, one that does not points at the driver;
+* the last lines of `crashes.log`, which name the faulting code and the
+  commands in flight when `VICTORY_D3D12_DRED=1` was set;
+* the variables from the table above that were set for the run, and the build
+  profile (`diag` or release);
+* how long it took, and whether the display reset (a TDR) or the process
+  stopped.
+
+Nothing from the title's data belongs in the report: no shader dumps, no
+frames, no memory, per [docs/asset-policy.md](docs/asset-policy.md). Names of
+our own functions, error codes and timings are enough to start.
+
+[docs/debugging-notes-from-a-gta-v-port.md](docs/debugging-notes-from-a-gta-v-port.md)
+collects what got another RAGE port from "the world loads" to "the game
+runs": what the title waited for, and how each wait was found.
+
+## License
+
+GPL-3.0-or-later. See [LICENSE](LICENSE).
