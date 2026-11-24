@@ -118,8 +118,9 @@ pub(crate) const LANE_PHI_IN_CONSOLE_FLOW: &str =
     "a per-lane descriptor chosen by control flow in the console flow";
 
 enum Stop {
-    /// A phi whose incoming value has no DXIL form was read: redo with it missing.
-    Retry(Value, Why),
+    /// Phis whose incoming value has no DXIL form were read: redo with them
+    /// missing.
+    Retry(Vec<(Value, Why)>),
     Fail(ShaderError),
 }
 
@@ -140,12 +141,14 @@ fn lower_program(parts: &Parts, numeric_selects: bool) -> Result<Lowered, Shader
     loop {
         match Lower::new(parts, &bad, numeric_selects).run() {
             Ok(l) => return Ok(l),
-            Err(Stop::Retry(v, why)) => {
-                if bad.insert(v, why).is_some() {
-                    return Err(ShaderError::Unsupported {
-                        offset: 0,
-                        what: "a phi that does not settle",
-                    });
+            Err(Stop::Retry(phis)) => {
+                for (v, why) in phis {
+                    if bad.insert(v, why).is_some() {
+                        return Err(ShaderError::Unsupported {
+                            offset: 0,
+                            what: "a phi that does not settle",
+                        });
+                    }
                 }
             }
             Err(Stop::Fail(e)) => return Err(e),
@@ -9914,6 +9917,68 @@ impl<'a> Lower<'a> {
             })
     }
 
+    /// The read phis a value with no DXIL form reaches, directly or through
+    /// other read phis (each would be found by a redo of its own: a missing
+    /// value stays missing when more are).
+    fn missing_phis(&mut self) -> Vec<(Value, Why)> {
+        let p = self.x.p;
+        // Barycentrics read lazily get their values first, as below.
+        for k in 0..self.data_phis.len() {
+            let (_, b, i) = self.data_phis[k];
+            let phi = &p.blocks[b].phis[i];
+            if !self.read_phis.contains(&phi.value) {
+                continue;
+            }
+            for (&q, &arg) in p.blocks[b].preds.iter().zip(&phi.args) {
+                if self.tail[q].is_some() && !self.vals.contains_key(&arg) {
+                    let _ = self.lazy_barycentric(arg);
+                }
+            }
+        }
+        let mut found = Vec::new();
+        let mut missing = HashMap::new();
+        loop {
+            let before = found.len();
+            for &(_, b, i) in &self.data_phis {
+                let phi = &p.blocks[b].phis[i];
+                if !self.read_phis.contains(&phi.value) || missing.contains_key(&phi.value) {
+                    continue;
+                }
+                let bit = phi.reg == Reg::Scc;
+                let why = p.blocks[b]
+                    .preds
+                    .iter()
+                    .zip(&phi.args)
+                    .find_map(|(&q, arg)| {
+                        self.tail[q]?;
+                        if let Some(&why) = missing.get(arg) {
+                            return Some(why);
+                        }
+                        // An edge from outside a loop takes the loop's final value.
+                        let looked = match self.finals.get(arg) {
+                            Some(&(f, h)) if !self.loop_bodies[&h].contains(&q) => Some(f),
+                            _ => self.vals.get(arg).copied(),
+                        };
+                        match (looked, bit) {
+                            (Some(Val::I32(_)), false) | (Some(Val::Bit(_)), true) => None,
+                            (Some(Val::Bit(_)), false) => Some("an SCC joined with SGPR values"),
+                            // Left undefined below (`descriptor_dword`).
+                            (Some(Val::Missing(_)), _) if self.descriptor_dword(*arg) => None,
+                            (Some(Val::Missing(why)), _) => Some(why),
+                            _ => Some("a join of mismatched values"),
+                        }
+                    });
+                if let Some(why) = why {
+                    missing.insert(phi.value, why);
+                    found.push((phi.value, why));
+                }
+            }
+            if found.len() == before {
+                return found;
+            }
+        }
+    }
+
     fn fill_phis(&mut self) -> Result<(), Stop> {
         let p = self.x.p;
         // A phi that only another read phi consumes is live too. Without this, a value with no DXIL form that
@@ -9929,6 +9994,10 @@ impl<'a> Lower<'a> {
                     work.push(arg);
                 }
             }
+        }
+        let missing = self.missing_phis();
+        if !missing.is_empty() {
+            return Err(Stop::Retry(missing));
         }
         for (v, b, i) in std::mem::take(&mut self.data_phis) {
             let phi = &p.blocks[b].phis[i];
@@ -9949,7 +10018,7 @@ impl<'a> Lower<'a> {
                 let x = match (looked, bit) {
                     (Some(Val::I32(x)), false) | (Some(Val::Bit(x)), true) => x,
                     (Some(Val::Bit(_)), false) if self.read_phis.contains(&phi.value) => {
-                        return Err(Stop::Retry(phi.value, "an SCC joined with SGPR values"));
+                        return Err(Stop::Retry(vec![(phi.value, "an SCC joined with SGPR values")]));
                     }
                     // A descriptor's dwords reaching a join that also takes
                     // data (the registers are reused after the last access).
@@ -9963,10 +10032,10 @@ impl<'a> Lower<'a> {
                         }
                     }
                     (Some(Val::Missing(why)), _) if self.read_phis.contains(&phi.value) => {
-                        return Err(Stop::Retry(phi.value, why));
+                        return Err(Stop::Retry(vec![(phi.value, why)]));
                     }
                     _ if self.read_phis.contains(&phi.value) => {
-                        return Err(Stop::Retry(phi.value, "a join of mismatched values"));
+                        return Err(Stop::Retry(vec![(phi.value, "a join of mismatched values")]));
                     }
                     _ if bit => self.s.m.bool(false),
                     _ => self.s.m.i32(0),
