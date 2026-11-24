@@ -123,6 +123,9 @@ impl Inst {
 /// count. Fails on instructions the IR cannot express yet
 /// ([`ShaderError::Unsupported`]).
 pub fn build(code: &[u8], wave64: bool, vgprs: u16) -> Result<Program, ShaderError> {
+    if vgprs > 256 {
+        return Err(ShaderError::Malformed("implausible VGPR count"));
+    }
     let list = gfx10::decode(code)?;
     let lanes = 1 + u8::from(wave64);
     let isa = |offset, reason| ShaderError::Isa { offset, reason };
@@ -1223,5 +1226,22 @@ mod tests {
         assert_eq!(vgprs(&movrels.reads), [4, 5, 0]);
         assert_eq!(movrels.read(Reg::V(4)), movreld.write(Reg::V(4)));
         assert!(build(&code, false, 4).is_err(), "v4 is past 4 VGPRs");
+    }
+
+    #[test]
+    fn rejects_implausible_vgpr_counts() {
+        let code: Vec<u8> = [0x7E04_8501_u32, S_ENDPGM] // v_movreld_b32 v2, v1
+            .iter()
+            .flat_map(|w| w.to_le_bytes())
+            .collect();
+        assert!(matches!(
+            build(&code, false, 257),
+            Err(ShaderError::Malformed(_))
+        ));
+        assert!(matches!(
+            build(&code, false, 300),
+            Err(ShaderError::Malformed(_))
+        ));
+        assert!(build(&code, false, 256).is_ok());
     }
 }
