@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use victory_pipeline::{Cache, Converter};
+use victory_pipeline::{Cache, CacheKey, Converter};
 use victory_shader::emit::{HostShader, StaticSampler, UserData};
 use victory_shader::resource::RootIndexedView;
 use victory_shader::{HwStage, RootType};
@@ -53,28 +53,7 @@ fn build() -> &'static [u8; 32] {
         }
         match exe {
             Ok(mut bytes) => {
-                bytes.extend_from_slice(&limit.to_le_bytes());
-                // Which group barriers wait is part of the translation too.
-                bytes.push(victory_shader::emit::group_sync());
-                // So are the switches that pick the form of a wave64 program:
-                // without them here a run with `VICTORY_WAVE_WIDE=0` was
-                // served the translations an earlier run of the same
-                // executable had cached with the switch unset.
-                for name in [
-                    "VICTORY_WAVE_WIDE",
-                    "VICTORY_WAVE_DEEP_SKIPS",
-                    "VICTORY_WAVE_OWN_BITS",
-                    "VICTORY_F16_NEAREST",
-                ] {
-                    bytes.extend_from_slice(name.as_bytes());
-                    bytes.push(b'=');
-                    if let Some(value) = std::env::var_os(name) {
-                        bytes.extend_from_slice(value.as_encoded_bytes());
-                    }
-                    bytes.push(0);
-                }
-                // And which clean-up passes ran over the translated code.
-                bytes.extend_from_slice(&victory_shader::emit::shader_opt().to_le_bytes());
+                bytes.extend(settings());
                 *blake3::hash(&bytes).as_bytes()
             }
             Err(e) => {
@@ -89,13 +68,115 @@ fn build() -> &'static [u8; 32] {
     })
 }
 
+/// The translation settings besides the executable that a build's entries
+/// depend on.
+fn settings() -> Vec<u8> {
+    let mut bytes = victory_shader::emit::loop_limit().to_le_bytes().to_vec();
+    // Which group barriers wait is part of the translation too.
+    bytes.push(victory_shader::emit::group_sync());
+    // So are the switches that pick the form of a wave64 program:
+    // without them here a run with `VICTORY_WAVE_WIDE=0` was
+    // served the translations an earlier run of the same
+    // executable had cached with the switch unset.
+    for name in [
+        "VICTORY_WAVE_WIDE",
+        "VICTORY_WAVE_DEEP_SKIPS",
+        "VICTORY_WAVE_OWN_BITS",
+        "VICTORY_F16_NEAREST",
+    ] {
+        bytes.extend_from_slice(name.as_bytes());
+        bytes.push(b'=');
+        if let Some(value) = std::env::var_os(name) {
+            bytes.extend_from_slice(value.as_encoded_bytes());
+        }
+        bytes.push(0);
+    }
+    // And which clean-up passes ran over the translated code.
+    bytes.extend_from_slice(&victory_shader::emit::shader_opt().to_le_bytes());
+    bytes
+}
+
+/// The key of a container's last translation that worked, under any build
+/// of the same settings.
+fn last() -> &'static [u8; 32] {
+    static LAST: OnceLock<[u8; 32]> = OnceLock::new();
+    LAST.get_or_init(|| *blake3::hash(&[b"last".as_slice(), &settings()].concat()).as_bytes())
+}
+
 /// The translation of a console shader container, from the cache when
 /// there is one.
 pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
     let translate = |c: &[u8]| victory_shader::emit::translate(c).map_err(|e| e.to_string());
     match CACHE.get() {
-        Some(cache) => cached(cache, build(), container, translate),
+        Some(cache) => {
+            let result = cached(cache, build(), last(), container, translate);
+            or_last_worked(cache, last(), container, result)
+        }
         None => translate(container),
+    }
+}
+
+/// A container the current translator fails on gets its last translation
+/// that worked, if an earlier build made one: it draws as before the
+/// change instead of not at all.
+fn or_last_worked(
+    cache: &Cache,
+    last: &[u8; 32],
+    container: &[u8],
+    result: Result<HostShader, String>,
+) -> Result<HostShader, String> {
+    result.or_else(|error| {
+        let shader = last_worked(cache, last, container).ok_or_else(|| error.clone())?;
+        tracing::warn!(error, "shader does not translate; using its last translation that worked");
+        HITS.fetch_add(1, Ordering::Relaxed);
+        Ok(shader)
+    })
+}
+
+/// Where a container's last translation that worked is: the entry's key.
+struct LastSpec;
+
+impl Converter for LastSpec {
+    fn id(&self) -> &'static str {
+        "shader.dxil.last"
+    }
+    fn version(&self) -> u32 {
+        1
+    }
+    fn convert(&self, _input: &[u8]) -> anyhow::Result<Vec<u8>> {
+        unreachable!("LastSpec only keys Cache::replace")
+    }
+}
+
+/// Notes the entry made from `input` as `container`'s last translation that
+/// worked.
+fn remember(cache: &Cache, last: &[u8; 32], container: &[u8], input: &[u8]) {
+    let entry = CacheKey::new(&KeySpec, input).to_hex();
+    // shortcut: a failed write only loses the fallback for this shader.
+    let _ = cache.replace(&LastSpec, &[&last[..], container].concat(), entry.as_bytes());
+}
+
+/// `container`'s last translation that worked, by an earlier build.
+fn last_worked(cache: &Cache, last: &[u8; 32], container: &[u8]) -> Option<HostShader> {
+    let pointer = CacheKey::new(&LastSpec, &[&last[..], container].concat());
+    let entry = std::fs::read_to_string(cache.path_for(&pointer)).ok()?;
+    let entry = CacheKey::from_hex(entry.trim())?;
+    decode(&std::fs::read(cache.path_for(&entry)).ok()?)
+}
+
+/// The key of a translation entry: [`Translate`]'s id and version.
+struct KeySpec;
+
+impl Converter for KeySpec {
+    fn id(&self) -> &'static str {
+        "shader.dxil"
+    }
+    fn version(&self) -> u32 {
+        // The build fingerprint in the input does the versioning.
+        1
+    }
+    fn convert(&self, _input: &[u8]) -> anyhow::Result<Vec<u8>> {
+        unreachable!("KeySpec only computes keys")
     }
 }
 
@@ -108,11 +189,10 @@ struct Translate<F> {
 
 impl<F: Fn(&[u8]) -> Result<HostShader, String> + Send + Sync> Converter for Translate<F> {
     fn id(&self) -> &'static str {
-        "shader.dxil"
+        KeySpec.id()
     }
     fn version(&self) -> u32 {
-        // The build fingerprint in the input does the versioning.
-        1
+        KeySpec.version()
     }
     fn convert(&self, input: &[u8]) -> anyhow::Result<Vec<u8>> {
         self.ran.store(true, Ordering::Relaxed);
@@ -124,6 +204,7 @@ impl<F: Fn(&[u8]) -> Result<HostShader, String> + Send + Sync> Converter for Tra
 fn cached(
     cache: &Cache,
     build: &[u8; 32],
+    last: &[u8; 32],
     container: &[u8],
     translate: impl Fn(&[u8]) -> Result<HostShader, String> + Send + Sync,
 ) -> Result<HostShader, String> {
@@ -138,6 +219,7 @@ fn cached(
             .map_err(|e| format!("{e:#}"))?;
         if let Some(shader) = std::fs::read(&path).ok().and_then(|b| decode(&b)) {
             let (counter, what) = if converter.ran.load(Ordering::Relaxed) {
+                remember(cache, last, container, &input);
                 (&MISSES, "translated and cached")
             } else {
                 (&HITS, "from the cache")
@@ -329,6 +411,29 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
 mod tests {
     use super::*;
 
+    const LAST: [u8; 32] = [9; 32];
+
+    #[test]
+    fn a_failing_translation_falls_back_to_the_last_that_worked() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::open(dir.path()).unwrap();
+        let container = b"a console container".as_slice();
+        let fail = |_: &[u8]| Err::<HostShader, _>("unsupported".to_owned());
+        let ok = |_: &[u8]| Ok(shader());
+        let run = |build: &[u8; 32], last: &[u8; 32], translate: fn(&[u8]) -> Result<HostShader, String>| {
+            or_last_worked(&cache, last, container, cached(&cache, build, last, container, translate))
+        };
+        // Nothing worked yet: the failure stands.
+        assert!(run(&[1; 32], &LAST, fail).is_err());
+        assert_eq!(run(&[1; 32], &LAST, ok), Ok(shader()));
+        // A later build that fails gets the earlier translation; without the
+        // fallback (the offline warm-up) the failure is reported.
+        assert_eq!(run(&[2; 32], &LAST, fail), Ok(shader()));
+        assert!(cached(&cache, &[2; 32], &LAST, container, fail).is_err());
+        // Other settings (another last key) do not.
+        assert!(run(&[2; 32], &[3; 32], fail).is_err());
+    }
+
     fn shader() -> HostShader {
         HostShader {
             stage: HwStage::Ps,
@@ -370,26 +475,26 @@ mod tests {
             runs.fetch_add(1, Ordering::Relaxed);
             Ok(shader())
         };
-        assert_eq!(cached(&cache, &build, container, translate), Ok(shader()));
-        assert_eq!(cached(&cache, &build, container, translate), Ok(shader()));
+        assert_eq!(cached(&cache, &build, &LAST, container, translate), Ok(shader()));
+        assert_eq!(cached(&cache, &build, &LAST, container, translate), Ok(shader()));
         assert_eq!(runs.load(Ordering::Relaxed), 1, "the second came from disk");
 
         // Another build translates again.
-        assert_eq!(cached(&cache, &[8; 32], container, translate), Ok(shader()));
+        assert_eq!(cached(&cache, &[8; 32], &LAST, container, translate), Ok(shader()));
         assert_eq!(runs.load(Ordering::Relaxed), 2);
 
         // A damaged entry is a miss, translated and stored again.
         for e in walk(dir.path()) {
             std::fs::write(e, b"VSH1 broken").unwrap();
         }
-        assert_eq!(cached(&cache, &build, container, translate), Ok(shader()));
+        assert_eq!(cached(&cache, &build, &LAST, container, translate), Ok(shader()));
         assert_eq!(runs.load(Ordering::Relaxed), 3);
-        assert_eq!(cached(&cache, &build, container, translate), Ok(shader()));
+        assert_eq!(cached(&cache, &build, &LAST, container, translate), Ok(shader()));
         assert_eq!(runs.load(Ordering::Relaxed), 3);
 
         // Failures are not stored.
         let fail = |_: &[u8]| Err::<HostShader, _>("unsupported".to_owned());
-        assert!(cached(&cache, &build, b"other", fail).is_err());
+        assert!(cached(&cache, &build, &LAST, b"other", fail).is_err());
     }
 
     fn walk(dir: &std::path::Path) -> Vec<PathBuf> {
