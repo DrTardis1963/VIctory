@@ -66,8 +66,17 @@ pub(crate) enum C {
     /// pipelines made on the waiting thread.
     ComputeWaitUs,
     ComputeMadeHere,
+    /// Bindless plans made again, the slots they went through, and of their
+    /// time, microseconds checking memory is committed and finding copies.
+    Plans,
+    PlanSlots,
+    PlanQueryUs,
+    PlanFindUs,
+    /// Plans made again because a slot was written (else memory or placed
+    /// textures changed).
+    PlansForSlots,
 }
-const COUNTERS: usize = 39;
+const COUNTERS: usize = 44;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -179,6 +188,15 @@ pub(crate) fn log(frames: f64) {
         c[C::TexRechecksSaved as usize],
         ms(c[C::ComputeWaitUs as usize]),
         c[C::ComputeMadeHere as usize],
+    );
+    tracing::info!(
+        "bindless plans per frame: {:.1} made ({:.1} for written slots), {:.0} slots; \
+         committed checks {:.1} ms, copies found {:.1} ms",
+        c[C::Plans as usize],
+        c[C::PlansForSlots as usize],
+        c[C::PlanSlots as usize],
+        ms(c[C::PlanQueryUs as usize]),
+        ms(c[C::PlanFindUs as usize]),
     );
     tracing::info!(
         "texture uploads per frame: {:.0} copied {:.1} MB, {:.0} skipped unchanged {:.1} MB",
