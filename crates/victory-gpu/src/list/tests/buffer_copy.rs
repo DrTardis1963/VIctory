@@ -899,3 +899,63 @@ fn native_copy_control_with_explicit_known_states() {
     assert_eq!(b.words(), [500]);
     assert_eq!(output.words(), [500]);
 }
+
+const EQUAL: u32 = 3;
+const GREATER_EQUAL: u32 = 7;
+
+#[test]
+fn wait_released_by_an_earlier_write_of_the_list_does_not_stall() {
+    let Some(gpu) = test_gpu() else { return };
+    let writer = Shader::new(gpu.host, s!("write_word"));
+    let reader = Shader::new(gpu.host, s!("read_word"));
+    let a = TitleBuffer::new(&[13]);
+    let output = TitleBuffer::new(&[0]);
+    let flag = Box::new(0u64);
+    let at = std::ptr::from_ref(&*flag) as u64;
+    let list = TitleList::new();
+    writer.write(&list, &a, 0, 500);
+    write64(list.list, at, 7, 0, 0);
+    // The trailing argument is not a mask (a retail title passes this).
+    wait64(list.list, at, GREATER_EQUAL, 7, 0x231_0000_0001, 0);
+    list.transition(&a, UAV, SRV);
+    reader.read(&list, &a, 0, &output);
+    list.close();
+    let started = std::time::Instant::now();
+    gpu.execute(&[list.host()]);
+    assert!(started.elapsed() < std::time::Duration::from_secs(1), "the wait timed out");
+    // SAFETY: written by the submission, which finished.
+    assert_eq!(unsafe { std::ptr::from_ref(&*flag).read_volatile() }, 7);
+    assert_eq!(output.words(), [500]);
+}
+
+#[test]
+fn wait_holds_the_rest_of_the_list_until_another_thread_writes() {
+    let Some(gpu) = test_gpu() else { return };
+    let writer = Shader::new(gpu.host, s!("write_word"));
+    let reader = Shader::new(gpu.host, s!("read_word"));
+    let a = TitleBuffer::new(&[13]);
+    let output = TitleBuffer::new(&[0]);
+    let flag = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let at = flag.as_ptr() as u64;
+    let list = TitleList::new();
+    writer.write(&list, &a, 0, 500);
+    // Only the low byte counts.
+    wait32(list.list, at, EQUAL, 1, 0xff, 0);
+    list.transition(&a, UAV, SRV);
+    reader.read(&list, &a, 0, &output);
+    list.close();
+    let releaser = {
+        let flag = flag.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            flag.store(0x7701, std::sync::atomic::Ordering::Release);
+        })
+    };
+    let started = std::time::Instant::now();
+    gpu.execute(&[list.host()]);
+    let waited = started.elapsed();
+    releaser.join().unwrap();
+    assert!(waited >= std::time::Duration::from_millis(100), "did not wait: {waited:?}");
+    assert!(waited < std::time::Duration::from_secs(2), "timed out: {waited:?}");
+    assert_eq!(output.words(), [500]);
+}

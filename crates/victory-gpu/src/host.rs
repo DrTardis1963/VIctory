@@ -576,6 +576,108 @@ const SCRATCH_CHUNK: u64 = 4 << 20;
 enum Continuation {
     Copy(Arc<BufferCopy>),
     Commands(Arc<HostList>),
+    Wait(MemoryWait),
+}
+
+/// A title wait in a list (`Wait32BitValueX`, `Wait64BitValueX`): until
+/// `(memory & mask) <comparison> value`, `comparison` a
+/// `D3D12_COMPARISON_FUNC` (1 never .. 8 always). The list's commands
+/// before it run first, then it is waited for on the CPU, without the
+/// submission lock (another queue's submission may be what releases it),
+/// up to [`WAIT_TIMEOUT`].
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct MemoryWait {
+    pub(crate) address: usize,
+    /// 64 bits, else 32.
+    pub(crate) wide: bool,
+    pub(crate) comparison: u32,
+    pub(crate) value: u64,
+    pub(crate) mask: u64,
+    /// The list's bottom-of-pipe writes recorded before it: done before it
+    /// is waited for.
+    writes_before: usize,
+}
+
+/// How long a title wait is waited for before the list goes on (logged).
+const WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// `lhs <comparison> rhs` for a `D3D12_COMPARISON_FUNC`; `None` if unknown.
+pub(crate) fn compare(comparison: u32, lhs: u64, rhs: u64) -> Option<bool> {
+    Some(match comparison {
+        1 => false,
+        2 => lhs < rhs,
+        3 => lhs == rhs,
+        4 => lhs <= rhs,
+        5 => lhs > rhs,
+        6 => lhs != rhs,
+        7 => lhs >= rhs,
+        8 => true,
+        _ => return None,
+    })
+}
+
+impl MemoryWait {
+    pub(crate) fn new(address: usize, wide: bool, comparison: u32, value: u64, mask: u64) -> Self {
+        MemoryWait {
+            address,
+            wide,
+            comparison,
+            value,
+            mask,
+            writes_before: 0,
+        }
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        if self.wide { 8 } else { 4 }
+    }
+
+    /// The memory now, if it is mapped.
+    fn read(&self) -> Option<u64> {
+        if !crate::texture::committed(self.address as *const u8, self.len()) {
+            return None;
+        }
+        // SAFETY: committed, aligned (checked when recorded); other
+        // threads write it, as another queue would.
+        Some(unsafe {
+            if self.wide {
+                (self.address as *const u64).read_volatile()
+            } else {
+                u64::from((self.address as *const u32).read_volatile())
+            }
+        })
+    }
+
+    /// Whether the memory satisfies the wait now (memory unmapped since it
+    /// was recorded: it does, as nothing can write it).
+    pub(crate) fn holds(&self) -> bool {
+        self.read().is_none_or(|now| {
+            compare(self.comparison, now & self.mask, self.value).unwrap_or(true)
+        })
+    }
+
+    /// Waits until it holds, up to [`WAIT_TIMEOUT`]; whether it does.
+    fn wait(&self) -> bool {
+        let started = std::time::Instant::now();
+        while !self.holds() {
+            let waited = started.elapsed();
+            if waited >= WAIT_TIMEOUT {
+                return false;
+            }
+            std::thread::sleep(if waited < std::time::Duration::from_millis(10) {
+                std::time::Duration::from_micros(100)
+            } else {
+                std::time::Duration::from_millis(1)
+            });
+        }
+        true
+    }
+
+    fn written_by(&self, writes: &[(usize, crate::queue::Written, usize)]) -> bool {
+        writes
+            .iter()
+            .any(|&(at, _, bytes)| overlaps((at, bytes), (self.address, self.len())))
+    }
 }
 
 struct BufferCopy {
@@ -942,9 +1044,14 @@ impl Host {
             })
             .collect();
         let has_copies = continuations.iter().any(|parts| !parts.is_empty());
+        // Per run, how many of its bottom-of-pipe writes are done (before a
+        // wait).
+        let mut written = vec![0; runs.len()];
         let mut ordered = Vec::new();
+        // Title waits: before which entry of `ordered`, in which run.
+        let mut waits: Vec<(usize, usize, MemoryWait)> = Vec::new();
         let mut gpu_work = false;
-        for (&list, parts) in runs.iter().zip(&continuations) {
+        for (run, (&list, parts)) in runs.iter().zip(&continuations).enumerate() {
             ordered.push((list, QueueSegment::Commands));
             gpu_work |= has_copies && list.may_access_buffers();
             let mut copy_group: Vec<CopyAccess> = Vec::new();
@@ -992,6 +1099,13 @@ impl Host {
                         // buffers. Retain the cheap mapped copy in this prefix.
                         run_mapped_copy(copy.to, copy.from, copy.len, true);
                     }
+                    Continuation::Wait(wait) => {
+                        waits.push((ordered.len(), run, *wait));
+                        // Copies after it read what is there once it holds.
+                        gpu_work = true;
+                        copy_group.clear();
+                        previous_copy = None;
+                    }
                 }
             }
         }
@@ -1001,7 +1115,47 @@ impl Host {
         } else {
             let mut start = 0;
             let mut pending = Vec::new();
-            for (i, &(list, _)) in ordered.iter().enumerate() {
+            let mut waits = waits.into_iter().peekable();
+            for i in 0..=ordered.len() {
+                while let Some((_, run, wait)) = waits.next_if(|&(at, ..)| at == i) {
+                    // The bottom-of-pipe writes recorded before the wait.
+                    let before: Vec<(usize, usize)> = (0..=run)
+                        .map(|r| {
+                            let n = runs[r].deferred().writes.len();
+                            let end = if r == run { wait.writes_before.min(n) } else { n };
+                            (written[r].min(end), end)
+                        })
+                        .collect();
+                    let unwritten = before.iter().enumerate().any(|(r, &(from, end))| {
+                        wait.written_by(&runs[r].deferred().writes[from..end])
+                    });
+                    // Holding already and released by nothing before it.
+                    if wait.holds() && !unwritten {
+                        continue;
+                    }
+                    if i != start {
+                        self.execute_batch(&ordered[start..i], &mut submitted);
+                        pending.clear();
+                        start = i;
+                    }
+                    for (r, &(from, end)) in before.iter().enumerate() {
+                        for &(at, what, bytes) in &runs[r].deferred().writes[from..end] {
+                            what.write(at as *mut u8, bytes);
+                        }
+                        written[r] = written[r].max(end);
+                    }
+                    if !wait.holds() {
+                        drop(submitted);
+                        let held = wait.wait();
+                        submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+                        if !held {
+                            wait_timed_out(&wait);
+                        }
+                    }
+                }
+                let Some(&(list, _)) = ordered.get(i) else {
+                    break;
+                };
                 if i != start
                     && (list.needs_title_bytes(&pending)
                         || ordered[start..i]
@@ -1014,10 +1168,13 @@ impl Host {
                 }
                 list.add_gpu_writes(&mut pending);
             }
-            self.execute_batch(&ordered[start..], &mut submitted);
+            if start < ordered.len() {
+                self.execute_batch(&ordered[start..], &mut submitted);
+            }
         }
-        for list in runs {
-            for &(at, what, bytes) in &list.deferred().writes {
+        for (r, list) in runs.iter().enumerate() {
+            let deferred = list.deferred();
+            for &(at, what, bytes) in &deferred.writes[written[r].min(deferred.writes.len())..] {
                 what.write(at as *mut u8, bytes);
             }
         }
@@ -1345,14 +1502,14 @@ impl HostList {
         let mut parts = self.continuations();
         match parts.last()? {
             Continuation::Commands(list) => return Some((list.clone(), false)),
-            Continuation::Copy(_) => {}
+            Continuation::Copy(_) | Continuation::Wait(_) => {}
         }
         let current = parts
             .iter()
             .rev()
             .find_map(|part| match part {
                 Continuation::Commands(list) => Some(list.as_ref()),
-                Continuation::Copy(_) => None,
+                Continuation::Copy(_) | Continuation::Wait(_) => None,
             })
             .unwrap_or(self);
         let mut next = host().unwrap().new_list().unwrap_or_else(|e| {
@@ -1392,11 +1549,7 @@ impl HostList {
             return;
         }
         let mut parts = self.continuations();
-        match parts.last() {
-            Some(Continuation::Commands(current)) => current.close_native(),
-            Some(Continuation::Copy(_)) => {}
-            None => self.close_native(),
-        }
+        self.end_segment(&parts);
         parts.push(Continuation::Copy(Arc::new(BufferCopy {
             to,
             from,
@@ -1408,6 +1561,25 @@ impl HostList {
             native: OnceLock::new(),
         })));
         self.has_buffer_copies.store(true, Ordering::Relaxed);
+    }
+
+    /// Ends native recording before a title wait: the commands before it
+    /// run before it is waited for, those after it in a continuation.
+    pub(crate) fn wait(&self, mut wait: MemoryWait) {
+        wait.writes_before = self.deferred().writes.len();
+        let mut parts = self.continuations();
+        self.end_segment(&parts);
+        parts.push(Continuation::Wait(wait));
+        self.has_buffer_copies.store(true, Ordering::Relaxed);
+    }
+
+    /// Closes the native list being recorded, if one is.
+    fn end_segment(&self, parts: &[Continuation]) {
+        match parts.last() {
+            Some(Continuation::Commands(current)) => current.close_native(),
+            Some(Continuation::Copy(_) | Continuation::Wait(_)) => {}
+            None => self.close_native(),
+        }
     }
 
     /// The timestamp heap and its read-back buffer (diagnostics, timing on).
@@ -1487,11 +1659,7 @@ impl HostList {
     }
 
     pub(crate) fn close(&self) {
-        match self.continuations().last() {
-            Some(Continuation::Commands(last)) => last.close_native(),
-            Some(Continuation::Copy(_)) => {}
-            None => self.close_native(),
-        }
+        self.end_segment(&self.continuations());
     }
 
     fn close_native(&self) {
@@ -2002,6 +2170,24 @@ impl HostList {
                 }
             }
         }
+    }
+}
+
+/// A title wait did not hold within [`WAIT_TIMEOUT`]: the list went on.
+fn wait_timed_out(wait: &MemoryWait) {
+    static TIMEOUTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = TIMEOUTS.fetch_add(1, Ordering::Relaxed) + 1;
+    if n <= 20 || n.is_power_of_two() {
+        tracing::warn!(
+            "Wait{}BitValueX timed out after {} ms at {:#x} (comparison {}, value {:#x}, mask {:#x}; memory holds {:x?}); the list goes on (timeout {n})",
+            wait.len() * 8,
+            WAIT_TIMEOUT.as_millis(),
+            wait.address,
+            wait.comparison,
+            wait.value,
+            wait.mask,
+            wait.read()
+        );
     }
 }
 

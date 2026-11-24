@@ -1461,10 +1461,59 @@ pub(crate) fn take_counts() -> (u64, u64) {
     (DRAWS.swap(0, Relaxed), DISPATCHES.swap(0, Relaxed))
 }
 
-/// A GPU wait for a memory value `(address, comparison, reference, ...)`.
-/// Lists run one after another and to completion, so a value another queue
-/// or the CPU has to write first cannot be waited for; nothing to do.
-extern "system" fn wait_value(_: This, _address: u64, _comparison: u32, _reference: u64) {}
+/// `Wait32BitValueX(address, comparison, value, mask, flags)`: the list
+/// waits until `(memory & mask) <comparison> value`, a
+/// `D3D12_COMPARISON_FUNC`.
+extern "system" fn wait32(this: This, address: u64, comparison: u32, value: u32, mask: u32, _flags: u32) {
+    record_wait(this, address, false, comparison, u64::from(value), u64::from(mask));
+}
+
+/// `Wait64BitValueX(address, comparison, value, flags)`: the whole 64-bit
+/// value is compared. What follows the value is not a mask: read as one
+/// (xcl #218), a retail title's waits for a counter never held.
+extern "system" fn wait64(this: This, address: u64, comparison: u32, value: u64, _flags: u64, _more: u32) {
+    record_wait(this, address, true, comparison, value, u64::MAX);
+}
+
+/// Splits the list at a title wait: the commands after it run once it
+/// holds (see [`crate::host::MemoryWait`]).
+fn record_wait(this: This, address: u64, wide: bool, comparison: u32, value: u64, mask: u64) {
+    #[cfg(windows)]
+    {
+        const NEVER: u32 = 1;
+        const ALWAYS: u32 = 8;
+        let wait = crate::host::MemoryWait::new(address as usize, wide, comparison, value, mask);
+        let len = wait.len();
+        let ignored = if address == 0 || address as usize % len != 0 {
+            Some("not aligned")
+        } else if crate::host::compare(comparison, 0, 0).is_none() {
+            Some("unknown comparison")
+        } else if comparison == ALWAYS {
+            return;
+        } else if comparison == NEVER {
+            Some("it never holds")
+        } else if !crate::texture::committed(address as *const u8, len) {
+            Some("not mapped memory")
+        } else {
+            None
+        };
+        if let Some(why) = ignored {
+            static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 20 {
+                tracing::warn!(
+                    "Wait{}BitValueX at {address:#x} (comparison {comparison}, value {value:#x}) ignored: {why}",
+                    len * 8
+                );
+            }
+            return;
+        }
+        if let Some(root) = host_list(this) {
+            root.wait(wait);
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = (this, address, wide, comparison, value, mask);
+}
 
 /// The enhanced barriers `(group count, groups)`: buffer, texture and
 /// global barriers with layouts instead of states. Every host use of a
@@ -1567,8 +1616,8 @@ const METHODS: [(usize, *const ()); 52] = [
     (68, depth_bounds as *const ()),              // 0x220
     (69, write32 as *const ()),                   // 0x228
     (70, write64 as *const ()),                   // 0x230
-    (71, wait_value as *const ()),                // 0x238, 32 bits
-    (72, wait_value as *const ()),                // 0x240, 64 bits
+    (71, wait32 as *const ()),                    // 0x238
+    (72, wait64 as *const ()),                    // 0x240
     (73, ignored_state as *const ()),             // 0x248 pixel shader depth order
     (83, copy_texture_region_x as *const ()),     // 0x298
     (84, copy_resource_x as *const ()),           // 0x2a0
@@ -1721,6 +1770,26 @@ mod tests {
         let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
         assert_eq!(release(list), 0);
         assert_eq!(release(allocator), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn waits_compare_the_masked_memory_as_d3d12_comparison_funcs() {
+        use crate::host::{MemoryWait, compare};
+        let cases = [(1, false), (2, true), (3, false), (4, true), (5, false), (6, true), (7, false), (8, true)];
+        for (op, expected) in cases {
+            assert_eq!(compare(op, 1, 2), Some(expected), "op {op}");
+        }
+        assert_eq!(compare(0, 0, 0), None);
+        assert_eq!(compare(9, 0, 0), None);
+        let word = Box::new(0x1234_5601u32);
+        let at = std::ptr::from_ref(&*word) as usize;
+        assert!(MemoryWait::new(at, false, 3, 1, 0xff).holds());
+        assert!(!MemoryWait::new(at, false, 3, 1, u64::from(u32::MAX)).holds());
+        let wide = Box::new(4u64);
+        let at = std::ptr::from_ref(&*wide) as usize;
+        assert!(MemoryWait::new(at, true, 7, 2, u64::MAX).holds());
+        assert!(!MemoryWait::new(at, true, 7, 5, u64::MAX).holds());
     }
 
     /// An offset near `u64::MAX` must not overflow and write outside the
