@@ -495,14 +495,12 @@ fn constant(inst: &Inst) -> Option<u64> {
         return None;
     };
     match *src.first()? {
-        Operand::Const(c) => {
-            let x = crate::resource::inline(c)?;
-            Some(if (x as i32) < 0 {
-                u64::MAX
-            } else {
-                u64::from(x)
-            })
-        }
+        Operand::Const(c) => match c {
+            128..=192 => Some(u64::from(c - 128)),
+            193..=208 => Some(i64::from(192 - i32::from(c)) as u64),
+            _ if inst.name() == "s_mov_b32" => crate::resource::inline(c).map(u64::from),
+            _ => None,
+        },
         Operand::Literal(x) => Some(u64::from(x)),
         _ => None,
     }
@@ -546,6 +544,9 @@ fn shapes(
 }
 
 fn per_lane(lanes: &[Sym], all: u64) -> Option<Shape> {
+    if lanes.is_empty() || lanes.len() > 64 {
+        return None;
+    }
     let first = lanes[0];
     let own = |l: usize, s: Sym| match s {
         Sym::Red {
@@ -577,7 +578,8 @@ fn per_lane(lanes: &[Sym], all: u64) -> Option<Shape> {
         };
     }
     // Prefixes: lane l holds lanes 0..l (exclusive) or 0..=l (inclusive).
-    let mut found: Option<(Op, Value, Value, u32, bool)> = None;
+    let mut found_op: Option<Op> = None;
+    let mut found: Option<(Value, Value, u32, bool)> = None;
     for (l, &s) in lanes.iter().enumerate() {
         let below = (1u64 << l) - 1;
         let (op, src, mask, ident, set) = match s {
@@ -596,19 +598,24 @@ fn per_lane(lanes: &[Sym], all: u64) -> Option<Shape> {
         if !inclusive && set != below {
             return None;
         }
-        let op = match (op, found) {
-            (Some(o), _) => o,
-            (None, Some(f)) => f.0,
-            (None, None) => continue,
-        };
-        let me = (op, src, mask, ident, inclusive);
+        if let Some(o) = op {
+            match found_op {
+                None => found_op = Some(o),
+                Some(prev) if prev == o => {}
+                _ => return None,
+            }
+        }
+        let me = (src, mask, ident, inclusive);
         match found {
             None => found = Some(me),
             Some(f) if f == me => {}
             _ => return None,
         }
     }
-    let (op, src, mask, ident, inclusive) = found?;
+    let (op, (src, mask, ident, inclusive)) = (found_op?, found?);
+    if !op.identity(ident) {
+        return None;
+    }
     if let Sym::K(k) = lanes[0]
         && (inclusive || k != ident)
     {
@@ -675,5 +682,65 @@ mod tests {
             per_lane(&vec![red(u64::MAX); 64], u64::MAX),
             Some(Shape::Active(Op::AddU, x, m, 0))
         );
+    }
+
+    #[test]
+    fn single_lane_prefix_entries_are_validated_and_empty_slices_rejected() {
+        assert_eq!(per_lane(&[], u64::MAX), None);
+        assert_eq!(per_lane(&[Sym::K(0); 65], u64::MAX), None);
+        let (x, wrong, m) = (Value(1), Value(99), Value(2));
+        let red = |op, src, lanes| Sym::Red {
+            op,
+            src,
+            mask: m,
+            ident: 0,
+            lanes,
+        };
+        let mut inc: Vec<Sym> = (0..64)
+            .map(|l| red(Some(Op::AddU), x, u64::MAX >> (63 - l)))
+            .collect();
+        inc[0] = red(None, wrong, 1);
+        assert_eq!(per_lane(&inc, u64::MAX), None);
+
+        let mut exc: Vec<Sym> = (0..64)
+            .map(|l| red(Some(Op::AddU), x, (1u64 << l) - 1))
+            .collect();
+        exc[0] = Sym::K(0);
+        exc[1] = red(None, wrong, 1);
+        assert_eq!(per_lane(&exc, u64::MAX), None);
+
+        let mut hybrid = exc.clone();
+        hybrid[0] = red(None, x, 1);
+        hybrid[1] = red(None, x, 1);
+        assert_eq!(per_lane(&hybrid, u64::MAX), None);
+
+        // Valid single-lane entry at the start still matches when consistent.
+        inc[0] = red(None, x, 1);
+        assert_eq!(
+            per_lane(&inc, u64::MAX),
+            Some(Shape::Prefix(Op::AddU, x, m, 0, true))
+        );
+        exc[1] = red(None, x, 1);
+        assert_eq!(
+            per_lane(&exc, u64::MAX),
+            Some(Shape::Prefix(Op::AddU, x, m, 0, false))
+        );
+    }
+
+    #[test]
+    fn negative_exec_inline_constants_preserve_all_bits() {
+        let constant_of = |word: u32| {
+            let code: Vec<u8> = [word, 0xBF81_0000]
+                .into_iter()
+                .flat_map(|w| w.to_le_bytes())
+                .collect();
+            let p = crate::ir::build(&code, true, 1).unwrap();
+            constant(&p.blocks[0].insts[0])
+        };
+        // s_mov_b64 exec, -1 / -2 / -1.0 and s_mov_b32 exec_lo, -2.
+        assert_eq!(constant_of(0xBEFE_04C1), Some(u64::MAX));
+        assert_eq!(constant_of(0xBEFE_04C2), Some(0xFFFF_FFFF_FFFF_FFFE));
+        assert_eq!(constant_of(0xBEFE_03C2), Some(0xFFFF_FFFF_FFFF_FFFE));
+        assert_eq!(constant_of(0xBEFE_04F3), None);
     }
 }
