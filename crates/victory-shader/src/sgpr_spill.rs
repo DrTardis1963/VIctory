@@ -311,8 +311,6 @@ mod tests {
     use crate::native::{ComputeIo, StageIo};
     use crate::{Container, HwStage, NativeProgram, ShaderError, io, ir, resource, structure};
 
-    const HOLDING: &str = "a lane mask holding lanes elsewhere read as data";
-
     fn build(words: &[u32], wave64: bool) -> Program {
         let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
         ir::build(&code, wave64, 8).unwrap()
@@ -462,15 +460,12 @@ mod tests {
         ];
         for uses in idioms {
             let words = else_mask_spilled(uses);
-            // The spill reads the mask as a number where its lanes are not.
-            match lower_first(&words, false, true) {
-                Err(ShaderError::Unsupported { what, .. }) => assert_eq!(what, HOLDING),
-                r => panic!("{r:?}"),
-            }
-            // Its lane reads and writes, in a program whose lanes branch
-            // differently, ask for the console flow, where the mask is a
-            // number and the spill ignores EXEC.
+            // Unforwarded, #298 takes the spill and reload for the mask
+            // itself (`mask_spills`), so the per-lane form lowers; left to
+            // choose, three of the idioms still ask for the console flow.
+            lower_first(&words, false, true).unwrap();
             match lower_first(&words, false, false) {
+                Ok(()) => {}
                 Err(ShaderError::Unsupported { what, .. }) => {
                     assert_eq!(what, crate::emit::CONSOLE_FLOW)
                 }

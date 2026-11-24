@@ -3003,3 +3003,162 @@ mod barycentric_tests {
         assert!(pixel(&words, PERSP_CENTER).is_err());
     }
 }
+
+#[cfg(test)]
+mod mesh_tests {
+    use super::*;
+    use crate::native::StageIo;
+
+    /// A mesh program of `threads` lanes (in wave64 or wave32 waves)
+    /// declaring `max` vertices and primitives that runs `code`, then exports its vertex (the position,
+    /// then `vertex_rows` four-component rows) and its primitive
+    /// (`prim_rows` rows), translated.
+    fn mesh_after(
+        code: &[u32],
+        wave64: bool,
+        threads: u32,
+        max: u32,
+        vertex_rows: u8,
+        prim_rows: u8,
+    ) -> Result<HostShader, ShaderError> {
+        use super::container::SigElement;
+        use crate::native::{MeshIo, Usage, VsOutput};
+        let element = |name: &str, row: u8, kind: u8| SigElement {
+            name: name.into(),
+            index: row.into(),
+            kind,
+            comp: 9,
+            interp: 0,
+            row: Some(row.into()),
+            col: 0,
+            cols: 4,
+            usage: 0,
+            half: false,
+        };
+        let mut vertex = vec![element("SV_Position", 0, 3)];
+        vertex.extend((1..=vertex_rows).map(|r| element("TEXCOORD", r, 0)));
+        let prims: Vec<SigElement> = (0..prim_rows).map(|r| element("PRIMDATA", r, 0)).collect();
+        let mut words: Vec<u32> = code.to_vec();
+        words.extend([
+            0x7E00_0280, // v_mov_b32 v0, 0
+            0x7E02_02F2, // v_mov_b32 v1, 1.0
+            0xF800_00CF, // exp pos0 v0, v0, v0, v1
+            0x0100_0000,
+        ]);
+        let mut outputs = Vec::new();
+        for n in 0..vertex_rows + prim_rows {
+            // exp param<n> v1, v1, v1, v1; the last ones per-primitive.
+            words.extend([0xF800_000F | (32 + u32::from(n)) << 4, 0x0101_0101]);
+            let primitive = n >= vertex_rows;
+            outputs.push(VsOutput {
+                usage: Usage::Generic,
+                row: if primitive { n - vertex_rows } else { n + 1 },
+                param: if primitive { 0x80 | n } else { n },
+                fp16: false,
+                pack2: false,
+            });
+        }
+        words.extend([
+            0xF800_0941, // exp prim v0, off, off, off done
+            0x0000_0000,
+            0xBF81_0000, // s_endpgm
+        ]);
+        let native = NativeProgram {
+            stage: HwStage::Ms,
+            wave64,
+            vgprs: 256,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Ms(MeshIo {
+                outputs,
+                clip_cntl: 0,
+                threads,
+                max_vertices: max,
+                max_primitives: max,
+                topology: 2,
+                lds_bytes: 0,
+            }),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let osg1 = super::container::signature(&vertex, false);
+        let psg1 = super::container::signature(&prims, false);
+        let bytes = crate::dxbc::build(&[(FourCC::OSG1, &osg1), (FourCC::PSG1, &psg1)]);
+        let c = Container::parse(&bytes).unwrap();
+        let p = ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        emit(&c, &native, &p, &st, &io, &res, Target::ANY)
+    }
+
+    #[test]
+    fn mesh_tests_whether_a_mask_has_lanes() {
+        // The expansion of WaveActiveAllEqual(v0): whether any lane differs
+        // from the first.
+        let mut all_equal = vec![
+            0x7E0C_0500, // v_readfirstlane_b32 s6, v0
+            0x7D84_0006, // v_cmp_eq_u32 vcc, s6, v0
+            0x8984_7E6A, // s_xor_b64 s[4:5], vcc, exec
+            0xBE84_1004, // s_bcnt1_i32_b64 s4, s[4:5]
+            0xBF85_0001, // s_cbranch_scc1 -> past the next
+            0x7E04_0280, // v_mov_b32 v2, 0
+        ];
+        assert!(mesh_after(&all_equal, true, 64, 64, 1, 0).is_ok());
+        // The count itself is the console wave's, not the host's.
+        all_equal[5] = 0x7E04_0204; // v_mov_b32 v2, s4
+        let err = mesh_after(&all_equal, true, 64, 64, 1, 0).unwrap_err();
+        assert!(
+            err.to_string().contains("a lane mask read as data"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn mesh_sums_over_the_hosts_wave() {
+        // WaveActiveSum(v0) as the console compiler expands it for wave32
+        // (see `wave::tests`), its total tested by a uniform branch.
+        // (Wave64 totals add the halves' lane reads with scalar code, which
+        // the section simulation here does not follow.)
+        let sum = [
+            0xBE80_3DC1, // s_or_saveexec_b32 s0, -1
+            0xD501_0001,
+            0x0002_0080, // v_cndmask_b32_e64 v1, 0, v0, s0
+            0x4A02_02FA,
+            0xFF01_6101, // v_add_nc_u32_dpp v1, v1, v1 row_xmask:1
+            0x4A02_02FA,
+            0xFF01_6201, // v_add_nc_u32_dpp v1, v1, v1 row_xmask:2
+            0x4A02_02FA,
+            0xFF01_6401, // v_add_nc_u32_dpp v1, v1, v1 row_xmask:4
+            0x4A02_02FA,
+            0xFF01_6801, // v_add_nc_u32_dpp v1, v1, v1 row_xmask:8
+            0xD777_0002,
+            0x0305_8301, // v_permlane16_b32 v2, v1, -1, -1
+            0xD778_0003,
+            0x0305_8302, // v_permlanex16_b32 v3, v2, -1, -1
+            0x4A08_0702, // v_add_nc_u32_e32 v4, v2, v3
+            0xD760_0002,
+            0x0001_0104, // v_readlane_b32 s2, v4, 0
+            0xBEFE_0300, // s_mov_b32 exec_lo, s0
+            0xBF06_8002, // s_cmp_eq_u32 s2, 0
+            0xBF85_0001, // s_cbranch_scc1 -> past the next
+            0x7E0C_0280, // v_mov_b32 v6, 0
+        ];
+        let s = mesh_after(&sum, false, 32, 32, 1, 0).unwrap();
+        if let Some(r) = validated(&s.dxil) {
+            assert_eq!(r, Ok(()));
+        }
+    }
+
+    /// What `dxil.dll` says of a container; `None` without it.
+    #[cfg(windows)]
+    fn validated(dxil: &[u8]) -> Option<Result<(), String>> {
+        let path = super::validator::Validator::default_path();
+        let mut v = super::validator::Validator::load(path.as_deref()).ok()?;
+        Some(v.validate(&mut dxil.to_vec()))
+    }
+
+    #[cfg(not(windows))]
+    fn validated(_: &[u8]) -> Option<Result<(), String>> {
+        None
+    }
+}
