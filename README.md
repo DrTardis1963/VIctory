@@ -14,18 +14,18 @@ The Windows executable can also be launched under Proton on x86-64 Linux. See
 ## Progress on NVIDIA (this fork)
 
 <!-- progress:start -->
-![shaders: 97.2%](https://img.shields.io/badge/shaders-97.2%25-green)
-![Mesh shaders: 99.8%](https://img.shields.io/badge/Mesh%20shaders-99.8%25-brightgreen)
-![Vertex/pixel shaders: 97.6%](https://img.shields.io/badge/Vertex%2Fpixel%20shaders-97.6%25-green)
-![Compute shaders: 85.7%](https://img.shields.io/badge/Compute%20shaders-85.7%25-yellow)
+![shaders: 88.8%](https://img.shields.io/badge/shaders-88.8%25-yellow)
+![Mesh shaders: 97.5%](https://img.shields.io/badge/Mesh%20shaders-97.5%25-green)
+![Vertex/pixel shaders: 88.8%](https://img.shields.io/badge/Vertex%2Fpixel%20shaders-88.8%25-yellow)
+![Compute shaders: 59.9%](https://img.shields.io/badge/Compute%20shaders-59.9%25-orange)
 ![measured: 2026-11-24](https://img.shields.io/badge/measured-2026--11--24-blue)
 
 | Part | Progress | % | Count |
 |---|---|---|---|
-| **All shaders** | `███████████████████░` | **97.2%** | 24633 / 25334 |
-| Mesh shaders | `████████████████████` | 99.8% | 8703 / 8713 |
-| Vertex/pixel shaders | `████████████████████` | 97.6% | 13715 / 14039 |
-| Compute shaders | `█████████████████░░░` | 85.7% | 2215 / 2582 |
+| **All shaders** | `██████████████████░░` | **88.8%** | 22519 / 25334 |
+| Mesh shaders | `████████████████████` | 97.5% | 8501 / 8713 |
+| Vertex/pixel shaders | `██████████████████░░` | 88.8% | 12469 / 14039 |
+| Compute shaders | `████████████░░░░░░░░` | 59.9% | 1549 / 2582 |
 | **Game stages working** | `██████████░░░░░░░░░░` | **50.0%** | 3 / 6 |
 
 | Game stage | State | Measured |
@@ -37,7 +37,7 @@ The Windows executable can also be launched under Proton on x86-64 Linux. See
 | First cutscene | ⚠️ | reached; 90-160 s per frame; some runs lose the device after 2-4 min |
 | Free roam | ❌ | not reached |
 
-*Measured 2026-11-24 on NVIDIA GeForce RTX 4060 Ti 8 GB, Intel Core i7-13700K, Windows 11 (`bba12c00`). Shader counts are the console shaders of the Xbox Series 1.0.2.1 dump that translate for this host (`victory translate`); game stages are what a run reached. Regenerate with `cargo xtask progress` after editing `docs/progress/progress.json`.*
+*Measured 2026-11-24 on NVIDIA GeForce RTX 4060 Ti 8 GB, Intel Core i7-13700K, Windows 11 (`d3a24ce9`). Shader counts are the console shaders of the Xbox Series 1.0.2.1 dump that translate for this host (`victory translate`); game stages are what a run reached. Regenerate with `cargo xtask progress` after editing `docs/progress/progress.json`.*
 <!-- progress:end -->
 
 ## Status (2026-11-23)
