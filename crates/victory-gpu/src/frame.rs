@@ -49,11 +49,13 @@ pub(crate) extern "system" fn set_interval(
     _period: u32,
     _flags: u32,
 ) -> HRESULT {
-    let interval = match length {
+    let asked = match length {
         0 => SIXTIETH,
         us => Duration::from_micros(u64::from(us)),
     };
-    tracing::info!(?interval, "frame interval");
+    let fps = std::env::var("VICTORY_FPS").ok().and_then(|v| v.trim().parse().ok());
+    let interval = at_most_fps(asked, fps);
+    tracing::info!(?interval, ?asked, "frame interval");
     // A new interval starts from now, after the last tick handed out.
     let first = LAST
         .iter()
@@ -66,6 +68,15 @@ pub(crate) extern "system" fn set_interval(
         first,
     });
     S_OK
+}
+
+/// `VICTORY_FPS`: the title's interval, shortened to one frame per `1/fps`
+/// second (Grand Theft Auto VI asks for 30).
+fn at_most_fps(asked: Duration, fps: Option<u32>) -> Duration {
+    match fps {
+        Some(fps @ 1..=1000) => asked.min(Duration::from_secs(1) / fps),
+        _ => asked,
+    }
 }
 
 /// Device method: events are scheduled at every tick.
@@ -179,6 +190,15 @@ pub(crate) extern "system" fn statistics(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fps_only_shortens_the_interval() {
+        let thirtieth = Duration::from_micros(33_333);
+        assert_eq!(at_most_fps(thirtieth, None), thirtieth);
+        assert_eq!(at_most_fps(thirtieth, Some(0)), thirtieth);
+        assert_eq!(at_most_fps(thirtieth, Some(60)), Duration::from_secs(1) / 60);
+        assert_eq!(at_most_fps(SIXTIETH, Some(30)), SIXTIETH);
+    }
 
     #[test]
     fn waits_end_on_ticks_and_count_frames() {
