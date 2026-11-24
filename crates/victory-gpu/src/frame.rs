@@ -130,7 +130,7 @@ pub(crate) extern "system" fn wait(
 ) -> HRESULT {
     let origin = kind == ORIGIN;
     let limit = Duration::from_millis(u64::from(timeout_ms));
-    let (_, wait) = next_tick(kind, limit);
+    let (_tick, wait) = next_tick(kind, limit);
     let hr = if wait > limit {
         std::thread::sleep(limit);
         TIMEOUT
@@ -153,7 +153,7 @@ pub(crate) extern "system" fn wait(
         timeout_ms,
         flags,
         hr,
-        tick,
+        tick = _tick,
         wait_us = wait.as_micros() as u64,
         frame = current(),
         "frame wait"
