@@ -2315,9 +2315,12 @@ impl Meter {
                 making = crate::pipeline::making()
             );
             let (peak, short) = crate::descriptor::host::take_dynamic_stats();
+            let [not_made, taken_back, refused] = crate::draw::take_table_stats();
             if peak > 0 {
                 tracing::info!(
-                    "dynamic descriptor slots: at most {peak} taken; {short} requests ran short"
+                    "dynamic descriptor slots: at most {peak} taken; {short} requests ran short, \
+                     {taken_back} submitted lists' slots taken back, {not_made} draws or dispatches \
+                     dropped for their tables, {refused} lists not run again"
                 );
             }
             #[cfg(feature = "diagnostics")]

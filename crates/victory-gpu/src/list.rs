@@ -133,6 +133,21 @@ fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::dra
     f(list, &mut state.lock().unwrap_or_else(|e| e.into_inner()));
 }
 
+/// Before a submission of a title list: false if it must not run (its
+/// dynamic slots were taken back, see `State::take_back`).
+#[cfg(windows)]
+pub(crate) fn take_back_slots(this: This) -> bool {
+    let mut runs = true;
+    with_state(this, |_, state| runs = state.take_back());
+    runs
+}
+
+/// After a submission of a title list ran: its dynamic slots may be lent.
+#[cfg(windows)]
+pub(crate) fn lend_slots(this: This) {
+    with_state(this, |_, state| state.lend());
+}
+
 /// The host list behind a title list, if there is a host GPU.
 #[cfg(windows)]
 pub(crate) fn host_list<'a>(this: This) -> Option<&'a crate::host::HostList> {

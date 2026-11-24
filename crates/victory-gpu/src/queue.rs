@@ -119,11 +119,27 @@ extern "system" fn execute(_: This, count: u32, lists: *const This) {
     if let Some(host) = crate::host::host() {
         // SAFETY: the title passes `count` lists.
         let lists = unsafe { std::slice::from_raw_parts(lists, count as usize) };
-        let host_lists: Vec<_> = lists
+        let runs: Vec<This> = lists
+            .iter()
+            .copied()
+            .filter(|&l| crate::list::take_back_slots(l))
+            .collect();
+        if runs.len() < lists.len() {
+            static REFUSED: std::sync::Once = std::sync::Once::new();
+            REFUSED.call_once(|| {
+                tracing::warn!(
+                    "a list submitted again after its descriptor slots were taken back is not run"
+                )
+            });
+        }
+        let host_lists: Vec<_> = runs
             .iter()
             .filter_map(|&l| crate::list::host_list(l))
             .collect();
         host.execute(&host_lists);
+        for &l in &runs {
+            crate::list::lend_slots(l);
+        }
         return;
     }
     static ONCE: AtomicBool = AtomicBool::new(false);

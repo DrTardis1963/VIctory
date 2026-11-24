@@ -83,12 +83,50 @@ pub(crate) struct State {
     table_failed: bool,
     /// Last bindless view heap prepared on this list: `(heap, revision, copy_epoch)`.
     bindless_prepared: Option<(usize, (u64, u64, u64), u64)>,
+    /// Its dynamic slots are in [`LENT`] under this id (see [`State::lend`]).
+    lent: Option<u64>,
 }
 
 impl Drop for State {
     fn drop(&mut self) {
+        self.unlend();
         for &(heap, first, n) in &self.dynamic {
             crate::descriptor::release_dynamic(heap, first, n);
+        }
+    }
+}
+
+/// Dynamic slots of lists whose submissions have run, oldest first, by
+/// lender: what [`State::tables`] takes back when a heap runs short. A list
+/// keeps its slots until it is reset because the title may submit it
+/// again; on NVIDIA's capped heap (65,536 dynamic slots) that held the
+/// world's slots for frames already drawn, and the tables of the frame
+/// being recorded were not made (#71).
+type Lent = std::collections::VecDeque<(u64, Vec<(usize, u32, u32)>)>;
+static LENT: std::sync::Mutex<Lent> = std::sync::Mutex::new(Lent::new());
+static NEXT_LENDER: AtomicU64 = AtomicU64::new(1);
+
+/// Since the last [`take_table_stats`]: draws and dispatches dropped for
+/// their tables, lists whose lent slots were taken back, and lists not run
+/// again because of that.
+static NOT_MADE: AtomicU64 = AtomicU64::new(0);
+static TAKEN_BACK: AtomicU64 = AtomicU64::new(0);
+static REFUSED: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn take_table_stats() -> [u64; 3] {
+    [&NOT_MADE, &TAKEN_BACK, &REFUSED].map(|c| c.swap(0, Ordering::Relaxed))
+}
+
+/// Takes back lent slots, oldest list first, until `retry` finds a run.
+fn take_lent(mut retry: impl FnMut() -> Option<u32>) -> Option<u32> {
+    loop {
+        let (_, slots) = LENT.lock().unwrap_or_else(|e| e.into_inner()).pop_front()?;
+        for (heap, first, n) in slots {
+            crate::descriptor::release_dynamic(heap, first, n);
+        }
+        TAKEN_BACK.fetch_add(1, Ordering::Relaxed);
+        if let Some(first) = retry() {
+            return Some(first);
         }
     }
 }
@@ -171,6 +209,41 @@ fn set(roots: &mut Vec<Root>, slot: u32, root: Root) {
 }
 
 impl State {
+    /// After a submission of the list ran (submissions are waited for):
+    /// its dynamic slots may be taken back by lists that run short.
+    pub(crate) fn lend(&mut self) {
+        if self.lent.is_some() || self.dynamic.is_empty() {
+            return;
+        }
+        let id = NEXT_LENDER.fetch_add(1, Ordering::Relaxed);
+        let slots = std::mem::take(&mut self.dynamic);
+        LENT.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push_back((id, slots));
+        self.lent = Some(id);
+    }
+
+    /// Before a submission of the list: its lent slots back. False if they
+    /// were taken: its tables are gone, so it must not run before a reset.
+    pub(crate) fn take_back(&mut self) -> bool {
+        let runs = self.unlend();
+        if !runs {
+            REFUSED.fetch_add(1, Ordering::Relaxed);
+        }
+        runs
+    }
+
+    fn unlend(&mut self) -> bool {
+        let Some(id) = self.lent else { return true };
+        let mut lent = LENT.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(at) = lent.iter().position(|g| g.0 == id) else {
+            return false;
+        };
+        self.dynamic = lent.remove(at).map(|g| g.1).unwrap_or_default();
+        self.lent = None;
+        true
+    }
+
     pub(crate) fn reset(&mut self, pipeline: This) {
         *self = State::default();
         self.pipeline = pipeline as usize;
@@ -503,6 +576,7 @@ impl State {
             let made = self.tables(list, &t.used, compute);
             if self.table_failed {
                 static DROPPED_TABLES: AtomicU64 = AtomicU64::new(0);
+                NOT_MADE.fetch_add(1, Ordering::Relaxed);
                 let n = DROPPED_TABLES.fetch_add(1, Ordering::Relaxed) + 1;
                 if n.is_power_of_two() {
                     tracing::warn!(
@@ -527,6 +601,7 @@ impl State {
                         None if u.root == RootType::Table
                             && self.past_host_heap(compute, u.slot) =>
                         {
+                            NOT_MADE.fetch_add(1, Ordering::Relaxed);
                             once!(
                                 slot = u.slot,
                                 "a draw or dispatch dropped: its table lies past the host heap"
@@ -791,7 +866,7 @@ impl State {
                 made.push((slot, first * 32));
                 continue;
             }
-            let Some(first) = host.dynamic(n) else {
+            let Some(first) = host.dynamic(n).or_else(|| take_lent(|| host.dynamic(n))) else {
                 // Without its fresh table the shader would read the title's
                 // slots, which for constant buffer tables hold no constant
                 // view: a texture or null descriptor read as a buffer gives
@@ -1366,4 +1441,40 @@ pub(crate) fn blend_factor(list: &HostList, factor: Option<&[f32; 4]>) {
 pub(crate) fn stencil_ref(list: &HostList, reference: u32) {
     // SAFETY: an open list.
     unsafe { list.list.OMSetStencilRef(reference) };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Submitted lists lend their dynamic slots; a list gets them back
+    /// before it runs again unless a short heap took them, and then it
+    /// must not run.
+    #[test]
+    fn lent_slots_come_back_unless_taken() {
+        // Heap addresses no title heap has: giving those slots back is a
+        // no-op, so only the bookkeeping is under test.
+        let (mut a, mut b) = (State::default(), State::default());
+        a.dynamic.push((1, 10, 5));
+        b.dynamic.push((2, 20, 7));
+        a.lend();
+        assert!(a.dynamic.is_empty());
+        assert!(a.take_back());
+        assert_eq!(a.dynamic, [(1, 10, 5)]);
+        a.lend();
+        b.lend();
+        // A short heap takes the oldest list's slots first.
+        let mut tries = 0;
+        let first = take_lent(|| {
+            tries += 1;
+            (tries == 1).then_some(99)
+        });
+        assert_eq!(first, Some(99));
+        assert!(!a.take_back());
+        assert!(!a.take_back(), "refused until reset");
+        assert!(b.take_back());
+        assert_eq!(b.dynamic, [(2, 20, 7)]);
+        a.reset(std::ptr::null_mut());
+        assert!(a.take_back());
+    }
 }
