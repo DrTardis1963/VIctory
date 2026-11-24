@@ -381,7 +381,11 @@ extern "system" fn copy_page_mappings(
     });
     let mut ok = true;
     for b in batches.into_iter().flatten() {
+        if b.count == 0 {
+            continue;
+        }
         if b.ranges.is_null() {
+            ok = false;
             continue;
         }
         // SAFETY: each batch holds `count` ranges.
@@ -389,16 +393,21 @@ extern "system" fn copy_page_mappings(
         let mut at = b.destination;
         for r in ranges {
             let len = u64::from(r.count) * PAGE;
+            let Some(next) = at.checked_add(len) else {
+                ok = false;
+                break;
+            };
             let inside = |pages: u32| r.start.checked_add(pages).is_some_and(|e| e <= pool_pages);
-            let source = pool + u64::from(r.start) * PAGE;
+            let source = || pool.checked_add(u64::from(r.start) * PAGE);
             ok &= match r.kind {
-                0 if inside(r.count) => map(at, source, len),
-                1 if inside(1) => (0..u64::from(r.count)).all(|k| map(at + k * PAGE, source, PAGE)),
+                0 if inside(r.count) => source().is_some_and(|s| map(at, s, len)),
+                1 if inside(1) => source()
+                    .is_some_and(|s| (0..u64::from(r.count)).all(|k| map(at + k * PAGE, s, PAGE))),
                 2 => map(at, 0, len),
                 3 => true,
                 _ => false,
             };
-            at += len;
+            at = next;
         }
     }
     if !ok {
@@ -543,5 +552,115 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(2));
         Written::GpuTimestamp.write(at[1..].as_mut_ptr().cast(), 8);
         assert!(at[1] > first);
+    }
+
+    #[test]
+    fn copy_page_mappings_handles_ranges_and_overflows() {
+        static MAP_CALLS: std::sync::Mutex<Vec<(u64, u64, u64)>> =
+            std::sync::Mutex::new(Vec::new());
+        fn record_map(to: u64, from: u64, len: u64) -> bool {
+            MAP_CALLS.lock().unwrap().push((to, from, len));
+            true
+        }
+
+        crate::resource::use_page_mapper(record_map);
+        let null = std::ptr::null();
+        assert_eq!(
+            copy_page_mappings(null, 1, std::ptr::null(), 0x200_0000, 8, 0),
+            E_INVALIDARG
+        );
+
+        let ranges = [
+            PageRange {
+                kind: 0,
+                start: 2,
+                count: 3,
+            },
+            PageRange {
+                kind: 1,
+                start: 5,
+                count: 2,
+            },
+            PageRange {
+                kind: 2,
+                start: 0,
+                count: 2,
+            },
+            PageRange {
+                kind: 3,
+                start: 0,
+                count: 1,
+            },
+        ];
+        let batches = [
+            PageBatch {
+                destination: 0x10_0000,
+                count: 0,
+                ranges: std::ptr::null(),
+            },
+            PageBatch {
+                destination: 0x100_0000,
+                count: ranges.len() as u32,
+                ranges: ranges.as_ptr(),
+            },
+        ];
+        MAP_CALLS.lock().unwrap().clear();
+        assert_eq!(
+            copy_page_mappings(null, batches.len() as u32, batches.as_ptr(), 0x200_0000, 8, 0),
+            S_OK
+        );
+        let calls = MAP_CALLS.lock().unwrap().clone();
+        assert_eq!(
+            calls,
+            [
+                (0x100_0000, 0x200_0000 + 2 * PAGE, 3 * PAGE),
+                (0x100_0000 + 3 * PAGE, 0x200_0000 + 5 * PAGE, PAGE),
+                (0x100_0000 + 4 * PAGE, 0x200_0000 + 5 * PAGE, PAGE),
+                (0x100_0000 + 5 * PAGE, 0, 2 * PAGE),
+            ]
+        );
+
+        // Unmapped / skipped ranges with high `pool` / `start`, and overflowing destination ranges
+        // must not panic or map out-of-range addresses.
+        let unmap_high = [PageRange {
+            kind: 2,
+            start: u32::MAX,
+            count: 1,
+        }];
+        let overflow_dest = [PageRange {
+            kind: 2,
+            start: 0,
+            count: 2,
+        }];
+        let bad_batches = [
+            PageBatch {
+                destination: 0x10_0000,
+                count: 1,
+                ranges: unmap_high.as_ptr(),
+            },
+            PageBatch {
+                destination: u64::MAX - PAGE + 1,
+                count: 1,
+                ranges: overflow_dest.as_ptr(),
+            },
+            PageBatch {
+                destination: 0x10_0000,
+                count: 1,
+                ranges: std::ptr::null(),
+            },
+        ];
+        MAP_CALLS.lock().unwrap().clear();
+        assert_eq!(
+            copy_page_mappings(
+                null,
+                bad_batches.len() as u32,
+                bad_batches.as_ptr(),
+                u64::MAX - PAGE + 1,
+                8,
+                0,
+            ),
+            S_OK
+        );
+        assert_eq!(*MAP_CALLS.lock().unwrap(), [(0x10_0000, 0, PAGE)]);
     }
 }
