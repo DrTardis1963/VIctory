@@ -183,11 +183,17 @@ fn far_jump<'a>(
             (Encoding::Sop1, Some("s_getpc_b64")) if sdst == n => {
                 let Some(delta) = delta else { break };
                 // s_getpc_b64 yields the address of the instruction after it.
-                return usize::try_from(prev.offset as i64 + 4 + delta)
+                let target = i64::try_from(prev.offset)
                     .ok()
+                    .and_then(|o| o.checked_add(4))
+                    .and_then(|o| o.checked_add(delta))
+                    .and_then(|t| usize::try_from(t).ok())
                     .filter(|&t| t < len)
-                    .map(Some)
-                    .ok_or(isa(setpc.offset, "far jump target outside the code"));
+                    .ok_or(isa(setpc.offset, "far jump target outside the code"))?;
+                if !target.is_multiple_of(4) {
+                    return Err(isa(setpc.offset, "far jump target not 4-byte aligned"));
+                }
+                return Ok(Some(target));
             }
             _ => {}
         }
@@ -492,5 +498,24 @@ mod tests {
         );
         // s_cbranch_scc0 into the literal of the s_mov_b32 at 4.
         assert!(decode(&bytes(&[sopp(0x04, 1), 0xBE80_03FF, S_ENDPGM, S_ENDPGM])).is_err());
+    }
+
+    #[test]
+    fn rejects_misaligned_far_jump_targets() {
+        let mut code = Vec::with_capacity(32);
+        for w in [
+            0xBE88_1F00_u32, // s_getpc_b64 s[8:9] (PC + 4 = 4)
+            0x8008_FF08,
+            22,          // s_add_u32 s8, s8, 22 -> target 26 (misaligned)
+            0x8209_8009, // s_addc_u32 s9, s9, 0
+            0xBE80_2008, // s_setpc_b64 s[8:9]
+        ] {
+            code.extend_from_slice(&w.to_le_bytes());
+        }
+        code.extend_from_slice(&[0u8; 6]);
+        code.extend_from_slice(&S_ENDPGM.to_le_bytes());
+        code.extend_from_slice(&[0u8; 2]);
+        assert_eq!(code.len(), 32);
+        assert!(matches!(decode(&code), Err(ShaderError::Isa { offset: 16, .. })));
     }
 }
