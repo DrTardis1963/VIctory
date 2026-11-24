@@ -12,15 +12,19 @@
 //! whole, of the written pages only, compared with the bytes read last; in
 //! physical-page views, which cannot be watched, at every submission that
 //! samples it.
+//! Only the subresources whose memory holds changed bytes are detiled
+//! again when the written pages are known (watched memory read before).
 //!
-//! shortcut: a change detiles the whole texture, not the pages written.
-//! Only textures read through descriptor tables are brought up to date
+//! shortcut: a changed subresource is detiled whole, not just its blocks in
+//! the pages written, and every subresource is still copied into the host
+//! texture. Only textures read through descriptor tables are brought up to date
 //! (directly indexed views are not known per draw); plane 0 is uploaded
 //! (every mip and array slice), depth and stencil planes are not.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use std::ops::Range;
 use std::sync::{Arc, Mutex};
 
 use windows::Win32::Graphics::Direct3D12::*;
@@ -48,6 +52,8 @@ pub(crate) struct Staging {
     layout: victory_formats::texture::Layout,
     /// Mips per array slice.
     mips: u32,
+    /// Per subresource, the byte ranges of the memory it is detiled from.
+    extents: Vec<Vec<Range<usize>>>,
     memory: *const u8,
     /// Original packed 16-bit format (86 or 115) when the host texture was
     /// widened to R8G8B8A8_UNORM, so detiled 2-byte texels expand into the
@@ -82,6 +88,23 @@ static RUNTIME_WRITES: AtomicU64 = AtomicU64::new(0);
 /// The runtime is about to write title memory (a title copy at submission).
 pub(crate) fn runtime_writes_title() {
     RUNTIME_WRITES.fetch_add(1, Relaxed);
+}
+
+/// Whether any of `changed` overlaps any of `extents` (both sorted).
+fn overlaps(extents: &[Range<usize>], changed: &[Range<usize>]) -> bool {
+    let (mut i, mut j) = (0, 0);
+    while i < extents.len() && j < changed.len() {
+        let (e, c) = (&extents[i], &changed[j]);
+        if e.start < c.end && c.start < e.end {
+            return true;
+        }
+        if e.end <= c.end {
+            i += 1;
+        } else {
+            j += 1;
+        }
+    }
+    false
 }
 
 // SAFETY: the staging mapping is written only at submission, under
@@ -225,7 +248,8 @@ impl Staging {
         let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
         let last = &mut *last;
         if let Some((now, written)) = crate::watch::writes(start, start + size, false) {
-            if last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked) {
+            let before = last.asked;
+            if before != 0 && written.iter().all(|&(_, w)| w <= before) {
                 return 0;
             }
             let since = std::mem::replace(&mut last.asked, now);
@@ -292,7 +316,7 @@ impl Staging {
         since: u64,
     ) -> usize {
         let start = self.memory as usize;
-        let (mut bytes, mut changed) = (0, false);
+        let (mut bytes, mut changed) = (0, Vec::new());
         for (from, to) in written_runs(written, since, start, start + read.len()) {
             SCRATCH.with_borrow_mut(|now| {
                 now.resize(to - from, 0);
@@ -300,17 +324,18 @@ impl Staging {
                 crate::host::copy_mapped(now.as_mut_ptr(), at, to - from, false);
                 if read[from..to] != now[..] {
                     read[from..to].copy_from_slice(now);
-                    changed = true;
+                    changed.push(from..to);
                 }
             });
             bytes += to - from;
         }
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexWatched, bytes as u64);
-        if changed {
+        if !changed.is_empty() {
             // The hash is of an older read: the next whole read detiles.
             last.hash = None;
-            self.detile(read);
+            // Only the subresources the changed runs (sorted) reach.
+            self.detile(read, Some(&changed));
             self.generation.fetch_add(1, Relaxed);
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::TexChanged, read.len() as u64);
@@ -329,15 +354,17 @@ impl Staging {
             return size;
         }
         last.hash = Some(hash);
-        self.detile(tiled);
+        self.detile(tiled, None);
         self.generation.fetch_add(1, Relaxed);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
         size
     }
 
-    /// Detiles `tiled` (the texture's memory) into the staging buffer.
-    fn detile(&self, tiled: &[u8]) {
+    /// Detiles `tiled` (the texture's memory) into the staging buffer: the
+    /// subresources whose memory overlaps `changed` (sorted byte ranges),
+    /// or all of them.
+    fn detile(&self, tiled: &[u8], changed: Option<&[Range<usize>]>) {
         #[cfg(feature = "diagnostics")]
         if tiled.iter().all(|&b| b == 0) {
             tracing::debug!(
@@ -348,6 +375,9 @@ impl Staging {
         }
         let mut packed = Vec::new();
         for (i, (footprint, &rows)) in self.footprints.iter().zip(&self.rows).enumerate() {
+            if changed.is_some_and(|c| !overlaps(&self.extents[i], c)) {
+                continue;
+            }
             let (mip, slice) = (i as u32 % self.mips, i as u32 / self.mips);
             let f = footprint.Footprint;
             let pitch = f.RowPitch as usize;
@@ -550,6 +580,18 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         )
     });
     tracing::debug!(?desc, total, "texture contents uploaded from title memory");
+    let mips = u32::from(d.MipLevels).max(1);
+    let whole: Vec<_> = std::iter::once(0..layout.size as usize).collect();
+    let extents = (0..count)
+        .map(|i| match layout.extents(i % mips, i / mips) {
+            Ok(e) => e
+                .into_iter()
+                .map(|r| r.start as usize..r.end as usize)
+                .collect(),
+            // Detiling it fails too; any change "touches" it.
+            Err(_) => whole.clone(),
+        })
+        .collect();
     let s = Arc::new(Staging {
         buffer,
         #[cfg(feature = "diagnostics")]
@@ -559,6 +601,7 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         rows,
         layout,
         mips: u32::from(d.MipLevels),
+        extents,
         memory,
         widened_from,
         last: Mutex::default(),
@@ -572,6 +615,22 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
 mod tests {
     use super::*;
     use victory_formats::texture::{Dimension, Swizzle, Texture, TextureDesc};
+
+    #[test]
+    fn ranges_overlap_only_when_they_share_a_byte() {
+        let extents = [10..20, 40..50];
+        assert!(overlaps(&extents, &[15..16]));
+        assert!(overlaps(&extents, &[0..5, 49..60]));
+        assert!(overlaps(&extents, &[0..11]));
+        // Touching ends share no byte.
+        assert!(!overlaps(&extents, &[20..40]));
+        assert!(!overlaps(&extents, &[0..10, 20..40, 50..90]));
+        assert!(!overlaps(&extents, &[]));
+        assert!(!overlaps(&[], &[0..100]));
+        // A long change across several extents, and the reverse.
+        assert!(overlaps(&[10..20, 40..50], &[0..100]));
+        assert!(overlaps(&[0..100], &[10..20, 40..50]));
+    }
 
     #[test]
     fn committed_regions_answer_as_a_query_and_remember_the_region() {
