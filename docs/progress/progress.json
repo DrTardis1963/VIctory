@@ -21,34 +21,34 @@
   ],
   "game": [
     {
-      "stage": "Boot and first-boot screens",
+      "stage": "Inicialização e telas da primeira execução",
       "state": "works",
       "note": "30 fps"
     },
     {
-      "stage": "Intro video with sound",
+      "stage": "Vídeo de abertura com som",
       "state": "works",
-      "note": "30 fps, 33.3 ms per frame"
+      "note": "30 fps, 33,3 ms por quadro"
     },
     {
-      "stage": "Start screen and menus",
+      "stage": "Tela inicial e menus",
       "state": "works",
       "note": "30 fps"
     },
     {
-      "stage": "First loading screen",
+      "stage": "Primeira tela de carregamento",
       "state": "partial",
-      "note": "1-2 fps; ~2.5 min without a frame while the driver makes the world's pipelines (cold cache)"
+      "note": "1-2 fps; ~2,5 min sem quadro enquanto o driver cria os pipelines do mundo (cache frio)"
     },
     {
-      "stage": "First cutscene",
+      "stage": "Primeira cutscene",
       "state": "partial",
-      "note": "reached; 90-160 s per frame; some runs lose the device after 2-4 min"
+      "note": "alcançada; 90-160 s por quadro; algumas execuções perdem o dispositivo após 2-4 min"
     },
     {
-      "stage": "Free roam",
+      "stage": "Exploração livre",
       "state": "broken",
-      "note": "not reached"
+      "note": "não alcançada"
     }
   ]
 }

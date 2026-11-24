@@ -17,29 +17,29 @@ Veja [Running with the Proton launcher](docs/proton-launcher.md).
 
 <!-- progress:start -->
 ![shaders: 88.8%](https://img.shields.io/badge/shaders-88.8%25-yellow)
-![Mesh shaders: 97.5%](https://img.shields.io/badge/Mesh%20shaders-97.5%25-green)
-![Vertex/pixel shaders: 88.8%](https://img.shields.io/badge/Vertex%2Fpixel%20shaders-88.8%25-yellow)
-![Compute shaders: 59.9%](https://img.shields.io/badge/Compute%20shaders-59.9%25-orange)
-![measured: 2026-11-24](https://img.shields.io/badge/measured-2026--11--24-blue)
+![shaders Mesh: 97.5%](https://img.shields.io/badge/shaders%20Mesh-97.5%25-green)
+![shaders Vertex/pixel: 88.8%](https://img.shields.io/badge/shaders%20Vertex%2Fpixel-88.8%25-yellow)
+![shaders Compute: 59.9%](https://img.shields.io/badge/shaders%20Compute-59.9%25-orange)
+![medido: 2026-11-24](https://img.shields.io/badge/medido-2026--11--24-blue)
 
-| Part | Progress | % | Count |
+| Parte | Progresso | % | Contagem |
 |---|---|---|---|
-| **All shaders** | `██████████████████░░` | **88.8%** | 22519 / 25334 |
-| Mesh shaders | `████████████████████` | 97.5% | 8501 / 8713 |
-| Vertex/pixel shaders | `██████████████████░░` | 88.8% | 12469 / 14039 |
-| Compute shaders | `████████████░░░░░░░░` | 59.9% | 1549 / 2582 |
-| **Game stages working** | `██████████░░░░░░░░░░` | **50.0%** | 3 / 6 |
+| **Todos os shaders** | `██████████████████░░` | **88.8%** | 22519 / 25334 |
+| Shaders Mesh | `████████████████████` | 97.5% | 8501 / 8713 |
+| Shaders Vertex/pixel | `██████████████████░░` | 88.8% | 12469 / 14039 |
+| Shaders Compute | `████████████░░░░░░░░` | 59.9% | 1549 / 2582 |
+| **Etapas do jogo funcionando** | `██████████░░░░░░░░░░` | **50.0%** | 3 / 6 |
 
-| Game stage | State | Measured |
+| Etapa do jogo | Estado | Medição |
 |---|---|---|
-| Boot and first-boot screens | ✅ | 30 fps |
-| Intro video with sound | ✅ | 30 fps, 33.3 ms per frame |
-| Start screen and menus | ✅ | 30 fps |
-| First loading screen | ⚠️ | 1-2 fps; ~2.5 min without a frame while the driver makes the world's pipelines (cold cache) |
-| First cutscene | ⚠️ | reached; 90-160 s per frame; some runs lose the device after 2-4 min |
-| Free roam | ❌ | not reached |
+| Inicialização e telas da primeira execução | ✅ | 30 fps |
+| Vídeo de abertura com som | ✅ | 30 fps, 33,3 ms por quadro |
+| Tela inicial e menus | ✅ | 30 fps |
+| Primeira tela de carregamento | ⚠️ | 1-2 fps; ~2,5 min sem quadro enquanto o driver cria os pipelines do mundo (cache frio) |
+| Primeira cutscene | ⚠️ | alcançada; 90-160 s por quadro; algumas execuções perdem o dispositivo após 2-4 min |
+| Exploração livre | ❌ | não alcançada |
 
-*Measured 2026-11-24 on NVIDIA GeForce RTX 4060 Ti 8 GB, Intel Core i7-13700K, Windows 11 (`d3a24ce9`). Shader counts are the console shaders of the Xbox Series 1.0.2.1 dump that translate for this host (`victory translate`); game stages are what a run reached. Regenerate with `cargo xtask progress` after editing `docs/progress/progress.json`.*
+*Medido em 2026-11-24 em NVIDIA GeForce RTX 4060 Ti 8 GB, Intel Core i7-13700K, Windows 11 (`d3a24ce9`). As contagens de shaders são os shaders de console do dump do Xbox Series 1.0.2.1 que são traduzidos para este host (`victory translate`); as etapas do jogo são o que uma execução alcançou. Regenere com `cargo xtask progress` depois de editar `docs/progress/progress.json`.*
 <!-- progress:end -->
 
 ## Situação (2026-11-23)

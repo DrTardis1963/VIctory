@@ -91,9 +91,9 @@ fn render(json: &Value) -> Result<String> {
         done_all += done;
         total_all += total;
         let p = percent(done, total);
-        badges.push(badge(&format!("{stage} shaders"), &format!("{p:.1}%"), color(p)));
+        badges.push(badge(&format!("shaders {stage}"), &format!("{p:.1}%"), color(p)));
         rows.push_str(&format!(
-            "| {stage} shaders | `{}` | {p:.1}% | {done} / {total} |\n",
+            "| Shaders {stage} | `{}` | {p:.1}% | {done} / {total} |\n",
             bar(p)
         ));
     }
@@ -105,7 +105,7 @@ fn render(json: &Value) -> Result<String> {
         out.push('\n');
     }
     let measured = str_of(json, "measured")?;
-    out.push_str(&badge("measured", measured, "blue"));
+    out.push_str(&badge("medido", measured, "blue"));
     out.push_str("\n\n");
 
     let stages = json["game"].as_array().context("progress.json: `game` is missing")?;
@@ -115,15 +115,15 @@ fn render(json: &Value) -> Result<String> {
         .count();
     let p_game = percent(reached as u64, stages.len() as u64);
     out.push_str(&format!(
-        "| Part | Progress | % | Count |\n|---|---|---|---|\n\
-         | **All shaders** | `{}` | **{p_all:.1}%** | {done_all} / {total_all} |\n{rows}\
-         | **Game stages working** | `{}` | **{p_game:.1}%** | {reached} / {} |\n\n",
+        "| Parte | Progresso | % | Contagem |\n|---|---|---|---|\n\
+         | **Todos os shaders** | `{}` | **{p_all:.1}%** | {done_all} / {total_all} |\n{rows}\
+         | **Etapas do jogo funcionando** | `{}` | **{p_game:.1}%** | {reached} / {} |\n\n",
         bar(p_all),
         bar(p_game),
         stages.len()
     ));
 
-    out.push_str("| Game stage | State | Measured |\n|---|---|---|\n");
+    out.push_str("| Etapa do jogo | Estado | Medição |\n|---|---|---|\n");
     for g in stages {
         let icon = match str_of(g, "state")? {
             "works" => "✅",
@@ -137,10 +137,10 @@ fn render(json: &Value) -> Result<String> {
         ));
     }
     out.push_str(&format!(
-        "\n*Measured {measured} on {} (`{}`). Shader counts are the console shaders of the \
-         Xbox Series 1.0.2.1 dump that translate for this host (`victory translate`); game \
-         stages are what a run reached. Regenerate with `cargo xtask progress` after editing \
-         `docs/progress/progress.json`.*\n",
+        "\n*Medido em {measured} em {} (`{}`). As contagens de shaders são os shaders de console \
+         do dump do Xbox Series 1.0.2.1 que são traduzidos para este host (`victory translate`); \
+         as etapas do jogo são o que uma execução alcançou. Regenere com `cargo xtask progress` \
+         depois de editar `docs/progress/progress.json`.*\n",
         str_of(json, "gpu")?,
         str_of(json, "commit")?
     ));
@@ -173,7 +173,7 @@ mod tests {
         )
         .unwrap();
         let s = render(&json).unwrap();
-        assert!(s.contains("| Mesh shaders |"));
+        assert!(s.contains("| Shaders Mesh |"));
         assert!(s.contains("| Boot | ✅ | 30 fps |"));
         assert!(s.contains("| World | ❌ | hangs |"));
         assert!(s.contains("1 / 2"));
