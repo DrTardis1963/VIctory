@@ -501,7 +501,7 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
 /// gets copies of the aligned windows it touches.
 /// shortcut: copies of windows are never freed; key them to the title's
 /// allocations if memory use grows.
-const WINDOW: u64 = 4 << 20;
+const WINDOW: u64 = 1 << 20;
 
 /// Copies of title memory outside buffers, by (start, length).
 static LOOSE: Mutex<BTreeMap<(u64, u64), Arc<Shadow>>> = Mutex::new(BTreeMap::new());

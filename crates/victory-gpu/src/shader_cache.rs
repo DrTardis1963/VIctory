@@ -19,12 +19,46 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 pub use victory_pipeline::Cache;
 use victory_pipeline::Converter;
-use victory_shader::emit::{HostShader, StaticSampler, TableView, Target, UserData};
+use victory_shader::emit::{
+    HostShader, StaticSampler, TableView, Target, TranslateOptions, UserData, Wave64Mode,
+};
 use victory_shader::{HwStage, RootType};
 
 static CACHE: OnceLock<Cache> = OnceLock::new();
 static HITS: AtomicU64 = AtomicU64::new(0);
 static MISSES: AtomicU64 = AtomicU64::new(0);
+
+fn mode_byte(mode: Wave64Mode) -> u8 {
+    match mode {
+        Wave64Mode::Native => 0,
+        Wave64Mode::Wave32 => 1,
+        Wave64Mode::Emulate => 2,
+    }
+}
+
+/// The Wave64 lowering in use for console wave64 compute programs.
+pub fn wave64_mode() -> Wave64Mode {
+    wave64_mode_with_source().0
+}
+
+/// The Wave64 lowering in use, and where it came from: `env` when
+/// `VICTORY_WAVE64_EMULATE` chose it, else `auto`: [`Wave64Mode::Native`],
+/// which follows the host's wave sizes ([`Target`]: wave64 programs run as
+/// two 32-lane waves or in the console flow on 32-lane hosts).
+/// `emulate` (#189) emulates 64-lane waves in group-shared memory instead,
+/// `wave32` maps them onto `WaveSize(32)` waves with group-shared scratch.
+pub fn wave64_mode_with_source() -> (Wave64Mode, &'static str) {
+    if let Ok(v) = std::env::var("VICTORY_WAVE64_EMULATE") {
+        match v.trim().to_ascii_lowercase().as_str() {
+            "0" | "native" => return (Wave64Mode::Native, "env"),
+            "wave32" | "32" => return (Wave64Mode::Wave32, "env"),
+            "1" | "emulate" | "force" => return (Wave64Mode::Emulate, "env"),
+            "" | "auto" => {}
+            other => tracing::warn!(value = other, "unknown VICTORY_WAVE64_EMULATE; using auto"),
+        }
+    }
+    (Wave64Mode::Native, "auto")
+}
 
 /// Serialization schema version for [`encode`] / [`decode`]. Bump whenever
 /// [`HostShader`]'s on-disk format changes.
@@ -48,7 +82,7 @@ pub fn use_shader_cache(dir: PathBuf) {
 
 /// Stores an already-translated [`HostShader`] for `container` into `cache`
 /// under the current translator fingerprint, for a host that runs `target`'s
-/// wave sizes. Returns `true` if a new entry was written, `false` if it was
+/// wave sizes with [`wave64_mode`]'s lowering. Returns `true` if a new entry was written, `false` if it was
 /// already present.
 pub fn store(
     cache: &Cache,
@@ -56,7 +90,7 @@ pub fn store(
     target: Target,
     shader: &HostShader,
 ) -> anyhow::Result<bool> {
-    store_with_build(cache, &key(build(), target), container, shader)
+    store_with_build(cache, &key(build(), target, wave64_mode()), container, shader)
 }
 
 fn store_with_build(
@@ -116,20 +150,25 @@ fn build_fingerprint(source_hash: &str, schema_version: u32, loop_limit: u32, sp
 /// The translation of a console shader container for a host that runs
 /// `target`'s wave sizes, from the cache when there is one.
 pub(crate) fn host_shader(container: &[u8], target: Target) -> Result<HostShader, String> {
-    let translate =
-        |c: &[u8]| victory_shader::emit::translate_for(c, target).map_err(|e| e.to_string());
+    let wave64 = wave64_mode();
+    let options = TranslateOptions { wave64 };
+    let translate = |c: &[u8]| {
+        victory_shader::emit::translate_options(c, target, options).map_err(|e| e.to_string())
+    };
     match CACHE.get() {
-        Some(cache) => cached(cache, &key(build(), target), container, translate),
+        Some(cache) => cached(cache, &key(build(), target, wave64), container, translate),
         None => translate(container),
     }
 }
 
-/// The part of an entry's key before the container: the build, and the
-/// host's wave sizes (a translation for one host's waves is not another's).
-fn key(build: &[u8; 32], target: Target) -> [u8; 32] {
+/// The part of an entry's key before the container: the build, the host's
+/// wave sizes and the Wave64 lowering (a translation for one host's waves
+/// is not another's).
+fn key(build: &[u8; 32], target: Target, wave64: Wave64Mode) -> [u8; 32] {
     let mut h = blake3::Hasher::new();
     h.update(build);
     h.update(&target.key());
+    h.update(&[mode_byte(wave64)]);
     *h.finalize().as_bytes()
 }
 
@@ -478,9 +517,15 @@ mod tests {
             lanes_min: 32,
             lanes_max: 64,
         };
-        assert_eq!(key(&build, nvidia), key(&build, nvidia));
-        assert_ne!(key(&build, nvidia), key(&build, rdna));
-        assert_ne!(key(&build, nvidia), key(&[8; 32], nvidia));
+        let native = Wave64Mode::Native;
+        assert_eq!(key(&build, nvidia, native), key(&build, nvidia, native));
+        assert_ne!(key(&build, nvidia, native), key(&build, rdna, native));
+        assert_ne!(key(&build, nvidia, native), key(&[8; 32], nvidia, native));
+        // Another Wave64 lowering translates separately.
+        assert_ne!(
+            key(&build, nvidia, native),
+            key(&build, nvidia, Wave64Mode::Emulate)
+        );
     }
 
     fn walk(dir: &std::path::Path) -> Vec<PathBuf> {
@@ -553,7 +598,7 @@ mod tests {
         assert!(!store(&cache, container, Target::ANY, &expected).unwrap());
 
         let runs = AtomicU64::new(0);
-        let got = cached(&cache, &key(build(), Target::ANY), container, |_| {
+        let got = cached(&cache, &key(build(), Target::ANY, wave64_mode()), container, |_| {
             runs.fetch_add(1, Ordering::Relaxed);
             Ok(expected.clone())
         });
