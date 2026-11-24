@@ -12,8 +12,11 @@
 //! bake) are there at once as before; past the budget a draw or dispatch
 //! whose pipeline is not ready is dropped, as an untranslated one is.
 //!
-//! The default budget is half a second per title frame. A pass the title
-//! runs only once and whose pipeline takes longer is lost.
+//! The default budget is half a second per title frame for the first
+//! [`WARMUP_FRAMES`] (boot and one-shot init passes compile reliably), then
+//! [`STEADY_MS`]: half a second in every frame that met a new pipeline made
+//! the intro and menus stutter while a cold library was filled. A pass the
+//! title runs only once and whose pipeline takes longer is lost.
 //!
 //! A dispatch is not dropped that way: what a compute pass writes is read
 //! later (by draws, other passes, the CPU), and a dropped one leaves that
@@ -105,17 +108,24 @@ pub(crate) fn missing(p: &Pending) -> Option<String> {
 /// Signalled whenever a worker has made a pipeline.
 static DONE: (Mutex<()>, Condvar) = (Mutex::new(()), Condvar::new());
 
-/// Waiting allowed per title frame, over all threads.
-fn wait_budget() -> Duration {
-    static BUDGET: OnceLock<Duration> = OnceLock::new();
-    *BUDGET.get_or_init(|| {
+/// Title frames that get [`WARMUP_MS`] of waiting.
+const WARMUP_FRAMES: u64 = 60;
+const WARMUP_MS: u64 = 500;
+/// Waiting per frame after the warm-up frames.
+const STEADY_MS: u64 = 8;
+
+/// Waiting allowed in title frame `frame`, over all threads;
+/// `VICTORY_PIPELINE_WAIT_MS` sets it for every frame.
+fn wait_budget(frame: u64) -> Duration {
+    static BUDGET: OnceLock<Option<Duration>> = OnceLock::new();
+    let set = *BUDGET.get_or_init(|| {
         let millis = std::env::var("VICTORY_PIPELINE_WAIT_MS")
             .ok()
-            .and_then(|value| value.trim().parse::<u64>().ok())
-            .unwrap_or(500);
-        tracing::info!(millis, "host pipeline wait budget per frame");
-        Duration::from_millis(millis)
-    })
+            .and_then(|value| value.trim().parse::<u64>().ok());
+        tracing::info!(?millis, "host pipeline wait budget per frame (none: {WARMUP_MS} ms, then {STEADY_MS} ms)");
+        millis.map(Duration::from_millis)
+    });
+    set.unwrap_or(Duration::from_millis(if frame < WARMUP_FRAMES { WARMUP_MS } else { STEADY_MS }))
 }
 
 /// Pipelines queued and not made yet.
@@ -227,7 +237,7 @@ fn shared_budget() -> bool {
 
 /// Waits for `p` while frame `frame` has budget left.
 fn wait(p: &Pending, frame: u64) {
-    let budget = wait_budget();
+    let budget = wait_budget(frame);
     if budget.is_zero() {
         return;
     }
