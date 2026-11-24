@@ -1048,6 +1048,7 @@ mod tests {
         let c = crate::Container {
             digest: [0; 16],
             version: (1, 0),
+            total_size: 0,
             parts: vec![],
         };
         let p = crate::ir::build(&native.code, native.wave64, native.vgprs)?;

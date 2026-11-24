@@ -104,6 +104,14 @@ pub fn records(file: &[u8]) -> impl Iterator<Item = Record<'_>> {
     })
 }
 
+/// Parses the SGD5 record whose marker sits at byte offset `at`.
+pub fn record_at(file: &[u8], at: usize) -> Option<Record<'_>> {
+    match record(file, at) {
+        Found::Record(r) => Some(r),
+        Found::Truncated | Found::Nothing => None,
+    }
+}
+
 enum Found<'a> {
     Record(Record<'a>),
     /// A record header whose packed bytes run past the end of the file.

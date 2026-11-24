@@ -91,6 +91,10 @@ enum Command {
         /// Print one line per program and outcome.
         #[arg(long)]
         list: bool,
+        /// Write translated shaders into `<cache_dir>/shaders` to warm the
+        /// runtime shader cache ahead of time.
+        #[arg(long)]
+        write_cache: bool,
         /// Worker threads (default: every logical core).
         #[arg(long)]
         jobs: Option<usize>,
@@ -174,9 +178,10 @@ fn dispatch(command: Command) -> Result<()> {
             validate,
             pipelines,
             list,
+            write_cache,
             jobs,
             host_lanes,
-        } => translate::run(paths, validate, pipelines, list, jobs, host_lanes),
+        } => translate::run(paths, validate, pipelines, list, write_cache, jobs, host_lanes),
         Command::Run {
             exe,
             unimplemented,
