@@ -271,13 +271,15 @@ pub extern "system" fn XApuEnqueueCommand(
             tracing::debug!(stream, channels, "Opus stream activated");
             result.error = if decoder.is_some() {
                 ALREADY_ACTIVE
+            } else if !(1..=2).contains(&channels) {
+                E_INVALIDARG
             } else {
                 match OpusDecoder::new(48_000, channels as usize) {
-                    Ok(d) if (1..=2).contains(&channels) => {
+                    Ok(d) => {
                         *decoder = Some(d);
                         S_OK
                     }
-                    _ => E_INVALIDARG,
+                    Err(_) => E_INVALIDARG,
                 }
             };
         }
@@ -340,14 +342,20 @@ fn process(decoder: &mut OpusDecoder, options: u32, command: &Process, result: &
         .min(command.frame_count as usize)
         .min(output_length as usize / (4 * channels));
     let kept = &pcm[first * channels..(first + frames) * channels];
-    // SAFETY: the title's output buffer holds `output_length` bytes.
-    let out = unsafe { std::slice::from_raw_parts_mut(output.cast::<f32>(), frames * channels) };
     if options & DEINTERLEAVED_OUTPUT != 0 && channels == 2 {
+        let out = output.cast::<f32>();
         for (i, frame) in kept.as_chunks::<2>().0.iter().enumerate() {
-            (out[i], out[frames + i]) = (frame[0], frame[1]);
+            // SAFETY: `output` holds at least `frames * 2 * 4` bytes; unaligned writes tolerate any byte offset.
+            unsafe {
+                out.add(i).write_unaligned(frame[0]);
+                out.add(frames + i).write_unaligned(frame[1]);
+            }
         }
     } else {
-        out.copy_from_slice(kept);
+        // SAFETY: `output` holds at least `kept.len() * 4` bytes; byte copy has alignment 1.
+        unsafe {
+            std::ptr::copy_nonoverlapping(kept.as_ptr().cast::<u8>(), output, kept.len() * 4);
+        }
     }
     result.frames = frames as u32;
     result.output_length = (frames * channels * 4) as u32;
@@ -520,5 +528,103 @@ mod tests {
         let error = unsafe { result.assume_init() }.error;
         assert_eq!(error, INVALID_STREAM);
         assert_eq!(XApuDisconnect(handle), S_OK);
+    }
+
+    #[test]
+    fn process_accepts_unaligned_output_and_activate_rejects_bad_channels() {
+        let tone: Vec<f32> = (0..960 * 2)
+            .map(|i| ((i / 2) as f32 * 440.0 * std::f32::consts::TAU / 48_000.0).sin() * 0.5)
+            .collect();
+        let mut encoder = OpusEncoder::new(48_000, 2, Application::Audio).unwrap();
+        let mut packet = [0u8; 1500];
+        let n = encoder.encode(&tone, 960, &mut packet).unwrap();
+
+        for options in [0, DEINTERLEAVED_OUTPUT] {
+            let input = ConnectInput {
+                process: DECODE_OPUS,
+                streams: 4,
+                commands_per_stream: 4,
+                memory: 0x2_0000,
+                frames_per_output: 0,
+                options,
+            };
+            let mut output = ConnectOutput {
+                memory: std::ptr::null_mut(),
+                result_event: std::ptr::null_mut(),
+            };
+            let mut handle = std::ptr::null_mut();
+            assert_eq!(XApuConnect(&input, &mut output, &mut handle), S_OK);
+            let base = output.memory.cast::<u8>();
+
+            let mut result = std::mem::MaybeUninit::<ApuResult>::zeroed();
+            for bad_channels in [u32::MAX, 3] {
+                let bad = Activate {
+                    id: id(ACTIVATE, 0),
+                    channels: bad_channels,
+                    init_length: 0,
+                    init: std::ptr::null(),
+                    start_pitch: 1.0,
+                    processing_length: 0,
+                    processing: std::ptr::null_mut(),
+                };
+                assert_eq!(
+                    XApuEnqueueCommand(handle, (&raw const bad).cast(), std::ptr::null_mut()),
+                    S_OK
+                );
+                assert_eq!(XApuDequeueResult(handle, result.as_mut_ptr()), S_OK);
+                // SAFETY: written above.
+                let err = unsafe { result.assume_init() }.error;
+                assert_eq!(err, E_INVALIDARG);
+            }
+
+            let ok = Activate {
+                id: id(ACTIVATE, 0),
+                channels: 2,
+                init_length: 0,
+                init: std::ptr::null(),
+                start_pitch: 1.0,
+                processing_length: 0,
+                processing: std::ptr::null_mut(),
+            };
+            assert_eq!(
+                XApuEnqueueCommand(handle, (&raw const ok).cast(), std::ptr::null_mut()),
+                S_OK
+            );
+            assert_eq!(XApuDequeueResult(handle, result.as_mut_ptr()), S_OK);
+
+            // SAFETY: inside the connection memory.
+            unsafe { std::ptr::copy_nonoverlapping(packet.as_ptr(), base, n) };
+            let out_ptr = base.wrapping_add(0x1_0001);
+            let process = Process {
+                id: id(PROCESS, 0),
+                pitch_ramp: 0.0,
+                target_pitch: 1.0,
+                first_frame: 0,
+                frame_count: 960,
+                input_length: n as u32,
+                input: base,
+                output_length: 960 * 8,
+                output: out_ptr,
+            };
+            assert_eq!(
+                XApuEnqueueCommand(handle, (&raw const process).cast(), std::ptr::null_mut()),
+                S_OK
+            );
+            assert_eq!(XApuDequeueResult(handle, result.as_mut_ptr()), S_OK);
+            // SAFETY: written above.
+            let decoded = unsafe { result.assume_init() };
+            let (error, frames, length) = (decoded.error, decoded.frames, decoded.output_length);
+            assert_eq!((error, frames, length), (S_OK, 960, 960 * 8));
+
+            let p = out_ptr.cast::<f32>();
+            let energy: f32 = (0..1920)
+                // SAFETY: `960 * 8` bytes were written starting at `out_ptr`.
+                .map(|i| unsafe { p.add(i).read_unaligned() })
+                .map(|s| s * s)
+                .sum::<f32>()
+                / 1920.0;
+            assert!(energy > 0.01, "decoded unaligned output, energy {energy}");
+            assert_eq!(XApuDisconnect(handle), S_OK);
+        }
     }
 }
