@@ -144,6 +144,9 @@ struct Last {
     /// The frame a refresh without the lock last found a page of the
     /// texture not there ([`no_wait`]): it is not read again that frame.
     left: Option<u64>,
+    /// The frame a guarded texture was last read whole (written, or on its
+    /// turn for the hash under the guard).
+    netted: Option<u64>,
 }
 
 // SAFETY: the staging mapping is written only at submission, under
@@ -785,10 +788,15 @@ impl Staging {
             const HASH_EVERY: u64 = 8;
             let unwritten = last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked);
             last.asked = now;
-            let turn = crate::frame::current().wrapping_add((start >> 16) as u64).is_multiple_of(HASH_EVERY);
+            let frame = crate::frame::current();
+            // The net once on the turn's frame, not at each of its ~32
+            // submissions that sample the texture.
+            let turn = frame.wrapping_add((start >> 16) as u64).is_multiple_of(HASH_EVERY)
+                && last.netted != Some(frame);
             if unwritten && !turn {
                 return 0;
             }
+            last.netted = Some(frame);
             #[cfg(feature = "diagnostics")]
             {
                 unreported = unwritten;
