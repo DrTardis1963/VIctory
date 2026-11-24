@@ -91,6 +91,9 @@ pub(crate) struct State {
     bindless_prepared: Option<(usize, (u64, u64, u64), u64)>,
     /// Its dynamic slots are in [`LENT`] under this id (see [`State::lend`]).
     lent: Option<u64>,
+    /// Root SRVs bound as one-view tables in this list: (host heap, title
+    /// address) → dynamic slot.
+    root_srv_slots: std::collections::HashMap<(usize, u64), u32>,
 }
 
 impl Drop for State {
@@ -192,6 +195,7 @@ fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
     let gpu = shadow.gpu(address);
     if srv || gpu % 256 == 0 {
         shadow.refresh(list, address, len);
+        list.buffer_state(&shadow.buffer, crate::host::BUFFER_READ);
         return Some(gpu);
     }
     let (gpu, to) = list.scratch(len)?;
@@ -212,6 +216,16 @@ fn set(roots: &mut Vec<Root>, slot: u32, root: Root) {
         roots.resize(slot + 1, Root::None);
     }
     roots[slot] = root;
+}
+
+/// Whether translated shaders get their heaps' guard slots (#483), so that
+/// a computed heap index at or past one reads it. With
+/// `VICTORY_HEAP_GUARD=0` they get `u32::MAX`: the same shaders, and no
+/// index is redirected. A diagnostic for a fault inside AMD's driver that a
+/// tester bisected to the merge that brought the guard into this tree.
+fn heap_guard() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_GUARD").is_none_or(|v| v != "0"))
 }
 
 impl State {
@@ -447,6 +461,29 @@ impl State {
         };
     }
 
+    /// The value of user-data dword `u` of a translated shader: a root
+    /// argument, or a bound heap's guard slot.
+    fn user_dword(&self, compute: bool, u: &victory_shader::emit::UserData) -> u32 {
+        let guard = |samplers: bool| {
+            let h = self.heaps[usize::from(samplers)];
+            (h != 0)
+                .then(|| crate::descriptor::heap(h as This).host())
+                .flatten()
+                .map_or(0, |h| {
+                    if heap_guard() {
+                        h.guard_slot()
+                    } else {
+                        u32::MAX
+                    }
+                })
+        };
+        match u.root {
+            RootType::ResourceHeap => guard(false),
+            RootType::SamplerHeap => guard(true),
+            _ => self.user_value(compute, u.slot, u.root, u.dword),
+        }
+    }
+
     /// The user-data value of a root argument, as translated shaders read
     /// it: a table's byte offset in its heap, a constant's value.
     fn user_value(&self, compute: bool, slot: u8, root: RootType, dword: u32) -> u32 {
@@ -547,6 +584,8 @@ impl State {
                 continue;
             };
             shadow.refresh(list, v.address, u64::from(v.size));
+            // After `bind`: a shader may have written the buffer before.
+            list.buffer_state(&shadow.buffer, crate::host::BUFFER_READ);
             *view = D3D12_VERTEX_BUFFER_VIEW {
                 BufferLocation: shadow.gpu(v.address),
                 SizeInBytes: v.size,
@@ -565,6 +604,7 @@ impl State {
                 return false;
             };
             shadow.refresh(list, v.address, u64::from(v.size));
+            list.buffer_state(&shadow.buffer, crate::host::BUFFER_READ);
             let view = D3D12_INDEX_BUFFER_VIEW {
                 BufferLocation: shadow.gpu(v.address),
                 SizeInBytes: v.size,
@@ -687,7 +727,7 @@ impl State {
                             );
                             return false;
                         }
-                        None => self.user_value(compute, u.slot, u.root, u.dword),
+                        None => self.user_dword(compute, u),
                     };
                 }
                 // SAFETY: an open list; `values` covers the parameter.
@@ -701,12 +741,23 @@ impl State {
             }
             for (views, srv) in [(&stage.root_cbvs, false), (&stage.root_srvs, true)] {
                 for &(slot, param) in views {
-                    let Some(Root::View(address)) = self.roots_ref(compute).get(usize::from(slot))
+                    let tabled = srv && crate::pipeline::host::bounded_root_srvs();
+                    let Some(&Root::View(address)) = self.roots_ref(compute).get(usize::from(slot))
                     else {
                         once!(slot, srv, "a shader reads a root view the title did not set");
+                        // An unset table is undefined: a null view instead.
+                        if tabled && self.root_srv_table(list, None, param, compute) {
+                            continue;
+                        }
                         return false;
                     };
-                    let Some(gpu) = root_view(list, *address, srv) else {
+                    if tabled {
+                        if !self.root_srv_table(list, Some(address), param, compute) {
+                            return false;
+                        }
+                        continue;
+                    }
+                    let Some(gpu) = root_view(list, address, srv) else {
                         once!(
                             slot,
                             srv,
@@ -725,6 +776,77 @@ impl State {
                         }
                     }
                 }
+            }
+        }
+        true
+    }
+
+    /// Binds a root SRV as a one-view table (see
+    /// [`crate::pipeline::host::bounded_root_srvs`]): a raw view of the
+    /// title buffer's host copy from `address` to the copy's end, or a null
+    /// view (no address, or no host copy). One slot per address per list.
+    /// False if no dynamic slot could be had (the draw is dropped).
+    fn root_srv_table(
+        &mut self,
+        list: &HostList,
+        address: Option<u64>,
+        param: u32,
+        compute: bool,
+    ) -> bool {
+        let Some((heap, host)) = self
+            .heaps
+            .iter()
+            .filter(|&&h| h != 0)
+            .map(|&h| crate::descriptor::heap(h as This))
+            .find_map(|h| h.host().filter(|x| !x.is_sampler()).map(|x| (h, x)))
+        else {
+            once!("a root SRV without a bound view heap: the draw is dropped");
+            return false;
+        };
+        let shadow = address.and_then(|a| crate::shadow::find(a, 1).map(|s| (a, s)));
+        let key = (std::ptr::from_ref(heap) as usize, address.unwrap_or(0));
+        let index = match self.root_srv_slots.get(&key) {
+            Some(&index) => index,
+            None => {
+                let Some(index) = host.dynamic(1) else {
+                    return false;
+                };
+                self.dynamic.push((key.0, index, 1));
+                self.root_srv_slots.insert(key, index);
+                match &shadow {
+                    Some((a, s)) => {
+                        // SAFETY: a live buffer.
+                        let base = unsafe { s.buffer.GetGPUVirtualAddress() };
+                        let offset = s.gpu(*a) - base;
+                        if offset.is_multiple_of(16) {
+                            host.raw_at(index, &s.buffer, offset, s.left(*a));
+                        } else {
+                            // Raw views start on 16 bytes; one from the
+                            // aligned start would shift every read.
+                            once!(
+                                address = format_args!("{a:#x}"),
+                                "a root SRV not on 16 bytes reads zeros"
+                            );
+                            host.null_raw_at(index);
+                        }
+                    }
+                    None => host.null_raw_at(index),
+                }
+                index
+            }
+        };
+        if let Some((a, s)) = &shadow {
+            s.refresh(list, *a, s.left(*a).min(1 << 20));
+            // As [`root_view`]: the copy may be in its written state.
+            list.buffer_state(&s.buffer, crate::host::BUFFER_READ);
+        }
+        let handle = host.gpu_handle(index);
+        // SAFETY: an open list; the slot is in the bound view heap.
+        unsafe {
+            if compute {
+                list.list.SetComputeRootDescriptorTable(param, handle);
+            } else {
+                list.list.SetGraphicsRootDescriptorTable(param, handle);
             }
         }
         true
@@ -783,7 +905,7 @@ impl State {
             let t = stage.translated();
             let _ = write!(text, " | {}:", stage.shader.hash);
             for u in &t.host.user_data {
-                let v = self.user_value(compute, u.slot, u.root, u.dword);
+                let v = self.user_dword(compute, u);
                 let table = u.root == RootType::Table;
                 let (kind, index) = if table {
                     ("table", v / 32)
@@ -869,8 +991,9 @@ impl State {
             .map(|u| u.slot)
             .collect();
         // Tables reaching past a host heap smaller than the title's (the
-        // host's limit, 1,000,000 views on NVIDIA) are made afresh too: the
-        // title's slots there have no host slot of their own.
+        // host's limit, 1,000,000 views on NVIDIA, 2,048 samplers anywhere)
+        // are made afresh too: the title's slots there have no host slot of
+        // their own.
         for u in used.iter().filter(tables) {
             if fresh.contains(&u.slot) {
                 continue;
@@ -1284,15 +1407,8 @@ impl State {
         if let Some((s, at)) = &counter {
             s.refresh(list, *at, 4);
         }
-        let count_buffer = counter.as_ref().map(|(s, _)| &s.buffer);
         // Bounded first: the clamp binds a compute pipeline of its own.
-        if !crate::indirect::bound(
-            list,
-            &args.buffer,
-            args.offset(arguments),
-            count_buffer,
-            (kind, stride, max),
-        ) {
+        if !crate::indirect::bound(list, &args.buffer, args.offset(arguments), (kind, stride, max)) {
             why("not bounded (no clamp or invalid argument range)");
             return false;
         }
@@ -1315,7 +1431,6 @@ impl State {
                     Some((buffer, offset, triangles, vertices))
                 });
             let Some(made) = made else {
-                crate::indirect::done(list, &args.buffer, count_buffer);
                 why("rectangles not expanded");
                 return false;
             };
@@ -1334,10 +1449,6 @@ impl State {
             _ => false,
         };
         if !ran {
-            crate::indirect::done(list, &from, count_buffer);
-            if rects {
-                crate::indirect::done(list, &args.buffer, None);
-            }
             #[cfg(feature = "diagnostics")]
             match crate::pipeline::host_pipeline(self.pipeline as This) {
                 None => crate::pipeline::note_drop(self.pipeline as This),
@@ -1349,22 +1460,13 @@ impl State {
         list.note_op(|| {
             self.op_text(format!("indirect kind {kind} max {max} at {arguments:#x}"), kind == DISPATCH)
         });
-        // SAFETY: an open list with everything set; the buffers are host
-        // copies the list keeps alive (refresh), the signature is cached.
-        unsafe {
-            list.list.ExecuteIndirect(
-                &signature,
-                max,
-                &from,
-                at,
-                count_buffer,
-                counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
-            )
-        };
-        crate::indirect::done(list, &from, count_buffer);
-        if rects {
-            crate::indirect::done(list, &args.buffer, None);
-        }
+        crate::indirect::execute(
+            list,
+            &signature,
+            max,
+            (&from, at),
+            counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at))),
+        );
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
         } else {
@@ -1428,6 +1530,9 @@ fn readable(list: &HostList, u: &UsedResource, view: &View) {
         shadow.refresh(list, address, len);
         if u.kind == ResourceType::Uav {
             shadow.gpu_writes(list, address, len);
+            list.buffer_state(&shadow.buffer, crate::host::BUFFER_WRITE);
+        } else {
+            list.buffer_state(&shadow.buffer, crate::host::BUFFER_READ);
         }
     }
     match (view, u.kind) {

@@ -46,7 +46,6 @@ pub(crate) struct Host {
     fence: ID3D12Fence,
     /// The last value signalled on `fence`, behind the submission lock.
     submitted: Mutex<u64>,
-    indirect_prelude: OnceLock<windows::core::Result<Prelude>>,
     event: HANDLE,
     rtvs: ID3D12DescriptorHeap,
     rtv_size: u32,
@@ -330,7 +329,6 @@ fn create() -> windows::core::Result<Host> {
             queue,
             fence,
             submitted: Mutex::new(0),
-            indirect_prelude: OnceLock::new(),
             event,
             rtvs,
             rtv_size,
@@ -453,6 +451,342 @@ mod tests {
             desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0,
         );
     }
+
+    #[test]
+    fn buffer_states_transition_between_writes_and_reads() {
+        let mut s = BufferStates::default();
+        // First uses: the prelude's.
+        assert_eq!(s.update(1, 'a', BUFFER_WRITE), None);
+        assert_eq!(s.update(2, 'b', BUFFER_READ), None);
+        assert_eq!(s.update(1, 'a', BUFFER_WRITE), None);
+        assert_eq!(s.update(1, 'a', BUFFER_READ), Some(BUFFER_WRITE));
+        assert_eq!(s.update(1, 'a', BUFFER_READ), None);
+        assert_eq!(s.update(1, 'a', BUFFER_WRITE), Some(BUFFER_READ));
+        let sorted = |mut v: Vec<(char, u32)>| {
+            v.sort_unstable();
+            v
+        };
+        let firsts = sorted(s.firsts().map(|(r, f)| (*r, f)).collect());
+        assert_eq!(firsts, [('a', BUFFER_WRITE), ('b', BUFFER_READ)]);
+        let lasts = sorted(s.lasts().map(|(r, l)| (*r, l)).collect());
+        assert_eq!(lasts, [('a', BUFFER_WRITE), ('b', BUFFER_READ)]);
+        s.clear();
+        assert_eq!(s.firsts().count(), 0);
+    }
+
+    /// Set in the child process `in_child` starts.
+    const CHILD: &str = "VICTORY_TEST_DEBUG_LAYER_CHILD";
+
+    /// Runs the test `name` of this module alone in a child process and
+    /// checks that it passed; false in that child. The debug layer is
+    /// process-wide and must be on before the host device is made.
+    fn in_child(name: &str) -> bool {
+        if std::env::var_os(CHILD).is_some() {
+            return false;
+        }
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([&format!("host::tests::{name}"), "--exact", "--nocapture"])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        eprintln!("{text}");
+        assert!(out.status.success(), "the child test failed");
+        assert!(text.contains("1 passed"), "the child ran no test");
+        true
+    }
+
+    fn compile(source: &str, entry: windows::core::PCSTR, target: windows::core::PCSTR) -> Vec<u8> {
+        use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
+        use windows::Win32::Graphics::Direct3D::ID3DBlob;
+        let (mut code, mut errors): (Option<ID3DBlob>, Option<ID3DBlob>) = (None, None);
+        // SAFETY: the source and names live through the call; out pointers
+        // ours; the blobs' own bytes are read.
+        unsafe {
+            let made = D3DCompile(
+                source.as_ptr().cast(),
+                source.len(),
+                None,
+                None,
+                None,
+                entry,
+                target,
+                0,
+                0,
+                &mut code,
+                Some(&mut errors),
+            );
+            if let Some(e) = &errors {
+                let text = std::slice::from_raw_parts(
+                    e.GetBufferPointer().cast::<u8>(),
+                    e.GetBufferSize(),
+                );
+                assert!(made.is_ok(), "{}", String::from_utf8_lossy(text));
+            }
+            made.unwrap();
+            let code = code.unwrap();
+            std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize())
+                .to_vec()
+        }
+    }
+
+    /// A buffer a shader writes and draws read as vertices, as the world's
+    /// 174 MB heap is (#199, #264): the argument clamp writes it and
+    /// indirect and plain draws read it, in two lists submitted together.
+    /// The debug layer checks every barrier's state before against what
+    /// the lists did (id 527, which #264 reported); it does not check
+    /// vertex buffer states at draws on every system, so this cannot show
+    /// #199's vertex buffer in unordered access.
+    #[test]
+    fn debug_layer_accepts_buffers_written_then_read_as_vertices() {
+        use windows::core::s;
+        if in_child("debug_layer_accepts_buffers_written_then_read_as_vertices") {
+            return;
+        }
+        let mut layer: Option<ID3D12Debug> = None;
+        // SAFETY: plain queries, before any device exists in this process.
+        if unsafe { D3D12GetDebugInterface(&mut layer) }.is_err() {
+            eprintln!("no D3D12 debug layer; skipped");
+            return;
+        }
+        // SAFETY: as above.
+        unsafe { layer.unwrap().EnableDebugLayer() };
+        let Some(host) = host() else {
+            eprintln!("no host device; skipped");
+            return;
+        };
+        let messages: ID3D12InfoQueue = host.device.cast().unwrap();
+
+        const SOURCE: &str = r#"
+            #define RS "RootFlags(ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT)"
+            [RootSignature(RS)] float4 vs(float4 p : POSITION) : SV_Position { return p; }
+            [RootSignature(RS)] float4 ps() : SV_Target { return float4(1, 0, 0, 1); }
+        "#;
+        let (vs, ps) = (
+            compile(SOURCE, s!("vs"), s!("vs_5_1")),
+            compile(SOURCE, s!("ps"), s!("ps_5_1")),
+        );
+        let element = D3D12_INPUT_ELEMENT_DESC {
+            SemanticName: s!("POSITION"),
+            Format: DXGI_FORMAT_R32G32B32A32_FLOAT,
+            InputSlotClass: D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA,
+            ..Default::default()
+        };
+        let mut blend = D3D12_BLEND_DESC::default();
+        blend.RenderTarget[0] = D3D12_RENDER_TARGET_BLEND_DESC {
+            SrcBlend: D3D12_BLEND_ONE,
+            DestBlend: D3D12_BLEND_ZERO,
+            BlendOp: D3D12_BLEND_OP_ADD,
+            SrcBlendAlpha: D3D12_BLEND_ONE,
+            DestBlendAlpha: D3D12_BLEND_ZERO,
+            BlendOpAlpha: D3D12_BLEND_OP_ADD,
+            LogicOp: D3D12_LOGIC_OP_NOOP,
+            RenderTargetWriteMask: D3D12_COLOR_WRITE_ENABLE_ALL.0 as u8,
+            ..Default::default()
+        };
+        let stencil = D3D12_DEPTH_STENCILOP_DESC {
+            StencilFailOp: D3D12_STENCIL_OP_KEEP,
+            StencilDepthFailOp: D3D12_STENCIL_OP_KEEP,
+            StencilPassOp: D3D12_STENCIL_OP_KEEP,
+            StencilFunc: D3D12_COMPARISON_FUNC_ALWAYS,
+        };
+        // SAFETY: plain object creation from valid descriptions; the
+        // shader bytes outlive the calls.
+        let (root, pso, target) = unsafe {
+            let root: ID3D12RootSignature = host.device.CreateRootSignature(0, &vs).unwrap();
+            let mut desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
+                pRootSignature: std::mem::transmute_copy(&root),
+                VS: D3D12_SHADER_BYTECODE {
+                    pShaderBytecode: vs.as_ptr().cast(),
+                    BytecodeLength: vs.len(),
+                },
+                PS: D3D12_SHADER_BYTECODE {
+                    pShaderBytecode: ps.as_ptr().cast(),
+                    BytecodeLength: ps.len(),
+                },
+                BlendState: blend,
+                SampleMask: u32::MAX,
+                RasterizerState: D3D12_RASTERIZER_DESC {
+                    FillMode: D3D12_FILL_MODE_SOLID,
+                    CullMode: D3D12_CULL_MODE_NONE,
+                    DepthClipEnable: true.into(),
+                    ..Default::default()
+                },
+                DepthStencilState: D3D12_DEPTH_STENCIL_DESC {
+                    DepthWriteMask: D3D12_DEPTH_WRITE_MASK_ZERO,
+                    DepthFunc: D3D12_COMPARISON_FUNC_ALWAYS,
+                    FrontFace: stencil,
+                    BackFace: stencil,
+                    ..Default::default()
+                },
+                InputLayout: D3D12_INPUT_LAYOUT_DESC {
+                    pInputElementDescs: &element,
+                    NumElements: 1,
+                },
+                PrimitiveTopologyType: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+                NumRenderTargets: 1,
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                ..Default::default()
+            };
+            desc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+            let pso: ID3D12PipelineState = host.device.CreateGraphicsPipelineState(&desc).unwrap();
+            let mut target: Option<ID3D12Resource> = None;
+            host.device
+                .CreateCommittedResource(
+                    &D3D12_HEAP_PROPERTIES {
+                        Type: D3D12_HEAP_TYPE_DEFAULT,
+                        ..Default::default()
+                    },
+                    D3D12_HEAP_FLAG_NONE,
+                    &D3D12_RESOURCE_DESC {
+                        Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                        Width: 4,
+                        Height: 4,
+                        DepthOrArraySize: 1,
+                        MipLevels: 1,
+                        Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                        SampleDesc: DXGI_SAMPLE_DESC {
+                            Count: 1,
+                            Quality: 0,
+                        },
+                        Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+                        ..Default::default()
+                    },
+                    D3D12_RESOURCE_STATE_RENDER_TARGET,
+                    None,
+                    &mut target,
+                )
+                .unwrap();
+            (root, pso, target.unwrap())
+        };
+
+        // Three vertices at 0, a draw's arguments (3 vertices, 1 instance)
+        // at 256: one buffer, as title memory is.
+        let (buffer, data) = host.shared_buffer(1 << 16).unwrap();
+        let vertices: [f32; 12] = [
+            -1.0, -1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 1.0, -1.0, 0.0, 1.0,
+        ];
+        // SAFETY: inside the mapping.
+        unsafe {
+            std::ptr::copy_nonoverlapping(vertices.as_ptr().cast::<u8>(), data, 48);
+            std::ptr::copy_nonoverlapping([3u32, 1, 0, 0].as_ptr().cast::<u8>(), data.add(256), 16);
+        }
+        // SAFETY: a live buffer.
+        let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+        let rtv = host.rtv(&target, None);
+        // SAFETY: one draw argument, no root arguments.
+        let signature: ID3D12CommandSignature = unsafe {
+            let argument = D3D12_INDIRECT_ARGUMENT_DESC {
+                Type: D3D12_INDIRECT_ARGUMENT_TYPE_DRAW,
+                ..Default::default()
+            };
+            let mut signature = None;
+            host.device
+                .CreateCommandSignature(
+                    &D3D12_COMMAND_SIGNATURE_DESC {
+                        ByteStride: 16,
+                        NumArgumentDescs: 1,
+                        pArgumentDescs: &argument,
+                        NodeMask: 0,
+                    },
+                    None::<&ID3D12RootSignature>,
+                    &mut signature,
+                )
+                .unwrap();
+            signature.unwrap()
+        };
+        // The draw state, with the buffer's vertices bound as `draw.rs`
+        // binds them.
+        let bind = |list: &HostList| {
+            list.buffer_state(&buffer, BUFFER_READ);
+            // SAFETY: an open list; our objects, alive until the lists ran.
+            unsafe {
+                let l = &list.list;
+                l.SetGraphicsRootSignature(&root);
+                l.SetPipelineState(&pso);
+                l.OMSetRenderTargets(1, Some(&rtv), false, None);
+                l.RSSetViewports(&[D3D12_VIEWPORT {
+                    Width: 4.0,
+                    Height: 4.0,
+                    MaxDepth: 1.0,
+                    ..Default::default()
+                }]);
+                l.RSSetScissorRects(&[RECT {
+                    right: 4,
+                    bottom: 4,
+                    ..Default::default()
+                }]);
+                l.IASetPrimitiveTopology(
+                    windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST,
+                );
+                l.IASetVertexBuffers(
+                    0,
+                    Some(&[D3D12_VERTEX_BUFFER_VIEW {
+                        BufferLocation: gpu,
+                        SizeInBytes: 48,
+                        StrideInBytes: 16,
+                    }]),
+                );
+            }
+        };
+        let draw = |list: &HostList| {
+            bind(list);
+            // SAFETY: an open list with the draw state set.
+            unsafe { list.list.DrawInstanced(3, 1, 0, 0) };
+        };
+        // As `draw.rs` executes indirect draws: clamp, bind, execute.
+        let indirect = |list: &HostList| {
+            assert!(crate::indirect::bound(list, &buffer, 256, (0, 16, 1)));
+            bind(list);
+            crate::indirect::execute(list, &signature, 1, (&buffer, 256), None);
+        };
+        // A list that draws, draws indirectly, draws; then one that starts
+        // with an indirect draw, submitted together.
+        let (a, b) = (host.new_list().unwrap(), host.new_list().unwrap());
+        draw(&a);
+        indirect(&a);
+        draw(&a);
+        a.close();
+        indirect(&b);
+        draw(&b);
+        b.close();
+        // SAFETY: plain queries.
+        unsafe { messages.ClearStoredMessages() };
+        host.execute(&[&a, &b]);
+
+        let mut errors = Vec::new();
+        // SAFETY: each message is read into a buffer of the size the queue
+        // reports.
+        unsafe {
+            for i in 0..messages.GetNumStoredMessages() {
+                let mut size = 0;
+                if messages.GetMessage(i, None, &mut size).is_err() || size == 0 {
+                    continue;
+                }
+                let mut bytes = vec![0u64; size.div_ceil(8)];
+                let m = bytes.as_mut_ptr().cast::<D3D12_MESSAGE>();
+                if messages.GetMessage(i, Some(m), &mut size).is_ok()
+                    && (*m).Severity.0 <= D3D12_MESSAGE_SEVERITY_ERROR.0
+                {
+                    let text =
+                        std::slice::from_raw_parts((*m).pDescription, (*m).DescriptionByteLength);
+                    errors.push(format!(
+                        "id {}: {}",
+                        (*m).ID.0,
+                        String::from_utf8_lossy(text)
+                    ));
+                }
+            }
+        }
+        assert!(errors.is_empty(), "debug layer errors: {errors:#?}");
+    }
 }
 
 /// A host command list and its allocator, always used together.
@@ -479,6 +813,11 @@ pub(crate) struct HostList {
     /// list names alive until it is reset, even if the title releases the
     /// resource first.
     states: Mutex<States>,
+    /// The states of the host copies of title memory the list uses.
+    buffers: Mutex<BufferStates<ID3D12Resource>>,
+    /// Depth targets the list gave unordered access to since it last made
+    /// them current: their twins hold their contents until copied back.
+    twins: Mutex<Vec<HostCopy>>,
     /// The list that runs those transitions just before this one.
     prelude: Prelude,
     /// The pipelines the list binds, for reports of slow submissions.
@@ -513,6 +852,71 @@ type States = std::collections::HashMap<
     usize,
     (u32, u32, std::sync::Arc<crate::resource::HostTexture>),
 >;
+
+/// Every read of a host copy of title memory (vertex, index, constant and
+/// shader-resource data, indirect arguments).
+pub(crate) const BUFFER_READ: u32 = D3D12_RESOURCE_STATE_GENERIC_READ.0 as u32;
+/// Shader writes to a host copy of title memory.
+pub(crate) const BUFFER_WRITE: u32 = D3D12_RESOURCE_STATE_UNORDERED_ACCESS.0 as u32;
+
+/// The states of the host copies of title memory (buffers) one list uses,
+/// by copy: the state it starts in and the one it is in now. A buffer is in
+/// the common state between lists: the list's prelude moves it to its first
+/// state and the list moves it back before it closes. A buffer a shader
+/// writes and a later draw reads as vertices (#199, #264) is transitioned in
+/// between; the implicit promotion from common that it relied on allows
+/// either use in a list, not both.
+///
+/// shortcut: buffers read only through directly indexed heaps are not
+/// tracked, and a command that both writes a buffer and reads it as
+/// vertices, indices or arguments leaves it in the read state.
+pub(crate) struct BufferStates<R> {
+    by_copy: std::collections::HashMap<usize, (u32, u32, R)>,
+}
+
+impl<R> Default for BufferStates<R> {
+    fn default() -> Self {
+        BufferStates {
+            by_copy: std::collections::HashMap::new(),
+        }
+    }
+}
+
+impl<R> BufferStates<R> {
+    /// The list uses `copy` (`resource`) in `wanted`: the state it leaves,
+    /// if a transition must be recorded now. A first use records nothing:
+    /// the prelude moves the buffer there.
+    pub(crate) fn update(&mut self, copy: usize, resource: R, wanted: u32) -> Option<u32> {
+        match self.by_copy.entry(copy) {
+            std::collections::hash_map::Entry::Vacant(v) => {
+                v.insert((wanted, wanted, resource));
+                None
+            }
+            std::collections::hash_map::Entry::Occupied(mut o) => {
+                let before = std::mem::replace(&mut o.get_mut().1, wanted);
+                (before != wanted).then_some(before)
+            }
+        }
+    }
+
+    /// The prelude's transitions: each buffer from common to its first state.
+    pub(crate) fn firsts(&self) -> impl Iterator<Item = (&R, u32)> {
+        self.by_copy.values().map(|(first, _, r)| (r, *first))
+    }
+
+    /// The list's closing transitions: each buffer from its last state back
+    /// to common.
+    pub(crate) fn lasts(&self) -> impl Iterator<Item = (&R, u32)> {
+        self.by_copy.values().map(|(_, last, r)| (r, *last))
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.by_copy.clear();
+    }
+}
+
+/// A title texture's host copy, as lists hold it.
+type HostCopy = std::sync::Arc<crate::resource::HostTexture>;
 
 /// Whether device-removed data is on (`VICTORY_D3D12_DRED`, diagnostics
 /// builds).
@@ -836,8 +1240,6 @@ struct Deferred {
     /// descriptor heaps): the title may release its objects before it
     /// submits the list.
     kept: Vec<ID3D12Object>,
-    /// Whole buffers whose indirect uses need enhanced barriers.
-    indirect_buffers: std::collections::HashMap<usize, ID3D12Resource>,
     /// Buffer ranges refreshed since the last title copy (host copy,
     /// address, bytes): refreshing them again would find the same bytes.
     refreshed: std::collections::HashSet<(usize, usize, usize)>,
@@ -923,7 +1325,9 @@ impl Host {
             );
             if !target.runs(64) {
                 tracing::warn!(
-                    "the host has no 64-lane waves: console wave64 compute programs that read                      other lanes do not translate, and their dispatches are dropped"
+                    "the host has no 64-lane waves: console wave64 compute programs that need \
+                     their whole wave run as two 32-lane waves where there is a form for \
+                     them; the rest do not translate, and their dispatches are dropped"
                 );
             }
             target
@@ -954,6 +1358,8 @@ impl Host {
                 scratch: Mutex::default(),
                 arguments: Mutex::default(),
                 states: Mutex::default(),
+                buffers: Mutex::default(),
+                twins: Mutex::default(),
                 prelude: self.new_prelude()?,
                 pipelines: Mutex::default(),
                 budget: Arc::default(),
@@ -980,47 +1386,6 @@ impl Host {
             list.Close()?;
             Ok((allocator, list))
         }
-    }
-
-    /// Selects enhanced barriers for all indirect buffers before any list
-    /// in this submission can implicitly promote them to a legacy state.
-    /// The caller waits for a prior prelude still running before this
-    /// re-records it.
-    fn indirect_prelude(
-        &self,
-        runs: &[&HostList],
-    ) -> windows::core::Result<Option<ID3D12CommandList>> {
-        let mut buffers = std::collections::HashMap::new();
-        for list in runs {
-            buffers.extend(
-                list.deferred()
-                    .indirect_buffers
-                    .iter()
-                    .map(|(&key, buffer)| (key, buffer.clone())),
-            );
-        }
-        if buffers.is_empty() {
-            return Ok(None);
-        }
-        let (allocator, list) = self
-            .indirect_prelude
-            .get_or_init(|| self.new_prelude())
-            .as_ref()
-            .map_err(Clone::clone)?;
-        // SAFETY: the preceding submission finished, and buffers live
-        // through this submission. A new submission starts them in COMMON.
-        unsafe {
-            allocator.Reset()?;
-            list.Reset(allocator, None)?;
-            crate::indirect::buffer_barriers(
-                &list.cast::<ID3D12GraphicsCommandList7>()?,
-                buffers.values(),
-                (D3D12_BARRIER_SYNC_NONE, D3D12_BARRIER_ACCESS_NO_ACCESS),
-                (D3D12_BARRIER_SYNC_ALL, D3D12_BARRIER_ACCESS_COMMON),
-            );
-            list.Close()?;
-        }
-        list.cast().map(Some)
     }
 
     pub(crate) fn new_title_list(&self) -> windows::core::Result<HostList> {
@@ -1309,43 +1674,15 @@ impl Host {
         add(C::PrepRetiredUs, since(step));
         *textures = std::mem::take(&mut batch.textures);
         let prepared = std::time::Instant::now();
-        // An ExecuteCommandLists not waited for yet whose prelude list the
-        // next one would re-record.
-        let mut prelude_running = false;
         for (group, &(first, i)) in groups.iter().enumerate() {
-            let (end, next_run) = groups
-                .get(group + 1)
-                .map_or((lists.len(), runs.len()), |&(end, next)| (end, next));
-            // Buffer state decays at each ExecuteCommandLists boundary, so
-            // each one registers its own lists' indirect buffers.
-            let mut prefixed = Vec::new();
-            let group_runs = &runs[i..next_run];
-            if prelude_running
-                && group_runs
-                    .iter()
-                    .any(|list| !list.deferred().indirect_buffers.is_empty())
-            {
-                *submitted += 1;
-                self.wait_for_submission(*submitted);
-                prelude_running = false;
-            }
-            let group_lists = match self.indirect_prelude(group_runs) {
-                Ok(Some(prelude)) => {
-                    prelude_running = true;
-                    prefixed.push(Some(prelude));
-                    prefixed.extend_from_slice(&lists[first..end]);
-                    prefixed.as_slice()
-                }
-                Ok(None) => &lists[first..end],
-                Err(e) => fail(format_args!("indirect buffer prelude did not record ({e})")),
-            };
+            let end = groups.get(group + 1).map_or(lists.len(), |&(end, _)| end);
+            let group_lists = &lists[first..end];
             let started = std::time::Instant::now();
             // SAFETY: closed lists and a live direct queue.
             unsafe { self.queue.ExecuteCommandLists(group_lists) };
             if timed || group + 1 == groups.len() {
                 *submitted += 1;
                 self.wait_for_submission(*submitted);
-                prelude_running = false;
             }
             #[cfg(feature = "diagnostics")]
             if timed && groups.len() > 1 && started.elapsed() > std::time::Duration::from_millis(50)
@@ -1758,6 +2095,13 @@ impl HostList {
     }
 
     fn close_native(&self) {
+        // Lists end, and so start, with depth targets current, not twins.
+        let twins = std::mem::take(&mut *self.twins.lock().unwrap_or_else(|e| e.into_inner()));
+        for depth in &twins {
+            if let Some(twin) = &depth.twin {
+                self.copy_texture(depth, twin);
+            }
+        }
         #[cfg(feature = "diagnostics")]
         if let Some((heap, back)) = self.stamps() {
             let count = (self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32).min(STAMPS - 1);
@@ -1766,6 +2110,25 @@ impl HostList {
                 self.list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, count);
                 self.list.ResolveQueryData(heap, D3D12_QUERY_TYPE_TIMESTAMP, 0, count + 1, back, 0);
             }
+        }
+        // The buffers it used back to common, where the next list's prelude
+        // expects them.
+        let back: Vec<D3D12_RESOURCE_BARRIER> = self
+            .buffers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .lasts()
+            .map(|(b, last)| {
+                transition(
+                    b,
+                    D3D12_RESOURCE_STATES(last as i32),
+                    D3D12_RESOURCE_STATE_COMMON,
+                )
+            })
+            .collect();
+        if !back.is_empty() {
+            // SAFETY: an open list and buffers the list holds.
+            unsafe { self.list.ResourceBarrier(&back) };
         }
         // SAFETY: our list.
         if let Err(e) = unsafe { self.list.Close() } {
@@ -1781,14 +2144,10 @@ impl HostList {
         self.continuations().clear();
         self.has_buffer_copies.store(false, Ordering::Relaxed);
         *self.deferred() = Deferred::default();
-        self.states
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clear();
-        self.pipelines
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clear();
+        self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.buffers.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
         self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
         {
@@ -1818,7 +2177,8 @@ impl HostList {
     /// Moves a title texture's host copy to `wanted` (a host state) in this
     /// list: the host texture and the state it leaves, if that is a change.
     /// The list's first use of a texture records nothing: its prelude brings
-    /// the texture there at submission.
+    /// the texture there at submission. A depth target with a twin is given
+    /// unordered access through the twin ([`HostList::sync_twin`]).
     pub(crate) fn transition(
         &self,
         resource: crate::object::This,
@@ -1826,17 +2186,105 @@ impl HostList {
     ) -> Option<(&'static ID3D12Resource, u32)> {
         let texture = crate::resource::host_resource(resource)?;
         let copy = crate::resource::host_copy(resource)?;
+        if let Some(twin) = &copy.twin
+            && self.sync_twin(&copy, twin, wanted)
+        {
+            // Unordered access goes to the twin; the depth stays as it is.
+            return None;
+        }
         let wanted = legal_state(texture, wanted);
+        self.track(&copy, wanted).map(|before| (texture, before))
+    }
+
+    /// Notes that the list has `copy` in `wanted` from here on: the state it
+    /// leaves, if that is a change (none on the list's first use).
+    fn track(&self, copy: &HostCopy, wanted: u32) -> Option<u32> {
         let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
-        match states.entry(std::sync::Arc::as_ptr(&copy) as usize) {
+        match states.entry(std::sync::Arc::as_ptr(copy) as usize) {
             std::collections::hash_map::Entry::Vacant(v) => {
-                v.insert((wanted, wanted, copy));
+                v.insert((wanted, wanted, copy.clone()));
                 None
             }
             std::collections::hash_map::Entry::Occupied(mut o) => {
                 let before = std::mem::replace(&mut o.get_mut().1, wanted);
-                (before != wanted).then_some((texture, before))
+                (before != wanted).then_some(before)
             }
+        }
+    }
+
+    /// Moves a host copy of title memory to `wanted` ([`BUFFER_READ`] or
+    /// [`BUFFER_WRITE`]) in this list: see [`BufferStates`].
+    pub(crate) fn buffer_state(&self, buffer: &ID3D12Resource, wanted: u32) {
+        let mut buffers = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(before) = buffers.update(buffer.as_raw() as usize, buffer.clone(), wanted) {
+            let barrier = transition(
+                buffer,
+                D3D12_RESOURCE_STATES(before as i32),
+                D3D12_RESOURCE_STATES(wanted as i32),
+            );
+            // SAFETY: an open list and a buffer the list holds.
+            unsafe { self.list.ResourceBarrier(&[barrier]) };
+        }
+    }
+
+    /// [`HostList::track`], with the barrier to record if it is a change.
+    fn move_to(&self, copy: &HostCopy, wanted: u32) -> Option<D3D12_RESOURCE_BARRIER> {
+        let before = self.track(copy, wanted)?;
+        Some(transition(
+            &copy.texture,
+            D3D12_RESOURCE_STATES(before as i32),
+            D3D12_RESOURCE_STATES(wanted as i32),
+        ))
+    }
+
+    /// Keeps a depth target and its unordered access twin coherent in this
+    /// list: unordered access (`wanted`) after other use copies the depth
+    /// into the twin, other use after unordered access copies the twin back
+    /// (as `close` does). Whether `wanted` is unordered access.
+    /// shortcut: a dispatch that also reads the depth through a shader view
+    /// readied after its unordered access view loses its writes (the read
+    /// copies the twin back first); whole-texture states cannot have both.
+    fn sync_twin(&self, depth: &HostCopy, twin: &HostCopy, wanted: u32) -> bool {
+        const UNORDERED_ACCESS: u32 = 0x8;
+        let unordered = wanted & UNORDERED_ACCESS != 0;
+        let mut twins = self.twins.lock().unwrap_or_else(|e| e.into_inner());
+        let ahead = twins.iter().position(|d| std::sync::Arc::ptr_eq(d, depth));
+        match (unordered, ahead) {
+            (true, None) => {
+                twins.push(depth.clone());
+                drop(twins);
+                self.copy_texture(twin, depth);
+            }
+            (false, Some(i)) => {
+                twins.swap_remove(i);
+                drop(twins);
+                self.copy_texture(depth, twin);
+            }
+            _ => {}
+        }
+        if unordered && let Some(barrier) = self.move_to(twin, UNORDERED_ACCESS) {
+            // SAFETY: an open list and a live texture.
+            unsafe { self.list.ResourceBarrier(&[barrier]) };
+        }
+        unordered
+    }
+
+    /// Records a copy of all of `src` into `dst` (a depth target and its
+    /// twin), with the transitions it needs.
+    fn copy_texture(&self, dst: &HostCopy, src: &HostCopy) {
+        const COPY_DEST: u32 = 0x400;
+        const COPY_SOURCE: u32 = 0x800;
+        let barriers: Vec<D3D12_RESOURCE_BARRIER> =
+            [self.move_to(dst, COPY_DEST), self.move_to(src, COPY_SOURCE)]
+                .into_iter()
+                .flatten()
+                .collect();
+        // SAFETY: an open list and live textures, in the copy states by then.
+        unsafe {
+            if !barriers.is_empty() {
+                self.list.ResourceBarrier(&barriers);
+            }
+            self.list.CopyResource(&dst.texture, &src.texture);
         }
     }
 
@@ -1895,6 +2343,16 @@ impl HostList {
                 }
             }
         }
+        // Host copies of title memory: from common, where every list leaves
+        // them, to the state this list first uses each in.
+        let buffers = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
+        before.extend(buffers.firsts().map(|(b, first)| {
+            transition(
+                b,
+                D3D12_RESOURCE_STATE_COMMON,
+                D3D12_RESOURCE_STATES(first as i32),
+            )
+        }));
         if before.is_empty() && uploads.is_empty() {
             return None;
         }
@@ -2078,19 +2536,6 @@ impl HostList {
             })
             .as_ref()
             .map(|(buffer, _)| buffer)
-    }
-
-    pub(crate) fn use_indirect_buffers<'a>(
-        &self,
-        buffers: impl IntoIterator<Item = &'a ID3D12Resource>,
-    ) {
-        let mut deferred = self.deferred();
-        for buffer in buffers {
-            deferred
-                .indirect_buffers
-                .entry(buffer.as_raw() as usize)
-                .or_insert_with(|| buffer.clone());
-        }
     }
 
     /// `len` bytes (at most 64 KiB) the list's shaders write and its

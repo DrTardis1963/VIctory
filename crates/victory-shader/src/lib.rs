@@ -9,11 +9,13 @@
 pub mod dxbc;
 pub mod dxil;
 pub mod emit;
+pub mod geometry;
 pub mod gfx10;
 pub mod io;
 pub mod ir;
 pub mod native;
 pub mod resource;
+pub mod sgpr_spill;
 pub mod structure;
 
 pub use dxbc::{Container, FourCC, Part};

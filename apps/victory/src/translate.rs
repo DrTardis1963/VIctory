@@ -417,12 +417,12 @@ pub fn run(
         t.unlisted
     );
     println!(
-        "I/O          {} of {} vertex and pixel programs raised ({} interpolations, \
+        "I/O          {} of {} vertex, geometry and pixel programs raised ({} interpolations, \
          {} vertex values; exports {:?}, {} still f16 pairs)",
         t.io_raised, t.io_programs, t.interpolated, t.vertex_values, t.exports, t.compressed
     );
     println!(
-        "DXIL         {} emitted of {} vertex and pixel programs; {} validated, {} pipelines",
+        "DXIL         {} emitted of {} vertex, geometry and pixel programs; {} validated, {} pipelines",
         t.emitted, t.emit_programs, t.validated, t.pipelines
     );
     println!(
@@ -509,15 +509,21 @@ fn translate(
     let container_bytes = &bytes[..container.total_size];
     for (program_index, p) in programs.into_iter().enumerate() {
         t.programs += 1;
-        match ir::build(&p.patched_code(), p.wave64, p.vgprs) {
-            Ok(program) => {
+        match p.translation_ir() {
+            Ok(mut program) => {
+                victory_shader::sgpr_spill::forward(&mut program);
                 t.translated += 1;
                 t.instructions += program.blocks.iter().map(|b| b.insts.len()).sum::<usize>();
                 // Per-lane descriptors are traced on the per-lane form; its
                 // failure is listed after the resources' and I/O's.
                 let structured = structure::structure(&program);
                 let lanes = structured.as_ref().ok();
-                let res = match resource::track(&program, &p.layout, p.stage, lanes) {
+                let io = io::raise(&program, &p);
+                let res = match &io {
+                    Ok(io) => resource::track_io(&program, &p.layout, p.stage, lanes, io),
+                    Err(_) => resource::track(&program, &p.layout, p.stage, lanes),
+                };
+                let res = match res {
                     Ok(r) => {
                         tally_resources(&p, &r, t);
                         Some(r)
@@ -533,12 +539,12 @@ fn translate(
                         None
                     }
                 };
-                let graphics = matches!(p.stage, HwStage::Vs | HwStage::Ps);
+                let graphics = matches!(p.stage, HwStage::Vs | HwStage::Ps | HwStage::Gs);
                 let compute = p.stage == HwStage::Cs;
                 let mut raised = None;
                 if graphics || compute || p.stage == HwStage::Ms {
                     t.io_programs += usize::from(graphics);
-                    match io::raise(&program, &p) {
+                    match io {
                         Ok(r) => {
                             if graphics {
                                 tally_io(&r, t);
@@ -630,6 +636,8 @@ fn check(
         let made = match shader.stage {
             HwStage::Vs => h.pipeline(&shader, stub_ps).map(drop),
             HwStage::Cs => h.compute_pipeline(&shader).map(drop),
+            HwStage::Gs => host::stub_vs(&shader)
+                .and_then(|vs| h.geometry_pipeline(&vs, &shader, stub_ps).map(drop)),
             HwStage::Ms => h.mesh_pipeline(&shader, stub_ps).map(drop),
             _ => host::stub_vs(&shader).and_then(|vs| h.pipeline(&vs, &shader).map(drop)),
         };
@@ -677,7 +685,13 @@ fn check(
                     let _ = std::fs::write(format!("{name}.txt"), format!("{}\n{text}", label()));
                 }
             }
-            t.fail(format!("validator: {first}"), label);
+            // With what the module declares and calls: the validator's
+            // message for an operation the stage or the entry's properties
+            // do not allow names neither.
+            t.fail(
+                format!("validator: {first} [{}]", emit::last_module_summary()),
+                label,
+            );
         }
     }
 }
@@ -710,10 +724,20 @@ fn counter(t: &mut Tally, stage: HwStage, k: usize) -> &mut usize {
 
 fn tally_io(r: &io::Io, t: &mut Tally) {
     t.io_raised += 1;
+    if let Some(gs) = &r.geometry {
+        for op in gs.messages.values() {
+            let name = match op {
+                victory_shader::geometry::StreamOp::Emit(_) => "geometry vertex",
+                victory_shader::geometry::StreamOp::Cut => "strip cut",
+            };
+            *t.exports.entry(name).or_default() += 1;
+        }
+    }
     for (_, i) in &r.interps {
         match i {
             io::Interp::Interpolated { .. } => t.interpolated += 1,
             io::Interp::Vertex { .. } => t.vertex_values += 1,
+            io::Interp::Weighted { .. } => t.interpolated += 1,
         }
     }
     for e in &r.exports {

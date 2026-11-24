@@ -17,16 +17,9 @@
 use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
 use windows::Win32::Graphics::Direct3D::ID3DBlob;
 use windows::Win32::Graphics::Direct3D12::*;
-use windows::core::{Interface, s};
+use windows::core::s;
 
-use crate::host::{HostList, host, transition};
-
-const COMMON_ACCESS: (D3D12_BARRIER_SYNC, D3D12_BARRIER_ACCESS) =
-    (D3D12_BARRIER_SYNC_ALL, D3D12_BARRIER_ACCESS_COMMON);
-const COMPUTE_UAV: (D3D12_BARRIER_SYNC, D3D12_BARRIER_ACCESS) = (
-    D3D12_BARRIER_SYNC_COMPUTE_SHADING,
-    D3D12_BARRIER_ACCESS_UNORDERED_ACCESS,
-);
+use crate::host::{BUFFER_READ, BUFFER_WRITE, HostList, host};
 
 const SOURCE: &str = r#"
 #define RS "RootConstants(num32BitConstants=4, b0), UAV(u0), UAV(u1)"
@@ -121,6 +114,99 @@ void main(uint3 id : SV_DispatchThreadID) {
 }
 "#;
 
+/// Where `dxcompiler.dll` is looked for: `VICTORY_DXC` (the DLL or its
+/// folder), beside the `dxil.dll` shader validation uses (the SDK ships them
+/// together), then the executable's folder and System32.
+fn dxc_library() -> windows::core::Result<windows::Win32::Foundation::HMODULE> {
+    use windows::Win32::System::LibraryLoader::{
+        LOAD_LIBRARY_SEARCH_APPLICATION_DIR, LOAD_LIBRARY_SEARCH_DEFAULT_DIRS,
+        LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR, LOAD_LIBRARY_SEARCH_SYSTEM32, LoadLibraryExW,
+    };
+    use windows::core::{HSTRING, w};
+    let mut paths: Vec<std::path::PathBuf> = Vec::new();
+    if let Some(p) = std::env::var_os("VICTORY_DXC").map(std::path::PathBuf::from) {
+        paths.push(if p.is_dir() {
+            p.join("dxcompiler.dll")
+        } else {
+            p
+        });
+    }
+    if let Some(dir) = victory_shader::emit::validator::Validator::default_path()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+    {
+        paths.push(dir.join("dxcompiler.dll"));
+    }
+    for path in paths.iter().filter(|p| p.is_file()) {
+        // SAFETY: a NUL-terminated path; its folder (dxil.dll) is searched first.
+        if let Ok(m) = unsafe {
+            LoadLibraryExW(
+                &HSTRING::from(path.as_path()),
+                None,
+                LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS,
+            )
+        } {
+            return Ok(m);
+        }
+    }
+    // SAFETY: a bare name, searched only in the executable's folder and System32.
+    unsafe {
+        LoadLibraryExW(
+            w!("dxcompiler.dll"),
+            None,
+            LOAD_LIBRARY_SEARCH_APPLICATION_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32,
+        )
+    }
+}
+
+/// Compiles a compute shader with DXC (see [`dxc_library`]).
+fn dxc_compile(source: &str) -> windows::core::Result<Vec<u8>> {
+    use windows::Win32::Graphics::Direct3D::Dxc::*;
+    use windows::Win32::System::LibraryLoader::GetProcAddress;
+    use windows::core::{Interface, w};
+    type Create = unsafe extern "system" fn(
+        *const windows::core::GUID,
+        *const windows::core::GUID,
+        *mut *mut std::ffi::c_void,
+    ) -> windows::core::HRESULT;
+    // SAFETY: loading the compiler and calling its documented entry point with
+    // out pointers of ours; the buffer and arguments outlive the calls.
+    unsafe {
+        let library = dxc_library()?;
+        let create: Create = std::mem::transmute(
+            GetProcAddress(library, s!("DxcCreateInstance"))
+                .ok_or_else(windows::core::Error::from_thread)?,
+        );
+        let mut raw = std::ptr::null_mut();
+        create(&CLSID_DxcCompiler, &IDxcCompiler3::IID, &mut raw).ok()?;
+        let compiler = IDxcCompiler3::from_raw(raw);
+        let buffer = DxcBuffer {
+            Ptr: source.as_ptr().cast(),
+            Size: source.len(),
+            Encoding: DXC_CP_UTF8.0,
+        };
+        let arguments = [w!("-T"), w!("cs_6_0"), w!("-E"), w!("main"), w!("-O3")];
+        let result: IDxcResult = compiler.Compile(&buffer, Some(&arguments), None)?;
+        if let Err(e) = result.GetStatus()?.ok() {
+            if let Ok(errors) = result.GetErrorBuffer() {
+                let text = std::slice::from_raw_parts(
+                    errors.GetBufferPointer().cast::<u8>(),
+                    errors.GetBufferSize(),
+                );
+                tracing::warn!(
+                    "argument clamp: DXC: {}",
+                    String::from_utf8_lossy(text).trim()
+                );
+            }
+            return Err(e);
+        }
+        let blob = result.GetResult()?;
+        Ok(
+            std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize())
+                .to_vec(),
+        )
+    }
+}
+
 /// One of our compute passes: its root signature (inside the shader) and
 /// pipeline.
 struct Pass {
@@ -178,20 +264,39 @@ fn make(source: &str, what: &str) -> windows::core::Result<Pass> {
             Some(&mut errors),
         )
     };
-    if let Err(e) = compiled {
-        if let Some(errors) = errors {
+    // Wine's d3dcompiler_47 (vkd3d-shader) rejects RWByteAddressBuffer loads:
+    // then DXC (dxcompiler.dll; see `dxc_library` for where it is looked for)
+    // compiles the same source as cs_6_0, root signature inside.
+    let fallback;
+    if let Err(e) = &compiled {
+        if let Some(errors) = &errors {
             // SAFETY: the blob's own bytes.
             let text = unsafe {
-                std::slice::from_raw_parts(errors.GetBufferPointer().cast::<u8>(), errors.GetBufferSize())
+                std::slice::from_raw_parts(
+                    errors.GetBufferPointer().cast::<u8>(),
+                    errors.GetBufferSize(),
+                )
             };
-            tracing::warn!("{what}: {}", String::from_utf8_lossy(text));
+            tracing::info!(
+                error = %e,
+                "{what}: the system compiler refused it ({}); trying DXC",
+                String::from_utf8_lossy(text).trim()
+            );
         }
-        return Err(e);
+        fallback = dxc_compile(source)
+            .inspect_err(|e| tracing::warn!(error = %e, "{what}: DXC failed too"))?;
+    } else {
+        fallback = Vec::new();
     }
-    let code = code.ok_or_else(windows::core::Error::empty)?;
     // SAFETY: the blob's own bytes; the root signature is inside the shader.
     unsafe {
-        let bytes = std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
+        let bytes = match (&compiled, &code) {
+            (Ok(()), Some(code)) => std::slice::from_raw_parts(
+                code.GetBufferPointer().cast::<u8>(),
+                code.GetBufferSize(),
+            ),
+            _ => &fallback[..],
+        };
         let root: ID3D12RootSignature = device.CreateRootSignature(0, bytes)?;
         let pso = device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
             pRootSignature: std::mem::transmute_copy(&root),
@@ -233,43 +338,16 @@ pub(crate) fn byte_len(kind: u32, stride: u32, records: u32) -> Option<u64> {
     (end <= 1 << 32).then_some(end)
 }
 
-fn enhanced_barriers() -> bool {
-    #[cfg(test)]
-    if std::env::var_os("VICTORY_TEST_LEGACY_INDIRECT").is_some() {
-        return false;
-    }
-    static SUPPORTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *SUPPORTED.get_or_init(|| {
-        let Some(host) = host() else { return false };
-        let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS12::default();
-        // SAFETY: the feature query writes the matching options structure.
-        let supported = unsafe {
-            host.device.CheckFeatureSupport(
-                D3D12_FEATURE_D3D12_OPTIONS12,
-                (&raw mut options).cast(),
-                size_of_val(&options) as u32,
-            )
-        }
-        .is_ok()
-            && options.EnhancedBarriersSupported.as_bool();
-        if !supported {
-            tracing::info!("indirect execution uses legacy buffer barriers");
-        }
-        supported
-    })
-}
-
-pub(crate) fn enhanced_list(list: &HostList) -> Option<ID3D12GraphicsCommandList7> {
-    enhanced_barriers().then(|| list.list.cast().ok()).flatten()
-}
-
-/// Validates the arguments in place and makes the native inputs readable.
-/// Replaces the list's compute root signature and pipeline.
+/// Validates the `records` records of `kind` (PC argument numbering)
+/// `stride` bytes apart at `offset` in `buffer` in place, and leaves the
+/// buffer ready to be read as arguments ([`execute`]). Replaces the list's
+/// compute root signature and pipeline (callers bind theirs after). False,
+/// with nothing recorded, if the clamp is not available or the records do
+/// not lie in the buffer.
 pub(crate) fn bound(
     list: &HostList,
     buffer: &ID3D12Resource,
     offset: u64,
-    count: Option<&ID3D12Resource>,
     (kind, stride, records): (u32, u32, u32),
 ) -> bool {
     let Some(len) = byte_len(kind, stride, records) else {
@@ -290,75 +368,29 @@ pub(crate) fn bound(
         return false;
     };
     let l = &list.list;
-    let enhanced = enhanced_list(list);
-    let separate_count = count.filter(|&count| count != buffer);
-    let written = [buffer, budget];
-    if let Some(enhanced) = &enhanced {
-        list.use_indirect_buffers(
-            [Some(buffer), separate_count, Some(budget)]
-                .into_iter()
-                .flatten(),
-        );
-        buffer_barriers(enhanced, written, COMMON_ACCESS, COMPUTE_UAV);
-    } else {
-        uav_barrier(l);
-    }
     let constants = [kind, stride, records, 0];
+    list.buffer_state(buffer, BUFFER_WRITE);
     // SAFETY: an open list; our root signature, pipeline and a live buffer
     // the caller's list holds.
     unsafe {
+        // Earlier shader writes (the title's argument passes) first.
+        l.ResourceBarrier(&[uav_barrier()]);
         l.SetComputeRootSignature(&c.root);
         l.SetPipelineState(&c.pso);
         l.SetComputeRoot32BitConstants(0, 4, constants.as_ptr().cast(), 0);
         l.SetComputeRootUnorderedAccessView(1, gpu);
         l.SetComputeRootUnorderedAccessView(2, budget.GetGPUVirtualAddress());
         l.Dispatch(records.div_ceil(THREADS_PER_GROUP), 1, 1);
-    }
-    if let Some(enhanced) = &enhanced {
-        buffer_barriers(enhanced, written, COMPUTE_UAV, COMMON_ACCESS);
-        buffer_barriers(enhanced, separate_count, COMMON_ACCESS, COMMON_ACCESS);
-    } else {
-        uav_barrier(l);
-        // The clamp writes only the arguments. A distinct count can promote
-        // from COMMON, following a producer handoff if written in this batch.
-        // SAFETY: an open list and a live argument buffer.
-        unsafe {
-            l.ResourceBarrier(&[transition(
-                buffer,
-                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
-            )]);
-        }
+        l.ResourceBarrier(&[uav_barrier()]);
     }
     true
-}
-
-/// Finish indirect reads before later passes reuse the buffers. COMMON
-/// access leaves them available to shaders, vertex fetch, or another call.
-pub(crate) fn done(list: &HostList, args: &ID3D12Resource, count: Option<&ID3D12Resource>) {
-    if let Some(enhanced) = enhanced_list(list) {
-        let buffers = [Some(args), count.filter(|&count| count != args)]
-            .into_iter()
-            .flatten();
-        buffer_barriers(&enhanced, buffers, COMMON_ACCESS, COMMON_ACCESS);
-    } else {
-        // SAFETY: bound transitioned the arguments before indirect use.
-        unsafe {
-            list.list.ResourceBarrier(&[transition(
-                args,
-                D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
-                D3D12_RESOURCE_STATE_COMMON,
-            )]);
-        }
-    }
 }
 
 /// Records, in `list`, the rewrite of `records` rectangle-list draw records
 /// `stride` bytes apart at host address `gpu` in `buffer` (bounded: read as
 /// arguments, and left so) into triangle-list records over the first
 /// `vertices` vertices expanded (see [`RECTANGLES`]): 16-byte records in
-/// the list's argument memory, ready to be read as arguments ([`done`] for
-/// both buffers after the execution). Replaces the list's compute root
+/// the list's argument memory, ready to be read as arguments ([`execute`]). Replaces the list's compute root
 /// signature and pipeline. None, with nothing recorded, if the pass or the
 /// memory is not available.
 /// shortcut: at most 4,096 records (the list's argument memory comes in
@@ -374,90 +406,67 @@ pub(crate) fn rectangles(
         return None;
     }
     let (out, offset) = list.argument_space(u64::from(records) * 16)?;
-    const READ: D3D12_RESOURCE_STATES = D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT;
-    const WRITE: D3D12_RESOURCE_STATES = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
     let l = &list.list;
-    // After `bound` the title's records are in common access (enhanced
-    // barriers) or the indirect-argument state (legacy); `out` starts the
-    // submission in the common state, promoted on its first write.
-    let enhanced = enhanced_list(list);
-    let both = [buffer, &out];
-    if let Some(enhanced) = &enhanced {
-        list.use_indirect_buffers(both);
-        buffer_barriers(enhanced, both, COMMON_ACCESS, COMPUTE_UAV);
-    } else {
-        // SAFETY: an open list and a live buffer `bound` left as arguments.
-        unsafe { l.ResourceBarrier(&[transition(buffer, READ, WRITE)]) };
-    }
+    list.buffer_state(buffer, BUFFER_WRITE);
+    list.buffer_state(&out, BUFFER_WRITE);
     let constants = [stride, records, vertices, 0];
     // SAFETY: an open list; our root signature, pipeline, the caller's live
     // buffer and the list's own argument memory.
     unsafe {
         let to = out.GetGPUVirtualAddress() + offset;
+        // The clamp's writes to the title's records first.
+        l.ResourceBarrier(&[uav_barrier()]);
         l.SetComputeRootSignature(&p.root);
         l.SetPipelineState(&p.pso);
         l.SetComputeRoot32BitConstants(0, 4, constants.as_ptr().cast(), 0);
         l.SetComputeRootUnorderedAccessView(1, gpu);
         l.SetComputeRootUnorderedAccessView(2, to);
         l.Dispatch(records.div_ceil(64), 1, 1);
+        l.ResourceBarrier(&[uav_barrier()]);
     }
-    if let Some(enhanced) = &enhanced {
-        buffer_barriers(enhanced, both, COMPUTE_UAV, COMMON_ACCESS);
-    } else {
-        uav_barrier(l);
-        // SAFETY: an open list; both buffers were written as unordered access.
-        unsafe {
-            l.ResourceBarrier(&[transition(buffer, WRITE, READ), transition(&out, WRITE, READ)]);
-        }
-    }
+    list.buffer_state(buffer, BUFFER_READ);
+    list.buffer_state(&out, BUFFER_READ);
     Some((out, offset))
 }
 
-fn uav_barrier(list: &ID3D12GraphicsCommandList) {
-    // SAFETY: a global UAV barrier with no resource pointer.
-    unsafe {
-        list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
-            Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
-            Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
-            Anonymous: D3D12_RESOURCE_BARRIER_0 {
-                UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
-                    pResource: std::mem::ManuallyDrop::new(None),
-                }),
-            },
-        }]);
+/// Runs `max` records of `signature` from `args` (a host copy of title
+/// memory) at `offset`, with their count at `counter` if there is one: both
+/// read as arguments, after whatever wrote them (the clamp, or the draw's
+/// own binding).
+pub(crate) fn execute(
+    list: &HostList,
+    signature: &ID3D12CommandSignature,
+    max: u32,
+    (args, offset): (&ID3D12Resource, u64),
+    counter: Option<(&ID3D12Resource, u64)>,
+) {
+    list.buffer_state(args, BUFFER_READ);
+    if let Some((c, _)) = counter {
+        list.buffer_state(c, BUFFER_READ);
     }
+    // SAFETY: an open list with everything set; host copies the list keeps
+    // alive, a cached signature.
+    unsafe {
+        list.list.ExecuteIndirect(
+            signature,
+            max,
+            args,
+            offset,
+            counter.map(|(c, _)| c),
+            counter.map_or(0, |(_, at)| at),
+        )
+    };
 }
 
-pub(crate) fn buffer_barriers<'a>(
-    list: &ID3D12GraphicsCommandList7,
-    buffers: impl IntoIterator<Item = &'a ID3D12Resource>,
-    (sync_before, access_before): (D3D12_BARRIER_SYNC, D3D12_BARRIER_ACCESS),
-    (sync_after, access_after): (D3D12_BARRIER_SYNC, D3D12_BARRIER_ACCESS),
-) {
-    let barriers: Vec<_> = buffers
-        .into_iter()
-        .map(|buffer| D3D12_BUFFER_BARRIER {
-            SyncBefore: sync_before,
-            SyncAfter: sync_after,
-            AccessBefore: access_before,
-            AccessAfter: access_after,
-            // SAFETY: borrow the interface for the duration of the call.
-            pResource: unsafe { std::mem::transmute_copy(buffer) },
-            Offset: 0,
-            Size: u64::MAX,
-        })
-        .collect();
-    if !barriers.is_empty() {
-        // SAFETY: the barriers name live whole buffers on an open list.
-        unsafe {
-            list.Barrier(&[D3D12_BARRIER_GROUP {
-                Type: D3D12_BARRIER_TYPE_BUFFER,
-                NumBarriers: barriers.len() as u32,
-                Anonymous: D3D12_BARRIER_GROUP_0 {
-                    pBufferBarriers: barriers.as_ptr(),
-                },
-            }])
-        };
+fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
+    D3D12_RESOURCE_BARRIER {
+        Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+        Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+        Anonymous: D3D12_RESOURCE_BARRIER_0 {
+            UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                pResource: std::mem::ManuallyDrop::new(None),
+            }),
+        },
     }
 }
 
@@ -528,7 +537,6 @@ mod tests {
             "GPU validation adapter: {}",
             String::from_utf16_lossy(&desc.Description[..end])
         );
-        eprintln!("enhanced indirect barriers: {}", enhanced_barriers());
         assert!(clamp().is_some());
     }
 
@@ -570,10 +578,9 @@ mod tests {
                 list,
                 &args.buffer,
                 Self::OFFSET,
-                None,
                 (kind, (4 * N) as u32, input.len() as u32)
             ));
-            done(list, &args.buffer, None);
+            list.buffer_state(&args.buffer, BUFFER_READ);
             args
         }
 
@@ -607,15 +614,6 @@ mod tests {
 
         fn address(&self) -> u64 {
             self.data.as_ptr() as u64
-        }
-
-        fn handoff(
-            &self,
-            list: &HostList,
-            before: D3D12_RESOURCE_STATES,
-            after: D3D12_RESOURCE_STATES,
-        ) {
-            crate::list::test_buffer_handoff(list, self.resource, before.0 as u32, after.0 as u32);
         }
     }
 
@@ -804,16 +802,8 @@ mod tests {
             list.list
                 .SetComputeRoot32BitConstants(0, 4, constants.as_ptr().cast(), 0);
             list.list.SetComputeRootUnorderedAccessView(1, work);
-            list.list.ExecuteIndirect(
-                signature,
-                max,
-                args.0,
-                args.1,
-                count.map(|(buffer, _)| buffer),
-                count.map_or(0, |(_, offset)| offset),
-            );
         }
-        done(list, args.0, count.map(|(buffer, _)| buffer));
+        execute(list, signature, max, args, count);
     }
 
     #[test]
@@ -826,8 +816,8 @@ mod tests {
         let work = Arguments::new(host, &[[6, 2, 3]]);
         let signature = dispatch_signature(host, 16);
         let (short, _) = host.shared_buffer(31).unwrap();
-        assert!(!bound(&list, &short, 4, None, (COMPUTE, 16, 2)));
-        assert!(bound(&list, &args.buffer, 4, None, (COMPUTE, 16, 2)));
+        assert!(!bound(&list, &short, 4, (COMPUTE, 16, 2)));
+        assert!(bound(&list, &args.buffer, 4, (COMPUTE, 16, 2)));
         dispatch(&list, (&args.buffer, 20), &signature, 1, None, work.gpu());
         list.close();
         host.execute(&[&list]);
@@ -851,13 +841,7 @@ mod tests {
                 .CopyBufferRegion(&copied_count.buffer, 4, &count.buffer, 4, 4);
         }
         for (buffer, offset) in [(&count.buffer, 4), (&args.buffer, 28)] {
-            assert!(bound(
-                &list,
-                &args.buffer,
-                4,
-                Some(buffer),
-                (COMPUTE, 12, 2)
-            ));
+            assert!(bound(&list, &args.buffer, 4, (COMPUTE, 12, 2)));
             dispatch(
                 &list,
                 (&args.buffer, 4),
@@ -889,6 +873,7 @@ mod tests {
             let writer = host.new_list().unwrap();
             count.shadow.refresh(&writer, count.address(), 16);
             count.shadow.gpu_writes(&writer, count.address() + 4, 12);
+            writer.buffer_state(&count.shadow.buffer, BUFFER_WRITE);
             let budget = writer.budget().unwrap();
             // SAFETY: the mesh clamp stores Y=1 at byte 8 of the count.
             unsafe {
@@ -908,20 +893,7 @@ mod tests {
             writer
         };
         let writer = record_writer(&count);
-        if enhanced_list(&writer).is_none() {
-            count.handoff(
-                &writer,
-                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
-            );
-        }
-        assert!(bound(
-            &reader,
-            &args.buffer,
-            4,
-            Some(&count.shadow.buffer),
-            (COMPUTE, 12, 2)
-        ));
+        assert!(bound(&reader, &args.buffer, 4, (COMPUTE, 12, 2)));
         dispatch(
             &reader,
             (&args.buffer, 4),
@@ -935,7 +907,7 @@ mod tests {
         host.execute(&[&writer, &reader]);
         assert_eq!(*count.data, [u32::MAX, 0, 1, 1]);
         assert_eq!(used(&reader), (2 + 36) * 64);
-        // In separate submissions the writer's UAV state decays naturally.
+        // In separate submissions too: every list leaves the copy in common.
         count.data[2] = 2;
         let writer = record_writer(&count);
         writer.close();
@@ -943,79 +915,6 @@ mod tests {
         assert_eq!(*count.data, [u32::MAX, 0, 1, 1]);
         host.execute(&[&reader]);
         assert_eq!(used(&reader), (2 + 36) * 64);
-    }
-
-    #[test]
-    fn indirect_buffers_can_be_used_for_copies_before_and_after() {
-        let Some(host) = host() else { return };
-        let list = host.new_list().unwrap();
-        let args = Arguments::new(host, &[[1, 1, 1]; 2]);
-        let count = TitleCount::new([u32::MAX, 0, 0, 0]);
-        let input = Arguments::new(host, &[[1]]);
-        let first_arg = Arguments::new(host, &[[0]]);
-        let result = Arguments::new(host, &[[0]]);
-        let work = Arguments::new(host, &[[6, 2, 3]]);
-        let signature = dispatch_signature(host, 12);
-        let enhanced = enhanced_list(&list).is_some();
-        if enhanced {
-            // SAFETY: the enhanced prelude permits an argument copy read
-            // before the clamp.
-            unsafe {
-                list.list
-                    .CopyBufferRegion(&first_arg.buffer, 4, &args.buffer, 4, 4)
-            };
-        }
-        for call in 0..2 {
-            if !enhanced && call > 0 {
-                count.handoff(
-                    &list,
-                    D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
-                    D3D12_RESOURCE_STATE_COPY_DEST,
-                );
-            }
-            // SAFETY: live buffers and a writable copy destination.
-            unsafe {
-                list.list
-                    .CopyBufferRegion(&count.shadow.buffer, 4, &input.buffer, 4, 4)
-            };
-            if !enhanced {
-                count.handoff(
-                    &list,
-                    D3D12_RESOURCE_STATE_COPY_DEST,
-                    D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
-                );
-            }
-            assert!(bound(
-                &list,
-                &args.buffer,
-                4,
-                Some(&count.shadow.buffer),
-                (COMPUTE, 12, 2)
-            ));
-            dispatch(
-                &list,
-                (&args.buffer, 4),
-                &signature,
-                2,
-                Some((&count.shadow.buffer, 4)),
-                work.gpu(),
-            );
-        }
-        // SAFETY: the count buffer can be read as a copy source after the
-        // indirect reads. Legacy read promotions can combine.
-        unsafe {
-            list.list
-                .CopyBufferRegion(&result.buffer, 4, &count.shadow.buffer, 4, 4)
-        };
-        list.close();
-        for _ in 0..2 {
-            host.execute(&[&list]);
-            assert_eq!(used(&list), 2 * (2 + 36) * 64);
-            if enhanced {
-                assert_eq!(first_arg.read(), [[1]]);
-            }
-            assert_eq!(result.read(), [[1]]);
-        }
     }
 
     /// Rectangle records become records of their expanded triangles: six
@@ -1042,10 +941,8 @@ mod tests {
         let list = host.new_list().unwrap();
         // SAFETY: a live buffer.
         let gpu = unsafe { input.GetGPUVirtualAddress() };
-        assert!(super::bound(&list, &input, 0, None, (0, 20, 5)));
+        assert!(super::bound(&list, &input, 0, (0, 20, 5)));
         let (out, offset) = super::rectangles(&list, &input, gpu, (20, 5, 9)).unwrap();
-        super::done(&list, &out, None);
-        super::done(&list, &input, None);
         list.close();
         host.execute(&[&list]);
         let read = |buffer: &super::ID3D12Resource, at: u64| {

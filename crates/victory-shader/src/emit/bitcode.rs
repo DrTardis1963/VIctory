@@ -96,6 +96,7 @@ pub(crate) enum Cast {
 }
 
 /// Compare predicates: floats 0-15, integers 32-41.
+#[allow(dead_code)]
 pub(crate) mod pred {
     pub const FALSE: u8 = 0;
     pub const OEQ: u8 = 1;
@@ -295,6 +296,8 @@ impl Module {
     }
 
     /// The value of an integer constant; `None` for anything else.
+    // In this tree #160's sample forms replace main's only caller.
+    #[allow(dead_code)]
     pub fn int_value(&self, v: V) -> Option<i64> {
         match v {
             V::Const(i) => match self.consts[i as usize].1 {
@@ -358,6 +361,19 @@ impl Module {
     pub fn new_block(&mut self) -> usize {
         self.blocks.push(Block::default());
         self.blocks.len() - 1
+    }
+
+    /// The bits of an integer or float constant (integers as stored,
+    /// sign-extended).
+    pub fn known(&self, v: V) -> Option<i64> {
+        match v {
+            V::Const(i) => match self.consts[i as usize].1 {
+                Const::Int(x) => Some(x),
+                Const::Float(bits) => Some(i64::from(bits)),
+                _ => None,
+            },
+            _ => None,
+        }
     }
 
     pub fn type_of(&self, v: V) -> Ty {

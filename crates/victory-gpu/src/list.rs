@@ -362,7 +362,9 @@ pub(crate) struct Barrier {
     last: u64,
 }
 
-/// The barrier on host resources, if the host mirrors the transition.
+/// The barrier on host resources, or `None` if it names a resource the host
+/// GPU does not have (buffers: host copies keep their own states, see
+/// `HostList::buffer_state`).
 #[cfg(windows)]
 fn host_barrier(list: &crate::host::HostList, b: &Barrier) -> Option<Barrier> {
     use windows::core::Interface;
@@ -373,30 +375,6 @@ fn host_barrier(list: &crate::host::HostList, b: &Barrier) -> Option<Barrier> {
             const BEGIN_ONLY: u32 = 1;
             if b.flags & BEGIN_ONLY != 0 {
                 return None;
-            }
-            const INDIRECT_ARGUMENT: u32 = 0x200;
-            const UAV: u32 = 0x8;
-            let before = crate::host::pc_state((b.second >> 32) as u32);
-            let after = crate::host::pc_state(b.last as u32);
-            let indirect_handoff = (before == INDIRECT_ARGUMENT
-                && matches!(after, UAV | COPY_DEST))
-                || (after == INDIRECT_ARGUMENT && matches!(before, UAV | COPY_DEST));
-            if indirect_handoff
-                && let Some((data, _)) = crate::resource::buffer_bytes(b.first)
-                && crate::indirect::enhanced_list(list).is_none()
-                && let Some(shadow) = crate::shadow::existing(b.first as usize, data as u64)
-            {
-                // Preserve the title's handoff between a producer and
-                // indirect execution. Either native use can promote from
-                // COMMON, including the argument clamp's UAV access.
-                list.keep(&shadow.buffer);
-                return Some(Barrier {
-                    kind: 0,
-                    flags: 0,
-                    first: shadow.buffer.as_raw().cast_const().cast(),
-                    second: 0xffff_ffff | (u64::from(before) << 32),
-                    last: 0,
-                });
             }
             // shortcut: whole resources, from the state the list tracked
             // (`HostList::transition`); subresources are not told apart.
@@ -423,11 +401,13 @@ fn host_barrier(list: &crate::host::HostList, b: &Barrier) -> Option<Barrier> {
             },
             ..*b
         }),
+        // Unordered access to a depth target is to its twin.
         2 => Some(Barrier {
             first: if b.first.is_null() {
                 b.first
             } else {
-                host(b.first)?
+                let (texture, _) = crate::resource::host_unordered(b.first)?;
+                texture.as_raw().cast_const().cast()
             },
             ..*b
         }),
@@ -482,24 +462,6 @@ fn record_barriers(list: &crate::host::HostList, barriers: &[Barrier]) {
             barriers.len(),
         ));
     }
-}
-
-#[cfg(all(test, windows))]
-pub(crate) fn test_buffer_handoff(
-    list: &crate::host::HostList,
-    resource: This,
-    before: u32,
-    after: u32,
-) {
-    let title = Barrier {
-        kind: 0,
-        flags: 0,
-        first: resource,
-        second: 0xffff_ffff | (u64::from(before) << 32),
-        last: u64::from(after),
-    };
-    let host = host_barrier(list, &title).expect("legacy buffer handoff");
-    record_barriers(list, &[host]);
 }
 
 /// Moves a title texture's host copy to `state` in the list, if needed.
@@ -678,6 +640,8 @@ fn prepare_footprint_upload(
         return Some((buffer, from, dst_bytes));
     }
     let (buffer, staging) = list.upload(host, bytes)?;
+    // The list owns this mapped D3D12 upload buffer. Wine can report
+    // its address as MEM_FREE, so use the host-upload path.
     list.defer_fill(staging, data, bytes as usize);
     from.resource = buffer.as_raw().cast_const().cast();
     from.footprint.offset = 0;

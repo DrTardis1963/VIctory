@@ -330,12 +330,38 @@ impl Host {
         Ok((root, pso))
     }
 
+    /// A triangle pipeline with a geometry stage between VS and PS.
+    pub fn geometry_pipeline(
+        &self,
+        vs: &HostShader,
+        gs: &HostShader,
+        ps: &HostShader,
+    ) -> Result<(ID3D12RootSignature, ID3D12PipelineState), String> {
+        let root = self.root_signature_for(&[
+            (vs, D3D12_SHADER_VISIBILITY_VERTEX),
+            (ps, D3D12_SHADER_VISIBILITY_PIXEL),
+            (gs, D3D12_SHADER_VISIBILITY_GEOMETRY),
+        ])?;
+        let pso = self.graphics_pipeline_with(&root, &vs.dxil, Some(&gs.dxil), &ps.dxil)?;
+        Ok((root, pso))
+    }
+
     /// A graphics pipeline with the given root signature; vertex inputs
     /// packed in register order.
     pub fn pipeline_with(
         &self,
         root: &ID3D12RootSignature,
         vs: &[u8],
+        ps: &[u8],
+    ) -> Result<ID3D12PipelineState, String> {
+        self.graphics_pipeline_with(root, vs, None, ps)
+    }
+
+    fn graphics_pipeline_with(
+        &self,
+        root: &ID3D12RootSignature,
+        vs: &[u8],
+        gs: Option<&[u8]>,
         ps: &[u8],
     ) -> Result<ID3D12PipelineState, String> {
         let inputs = sig(vs, FourCC::ISG1)?;
@@ -361,6 +387,12 @@ impl Host {
         let mut desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
             // SAFETY: a borrowed pointer the descriptor never releases.
             pRootSignature: unsafe { std::mem::transmute_copy(root) },
+            GS: gs.map_or_else(D3D12_SHADER_BYTECODE::default, |code| {
+                D3D12_SHADER_BYTECODE {
+                    pShaderBytecode: code.as_ptr().cast(),
+                    BytecodeLength: code.len(),
+                }
+            }),
             VS: D3D12_SHADER_BYTECODE {
                 pShaderBytecode: vs.as_ptr().cast(),
                 BytecodeLength: vs.len(),
@@ -740,7 +772,8 @@ impl Host {
             let views: ID3D12DescriptorHeap = dev
                 .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
                     Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-                    NumDescriptors: d.textures.len().max(1) as u32,
+                    // A null guard slot after the textures (see [`guard`]).
+                    NumDescriptors: d.textures.len() as u32 + 1,
                     Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
                     ..Default::default()
                 })
@@ -820,6 +853,7 @@ impl Host {
                 keep.push(tex);
                 keep.push(upload);
             }
+            null_guard(dev, &views, d.textures.len());
             for (i, s) in d.samplers.iter().enumerate() {
                 let mut at = sampler_heap.GetCPUDescriptorHandleForHeapStart();
                 at.ptr += i * sampler_size;
@@ -994,6 +1028,14 @@ pub enum View<'a> {
     Texture(u32, u32, &'a [[f32; 4]]),
     /// An RGBA32F cube SRV (face size, texels of faces +x -x +y -y +z -z).
     Cube(u32, &'a [[f32; 4]]),
+    /// An RGBA32F texture SRV with mip levels (width, height, levels,
+    /// texels of each level in turn, level n `max(1, size >> n)` wide).
+    Levels(u32, u32, u32, &'a [[f32; 4]]),
+    /// An RGBA32F cube SRV with mip levels (face size, levels, texels of
+    /// faces +x -x +y -y +z -z, each face's levels in turn).
+    CubeLevels(u32, u32, &'a [[f32; 4]]),
+    /// An R32F texture SRV (width, height, texels), for comparison sampling.
+    Depth(u32, u32, &'a [f32]),
     /// A raw buffer UAV of this many dwords, zeroed.
     RawUav(u32),
     /// An RGBA32F texture UAV (width, height), zeroed.
@@ -1019,6 +1061,44 @@ pub enum Stride {
     Structured(u32),
     /// Typed, elements in this format of this many bytes.
     Format(DXGI_FORMAT, u32),
+}
+
+/// The user-data value of a translated shader's heap guard entry (root
+/// type `ResourceHeap` or `SamplerHeap`, see the module notes) for
+/// [`Host::dispatch`] and [`Host::draw`] with `views` views (textures) and
+/// `samplers` samplers: the null view slot they keep after the views, the
+/// last sampler. `None` for other entries.
+#[cfg(test)]
+pub fn guard(root: crate::native::RootType, views: usize, samplers: usize) -> Option<u32> {
+    match root {
+        crate::native::RootType::ResourceHeap => Some(views as u32),
+        crate::native::RootType::SamplerHeap => Some(samplers.saturating_sub(1) as u32),
+        _ => None,
+    }
+}
+
+/// Makes slot `at` of view heap `heap` null, as the host makes its empty
+/// slots (a null 2D texture view).
+#[cfg(test)]
+fn null_guard(dev: &ID3D12Device, heap: &ID3D12DescriptorHeap, at: usize) {
+    let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+        Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+        ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+        Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+        Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+            Texture2D: D3D12_TEX2D_SRV {
+                MipLevels: 1,
+                ..Default::default()
+            },
+        },
+    };
+    // SAFETY: a slot inside a live heap.
+    unsafe {
+        let step = dev.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        let mut slot = heap.GetCPUDescriptorHandleForHeapStart();
+        slot.ptr += at * step as usize;
+        dev.CreateShaderResourceView(None, Some(&desc), slot);
+    }
 }
 
 /// Bindings for [`Host::dispatch`]: root arguments, the view heap in order,
@@ -1153,7 +1233,9 @@ impl Host {
                 b.Unmap(0, None);
                 Ok(b)
             };
-            let views = heap(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, d.views.len())?;
+            // A null guard slot after the views (see [`guard`]).
+            let views = heap(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, d.views.len() + 1)?;
+            null_guard(dev, &views, d.views.len());
             let samplers = heap(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, d.samplers.len())?;
             let view_size = dev
                 .GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
@@ -1223,6 +1305,83 @@ impl Host {
                             Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
                                 TextureCube: D3D12_TEXCUBE_SRV {
                                     MipLevels: 1,
+                                    ..Default::default()
+                                },
+                            },
+                        };
+                        dev.CreateShaderResourceView(
+                            &tex,
+                            (faces == 6).then_some(&cube as *const _),
+                            at,
+                        );
+                        keep.push(tex);
+                    }
+                    View::Levels(..) | View::CubeLevels(..) | View::Depth(..) => {
+                        // (width, height, levels, faces, format, texel bytes, texel data)
+                        let (w, h, levels, faces, format, size, bytes) = match *v {
+                            View::Levels(w, h, n, t) => {
+                                let b = std::slice::from_raw_parts(t.as_ptr().cast(), t.len() * 16);
+                                (w, h, n, 1u32, DXGI_FORMAT_R32G32B32A32_FLOAT, 16, b)
+                            }
+                            View::CubeLevels(w, n, t) => {
+                                let b = std::slice::from_raw_parts(t.as_ptr().cast(), t.len() * 16);
+                                (w, w, n, 6, DXGI_FORMAT_R32G32B32A32_FLOAT, 16, b)
+                            }
+                            View::Depth(w, h, t) => {
+                                let b = std::slice::from_raw_parts(t.as_ptr().cast(), t.len() * 4);
+                                (w, h, 1, 1, DXGI_FORMAT_R32_FLOAT, 4, b)
+                            }
+                            _ => unreachable!(),
+                        };
+                        let mut desc = texture_as(w, h, D3D12_RESOURCE_FLAG_NONE, format);
+                        desc.MipLevels = levels as u16;
+                        desc.DepthOrArraySize = faces as u16;
+                        let tex = make(
+                            D3D12_HEAP_TYPE_DEFAULT,
+                            &desc,
+                            D3D12_RESOURCE_STATE_COPY_DEST,
+                        )?;
+                        let mut from = 0;
+                        for (face, level) in (0..faces).flat_map(|f| (0..levels).map(move |l| (f, l))) {
+                            let (lw, lh) =
+                                ((w >> level).max(1) as usize, (h >> level).max(1) as usize);
+                            let pitch = (lw * size).next_multiple_of(256);
+                            let upload = make(
+                                D3D12_HEAP_TYPE_UPLOAD,
+                                &buffer((pitch * lh) as u64, D3D12_RESOURCE_FLAG_NONE),
+                                D3D12_RESOURCE_STATE_GENERIC_READ,
+                            )?;
+                            let mut p = std::ptr::null_mut();
+                            upload.Map(0, None, Some(&mut p)).map_err(err)?;
+                            for y in 0..lh {
+                                std::ptr::copy_nonoverlapping(
+                                    bytes[from + y * lw * size..].as_ptr(),
+                                    p.cast::<u8>().add(y * pitch),
+                                    lw * size,
+                                );
+                            }
+                            from += lw * lh * size;
+                            upload.Unmap(0, None);
+                            let mut src = footprint(&upload, lw as u32, lh as u32);
+                            src.Anonymous.PlacedFootprint.Footprint.Format = format;
+                            src.Anonymous.PlacedFootprint.Footprint.RowPitch = pitch as u32;
+                            let mut dst = subresource(&tex);
+                            dst.Anonymous.SubresourceIndex = level + face * levels;
+                            list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
+                            keep.push(upload);
+                        }
+                        list.ResourceBarrier(&[transition(
+                            &tex,
+                            D3D12_RESOURCE_STATE_COPY_DEST,
+                            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                        )]);
+                        let cube = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                            Format: format,
+                            ViewDimension: D3D12_SRV_DIMENSION_TEXTURECUBE,
+                            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                                TextureCube: D3D12_TEXCUBE_SRV {
+                                    MipLevels: levels,
                                     ..Default::default()
                                 },
                             },

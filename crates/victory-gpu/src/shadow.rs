@@ -242,13 +242,13 @@ impl Shadow {
         let mut written = 0;
         let (from, to) = self.inside(address, len);
         let start = self.start as usize;
-        if let Some((taken, before)) = &*snapshot
+        if let Some((taken, before)) = &mut *snapshot
             && *taken <= from
-            && to <= taken + before.len()
+            && to <= *taken + before.len()
             && from < to
         {
-            unchanged.begin(start + taken, start + taken + before.len());
-            let before = &before[from - taken..to - taken];
+            unchanged.begin(start + *taken, start + *taken + before.len());
+            let before = &mut before[from - *taken..to - *taken];
             // By 64 KiB piece: the copy compared with its bytes before the
             // submission, title memory read only where the GPU wrote.
             // An unchanged page is never modified by copy-back, so later
@@ -261,13 +261,15 @@ impl Shadow {
                 // SAFETY: inside the mapping; only the submitting thread
                 // writes it.
                 let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
-                let old = &before[at - from..at - from + n];
+                let old = &mut before[at - from..at - from + n];
                 if unchanged.differs(start + at, host, old)
                     && let title = &mut title.get_or_insert_with(|| vec![0u8; PAGE])[..n]
                     && crate::host::read_into((start + at) as *const u8, title)
                 {
                     // Title memory with the GPU's bytes put in; the copy
-                    // takes the title's bytes in turn.
+                    // takes the title's bytes in turn, and so does the
+                    // snapshot: to a later range that overlaps this one,
+                    // they are not a shader's write to put back.
                     let mut changed = false;
                     for ((t, h), o) in title.iter_mut().zip(host.iter_mut()).zip(old) {
                         if *h != *o && *t != *h {
@@ -275,6 +277,7 @@ impl Shadow {
                             changed = true;
                         }
                         *h = *t;
+                        *o = *t;
                     }
                     if changed {
                         crate::watch::writing(start + at, n);
@@ -449,12 +452,6 @@ pub(crate) fn register(resource: usize, start: u64, len: u64) {
 /// The title released it; lists that still hold its copy keep it alive.
 pub(crate) fn unregister(resource: usize, start: u64) {
     buffers().remove(&(start, resource));
-}
-
-/// The existing copy of this title resource, without creating a shadow or
-/// choosing a differently sized alias by address.
-pub(crate) fn existing(resource: usize, start: u64) -> Option<Arc<Shadow>> {
-    buffers().get(&(start, resource))?.shadow.clone()
 }
 
 /// The copy of the innermost title buffer holding `[address, address +
@@ -696,5 +693,98 @@ mod tests {
             cached[2],
             baseline[2].as_secs_f64() / cached[2].as_secs_f64(),
         );
+    }
+
+    /// Three pages of title memory on page bounds (plain heap memory, so
+    /// not write-watched: refreshes copy whole ranges) and their host
+    /// copy; `None` without a host GPU. Returns the memory's owner, the
+    /// address of the first page and the copy.
+    fn title() -> Option<(Vec<u8>, usize, Shadow)> {
+        let memory = vec![0u8; 4 * PAGE];
+        let base = (memory.as_ptr() as usize).next_multiple_of(PAGE);
+        let (buffer, data) = host()?.shared_buffer(3 * PAGE as u64)?;
+        // SAFETY: a live buffer.
+        let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+        let shadow = Shadow::new(buffer, data, gpu, base as u64, 3 * PAGE as u64);
+        Some((memory, base, shadow))
+    }
+
+    /// A write of one byte: the title's into its memory, or a shader's
+    /// into the copy.
+    fn poke(at: usize, value: u8) {
+        // SAFETY: the tests pass addresses inside the memory or the copy.
+        unsafe { (at as *mut u8).write_volatile(value) }
+    }
+
+    fn peek(at: usize) -> u8 {
+        // SAFETY: as in `poke`.
+        unsafe { (at as *const u8).read_volatile() }
+    }
+
+    /// A range declared after ranges on both sides of it, once the snapshot
+    /// already spans it: what its refresh brought into the copy is not a
+    /// shader's write, and does not go back over what the title wrote since.
+    #[test]
+    fn a_range_between_earlier_ones_keeps_the_titles_newer_bytes() {
+        let Some((_memory, base, s)) = title() else {
+            return; // no host GPU here
+        };
+        let (a, b, c) = (base, base + PAGE, base + 2 * PAGE);
+        let copy = |at: usize| s.data as usize + (at - base);
+        // An earlier submission read the middle page; the title has written
+        // it since.
+        s.update(b, PAGE);
+        poke(b + 5, 1);
+        poke(b + 6, 3);
+        // This submission's shaders write the outer pages, then the middle
+        // one: each range refreshed, then declared.
+        for at in [a, c, b] {
+            s.update(at, PAGE);
+            s.queue_write(at, PAGE);
+        }
+        s.snapshot(a, 3 * PAGE);
+        assert_eq!(peek(copy(b + 5)), 1, "the refresh");
+        // While the GPU runs: a shader writes two bytes, the title one.
+        poke(copy(a + 7), 9);
+        poke(copy(b + 9), 7);
+        poke(b + 5, 2);
+        for at in [a, c, b] {
+            s.copy_back(at, PAGE);
+        }
+        s.finish_writes();
+        assert_eq!(peek(b + 5), 2, "the title's newer byte");
+        assert_eq!(peek(b + 6), 3, "the title's byte from before");
+        // What the shader wrote does go back, in either kind of range.
+        assert_eq!((peek(a + 7), peek(b + 9)), (9, 7));
+        assert!(
+            s.before.lock().unwrap().snapshot.is_none(),
+            "the snapshot is done"
+        );
+    }
+
+    /// Two declared ranges that overlap: the first one's copy-back gives
+    /// the copy the title's bytes, which the second must not take for a
+    /// shader's and put back over what the title wrote in between.
+    #[test]
+    fn overlapping_ranges_keep_the_titles_newer_bytes() {
+        let Some((_memory, base, s)) = title() else {
+            return; // no host GPU here
+        };
+        let copy = |at: usize| s.data as usize + (at - base);
+        s.update(base, 2 * PAGE);
+        s.queue_write(base, PAGE);
+        s.queue_write(base, 2 * PAGE);
+        s.snapshot(base, 2 * PAGE);
+        // While the GPU runs: a shader's byte and the title's, in one page.
+        poke(copy(base + 3), 9);
+        poke(base + 8, 1);
+        s.copy_back(base, PAGE);
+        assert_eq!((peek(base + 3), peek(base + 8)), (9, 1));
+        // The title writes its byte again before the second range's turn.
+        poke(base + 8, 2);
+        s.copy_back(base, 2 * PAGE);
+        s.finish_writes();
+        assert_eq!(peek(base + 8), 2, "the title's newer byte");
+        assert_eq!(peek(base + 3), 9, "the shader's byte");
     }
 }

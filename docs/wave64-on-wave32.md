@@ -3,8 +3,12 @@
 Status: steps 1, 2, 4 and 5 are in. On NVIDIA, wave64 programs whose lanes
 read only their own half run as two 32-lane waves. Groups of one console
 wave also run in the console flow: masks read whole, lanes of the other
-half, divergent branches and loops. Still open: groups of several console
-waves, LDS, whole-wave sections and `ds_(b)permute`.
+half, divergent branches and loops, LDS shared in the console's
+instruction order, and (in groups of exactly 64 threads) whole-wave
+reductions and prefix sums, of integers and floats. Still open: groups of
+several console waves, whole-wave sections in other groups, and
+`ds_permute`; each stops with its own reason. (`ds_bpermute` gathers within each 32-lane half
+and is lowered as an in-half read, like `ds_swizzle`.)
 
 ## The problem
 
@@ -74,7 +78,8 @@ wave's first lane.)
 | `v_mbcnt_lo` in the upper half | the lower half's ballot |
 | `v_readlane`, `v_readfirstlane` (uniform lane) | the value of lane `l & 31` from the half that owns `l` |
 | `v_writelane` to the other half | the value and lane |
-| `ds_bpermute`, `ds_permute` | open: check whether GFX10 wave64 crosses halves for these, then 32 words per half if it does |
+| `ds_bpermute` | nothing: on GFX10 a wave64's backward permute gathers within each 32-lane half (AMD's RDNA 2 ISA reference, as cited by the lowering's contributor; not checked on console hardware), so it is an in-half read |
+| `ds_permute` | open: check whether GFX10 wave64 crosses halves for it, then 32 words per half if it does |
 
 A mask read only lane by lane (a `v_cndmask` selector, a carry-in) needs
 just the lane's own half. Exchanging those anyway is correct but slow.
@@ -116,12 +121,79 @@ does (step 5, `lower::CONSOLE_FLOW`):
 `lower` tries the per-lane form first. A program that needs the console
 flow stops with `CONSOLE_FLOW`, and `emit` lowers it again from the
 console structure. Eligible: wave64 compute on a host without 64-lane
-waves, at most 64 threads per group, no LDS, no `ds_(b)permute`, and no
-whole-wave sections.
+waves, at most 64 threads per group, no `ds_permute`, and whole-wave
+sections only in a group of exactly 64 threads.
 
-Groups of several console waves still need another meeting point: a group
-barrier would wait for console waves elsewhere. The plan stays per-console-
-wave arrival counters with double-buffered slots and a bounded wait.
+**LDS.** The console runs an instruction in all 64 lanes before the next,
+so one wave shares LDS without `s_barrier`: a lane reads what a lane of the
+other half wrote one instruction earlier. In the console flow both halves
+reach every LDS access together, so a group barrier before each access puts
+it after every earlier one. This also takes the programs that needed 64-lane
+waves only for that (one console wave per group, LDS, no cross-lane read).
+Two testers' counts on the title put those first: 120 of the 223 programs
+#233 still stopped on a 32-lane host. On an RTX 5070 most LDS tests pass
+without the barrier too (that card keeps the two waves in step, and a
+branch on EXEC is an exchange, which is a barrier itself). One does not:
+with a write under one EXEC mask and a read under another and no branch
+between them, the lower half reads before the upper half writes every
+time unless the barrier is there
+(`lds_written_and_read_in_different_masked_blocks`).
+
+**Whole-wave sections** (contributed by Raxstreams). A section stays
+recognised as it is (`emit::wave`), and only what it leaves crosses the
+halves, where the section is lowered: each half's reduction is exchanged
+and the two are combined with the section's own operation (sum, and, or,
+xor, minimum, maximum of integers); a prefix sum in the upper half adds the
+lower half's total. Only in a group of exactly 64 threads, so both halves
+are whole. Floats cross as their bits: minimum and maximum stay exact, and
+a sum is each half's sum added last, one more order of additions next to
+the console's and the host wave's own (the last bits may differ, as they
+already may in one host wave). A title run on #439 put sections next: 24
+of the 45 programs the stack still stopped.
+
+What still stops says why: `console wave64 lanes in a group of more than 64
+threads`, `ds_permute across the halves`, or `a whole-wave section` (in
+other groups), each `on a host without 64-lane waves`.
+
+### Groups of several console waves (planned)
+
+A group barrier is reached by every thread of the group only where all its
+console waves branch alike, and they need not: each console wave takes its
+`s_cbranch_*` for itself. The earlier plan was a meeting point per console
+wave (arrival counters, double-buffered slots, a bounded wait). It is
+dropped: a wait is met only if the partner half runs meanwhile, and D3D12
+promises no such thing. On an RTX 5070 the upper half of a group does not
+write LDS before the lower half reads it unless a barrier orders them, in
+20 of 20 runs (`lds_written_and_read_in_different_masked_blocks`), which is
+what waves run one after the other would give. A wait would then never be
+met, and a bounded one gives a wrong result instead of a hang.
+
+What the programs are (an offline translate over a local copy of the
+title's shaders, 43 programs stopped for their group size): groups of
+16x16x1 (15), 1024x1x1 (7), 8x16x1 (6), 256x1x1 (4), 512x1x1 (2), 128x1x1
+(2) and 32x32x1 (1). Nearly all count mask bits (`v_mbcnt`) and read a mask
+as a number; about two thirds have no LDS and no `s_barrier`.
+
+**Without LDS: one console wave per host group.** The console waves of
+such a group share nothing but the resources every group shares, so they
+can be separate host groups. The program is emitted with 64 threads per
+group, and a dispatch of (x, y, z) groups of k console waves each becomes
+(x * k, y, z) host groups: host group id x gives the console group
+(x / k) and the wave in it (x % k), the flat thread id is 64 * wave +
+the id in the host group, and the console's thread and group ids follow
+from those. Each host group is then one console wave in two host waves,
+which is the console flow as it is. Needed outside the translator: the
+emitted shader says its k, direct dispatches multiply x (within D3D12's
+65535 groups per dimension; refuse beyond), and indirect dispatches
+multiply the record's x where the indirect records are already rewritten
+(`victory-gpu`'s clamp pass).
+
+**With LDS and `s_barrier`:** the waves of a group do meet there, so they
+must stay one host group. Open; candidates are group barriers where every
+console wave provably arrives (as #189 places them) and, for the rest, a
+group-wide form in which every thread runs every block any console wave of
+its group enters, with each wave's scalars and effects guarded by whether
+that wave is really there.
 
 ### The console flow on every host
 
@@ -137,7 +209,7 @@ lanes below 20 take never wrote lane 40.
 
 Such compute programs now ask for the console flow on every host (the
 second case of `CONSOLE_FLOW`): a program with `v_readlane` or
-`v_writelane`, at least one branch that is not uniform, no `ds_(b)permute`
+`v_writelane`, at least one branch that is not uniform, no `ds_permute`
 and no whole-wave sections. On a host that runs the console's wave size,
 one host wave is the console wave, so ballots are the wave's own and nothing
 is exchanged; any group size and LDS are fine. If the console flow cannot
@@ -164,15 +236,20 @@ takes `WaveSize(64)`, the NVIDIA reports 32-32).
 
 1. ~~Translate for the host's wave range; cache by it; `--host-lanes`.~~
 2. ~~Adapter selection for tests and tools.~~
-3. Measure the title's programs by reason (`--host-lanes 32-32`), to
-   order steps 4 to 6.
+3. ~~Measure the title's programs by reason (`--host-lanes 32-32`), to
+   order the later steps.~~ Testers did, and from `965ce30` on a local
+   offline run does.
 4. ~~In-half programs: console-lane programs whose cross-lane operations
    all stay inside a half, with no mask read whole.~~ No new lane assignment
    was needed (see above). A later widening is LDS in multi-wave groups,
    whose waves already meet at barriers.
 5. ~~The console flow and the one-wave exchange (ballots, readlane,
    readfirstlane, writelane, mbcnt, divergent branches and loops).~~
-6. Multi-wave groups (counters), then one-wave LDS sharing.
+6. ~~One-wave LDS sharing (a group barrier before each LDS access in the
+   console flow).~~
+7. Multi-wave groups without LDS: one console wave per host group (the
+   translator's ids, then direct and indirect dispatch counts).
+8. Multi-wave groups with LDS.
 
 ## Credit
 

@@ -16,10 +16,14 @@ pub const ROOT_CBV_SPACE: u32 = 1;
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
     pub const RAW_BUFFERS: u64 = 1 << 4;
+    pub const TILED_RESOURCES: u64 = 1 << 12;
     pub const STENCIL_REF: u64 = 1 << 11;
     pub const TYPED_UAV_LOADS: u64 = 1 << 13;
     pub const WAVE_OPS: u64 = 1 << 19;
+    pub const BARYCENTRICS: u64 = 1 << 22;
     pub const INT64: u64 = 1 << 20;
+    pub const ATOMIC_TYPED64: u64 = 1 << 27;
+    pub const ATOMIC_HEAP64: u64 = 1 << 32;
     pub const RESOURCE_HEAP: u64 = 1 << 30;
     pub const SAMPLER_HEAP: u64 = 1 << 31;
 }
@@ -47,6 +51,13 @@ pub(crate) struct Mesh {
 
 pub(crate) struct Shader {
     pub m: Module,
+    /// Test builds: the property words of each handle annotation, in order.
+    #[cfg(test)]
+    pub annotations: Vec<(u32, u32)>,
+    /// Test builds: each `dx.op` call made, as its opcode and its first
+    /// argument where that is a constant.
+    #[cfg(test)]
+    calls: Vec<(u32, Option<i64>)>,
     pub t: Types,
     pub pixel: bool,
     pub inputs: Vec<SigElement>,
@@ -55,6 +66,8 @@ pub(crate) struct Shader {
     pub prims: Vec<SigElement>,
     /// A mesh shader (`threads` is its thread-group size).
     pub mesh: Option<Mesh>,
+    /// Maximum emitted vertices of a single-stream triangle GS.
+    pub gs_vertices: Option<u16>,
     /// Dwords of user data the shader reads (0: no user-data buffer).
     pub user_data: u32,
     /// Immediate samplers, bound as `s0..` in [`SAMPLER_SPACE`].
@@ -72,11 +85,47 @@ pub(crate) struct Shader {
     pub threads: Option<[u32; 3]>,
     /// The wave size a compute shader requires (`WaveSize`).
     pub wave_size: Option<u32>,
+    /// Compute shader uses SM 6.6 implicit-derivative ops (`dx.valver` 1.8).
+    pub cs_derivatives: bool,
+    /// A sample takes a level clamp other than 0 (tiled resources, as
+    /// validator 1.8 counts it).
+    pub lod_clamp: bool,
     /// Thread-group shared memory, in dwords.
     pub lds_dwords: u32,
     lds: Option<V>,
     main: V,
     pub entry: usize,
+    /// The `dx.op` operations called (names without overload).
+    ops: std::collections::BTreeSet<String>,
+}
+
+thread_local! {
+    /// See [`last_summary`].
+    static LAST: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+}
+
+/// What the module this thread finished last declares and calls: its
+/// thread-group size and wave size, and its `dx.op` operations. A
+/// diagnostic for tools that report a module the validator refuses, since
+/// the validator's message for an operation the stage or the entry's
+/// properties do not allow names neither.
+pub(crate) fn last_summary() -> String {
+    LAST.with(|l| l.borrow().clone())
+}
+
+#[cfg(test)]
+thread_local! {
+    /// See [`last_calls`].
+    static LAST_CALLS: std::cell::RefCell<Vec<(u32, Option<i64>)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Test builds: the `dx.op` calls of the module this thread finished last,
+/// in the order they were made: the opcode, and the first argument where
+/// that is a constant (a barrier's mode, say).
+#[cfg(test)]
+pub(crate) fn last_calls() -> Vec<(u32, Option<i64>)> {
+    LAST_CALLS.with(|l| l.borrow().clone())
 }
 
 impl Shader {
@@ -99,6 +148,10 @@ impl Shader {
         let entry = m.new_block();
         Shader {
             m,
+            #[cfg(test)]
+            annotations: Vec::new(),
+            #[cfg(test)]
+            calls: Vec::new(),
             t: Types {
                 void,
                 i1,
@@ -115,6 +168,7 @@ impl Shader {
             outputs: Vec::new(),
             prims: Vec::new(),
             mesh: None,
+            gs_vertices: None,
             user_data: 0,
             samplers: 0,
             cmp_samplers: 0,
@@ -124,10 +178,13 @@ impl Shader {
             nonuniform_handles: 0,
             threads: None,
             wave_size: None,
+            cs_derivatives: false,
+            lod_clamp: false,
             lds_dwords: 0,
             lds: None,
             main,
             entry,
+            ops: std::collections::BTreeSet::new(),
         }
     }
 
@@ -157,9 +214,14 @@ impl Shader {
         params.extend(args.iter().map(|&a| self.m.type_of(a)));
         let fty = self.m.func_ty(ret, params);
         self.m.ptr(fty);
+        self.ops
+            .insert(name.split('.').next().unwrap_or(name).to_owned());
         let f = self
             .m
             .function(&format!("dx.op.{name}"), fty, Some(attr), false);
+        #[cfg(test)]
+        self.calls
+            .push((opcode, args.first().and_then(|&a| self.m.known(a))));
         let mut all = vec![self.m.i32(opcode)];
         all.extend(args);
         self.m.call(block, f, all)
@@ -264,6 +326,8 @@ impl Shader {
     }
 
     pub fn annotate(&mut self, block: usize, h: V, props0: u32, props1: u32) -> V {
+        #[cfg(test)]
+        self.annotations.push((props0, props1));
         let p = [self.m.i32(props0), self.m.i32(props1)];
         let p = self.m.aggregate(self.t.props, &p);
         self.op(
@@ -306,6 +370,15 @@ impl Shader {
 
     /// The finished container.
     pub fn finish(mut self) -> Vec<u8> {
+        let threads = self
+            .threads
+            .map_or(String::new(), |[x, y, z]| format!("threads {x}x{y}x{z}, "));
+        let wave = self.wave_size.map_or("any".to_owned(), |n| n.to_string());
+        let ops: Vec<&str> = self.ops.iter().map(String::as_str).collect();
+        let summary = format!("{threads}wave size {wave}; ops: {}", ops.join(", "));
+        LAST.with(|l| *l.borrow_mut() = summary);
+        #[cfg(test)]
+        LAST_CALLS.with(|l| *l.borrow_mut() = std::mem::take(&mut self.calls));
         let ud_size = (self.user_data * 4).next_multiple_of(16);
         self.fix_user_data_size(ud_size);
         let mut resources = None;
@@ -468,6 +541,9 @@ impl Shader {
                     });
                 }
             }
+            if self.gs_vertices.is_some() {
+                view.extend([0; 3]);
+            }
             let arr = self.m.array(view.len() as u32, self.t.i32);
             let elems: Vec<V> = view.iter().map(|&v| self.m.i32(v)).collect();
             let arr = self.m.aggregate(arr, &elems);
@@ -491,11 +567,21 @@ impl Shader {
         // Entry properties: shader flags (tag 0), thread-group size (4),
         // wave size (11).
         let mut props = Vec::new();
+        // A level clamp needs tiled resources; validators before 1.8 do not
+        // count it and refuse the flag (DXC `CollectShaderFlags`).
+        if self.cs_derivatives && self.lod_clamp {
+            self.flags |= flags::TILED_RESOURCES;
+        }
         if self.flags != 0 {
             props.push(i32c(&mut self, 0));
             let i64t = self.m.int(64);
             let f = self.m.int_const(i64t, self.flags as i64);
             props.push(self.m.md_value(f));
+        }
+        if let Some(maximum) = self.gs_vertices {
+            props.push(i32c(&mut self, 1));
+            let state = [3, u32::from(maximum), 1, 5, 1].map(|n| Some(i32c(&mut self, n)));
+            props.push(self.m.md_node(state.to_vec()));
         }
         if let Some(threads) = self.threads {
             let t = threads.map(|n| Some(i32c(&mut self, n)));
@@ -542,9 +628,16 @@ impl Shader {
         let six = i32c(&mut self, 6);
         let version = self.m.md_node(vec![Some(one), Some(six)]);
         self.m.named_md("dx.version", vec![version]);
-        self.m.named_md("dx.valver", vec![version]);
-        // Program kinds: 0 pixel, 1 vertex, 5 compute, 13 mesh.
+        let valver = if self.cs_derivatives {
+            let eight = i32c(&mut self, 8);
+            self.m.md_node(vec![Some(one), Some(eight)])
+        } else {
+            version
+        };
+        self.m.named_md("dx.valver", vec![valver]);
+        // Program kinds: 0 pixel, 1 vertex, 2 geometry, 5 compute, 13 mesh.
         let (name, kind) = match (self.threads, self.pixel) {
+            _ if self.gs_vertices.is_some() => ("gs", 2u32),
             _ if self.mesh.is_some() => ("ms", 13u32),
             (Some(_), _) => ("cs", 5u32),
             (None, true) => ("ps", 0),
@@ -566,6 +659,9 @@ impl Shader {
         dxil.extend(&bitcode);
 
         let mut features = 0u64;
+        if self.flags & flags::TILED_RESOURCES != 0 {
+            features |= 0x100;
+        }
         if self.flags & flags::STENCIL_REF != 0 {
             features |= 0x200;
         }
@@ -578,11 +674,20 @@ impl Shader {
         if self.flags & flags::INT64 != 0 {
             features |= 0x8000;
         }
+        if self.flags & flags::BARYCENTRICS != 0 {
+            features |= 0x2_0000;
+        }
         if self.flags & flags::RESOURCE_HEAP != 0 {
             features |= 0x200_0000;
         }
         if self.flags & flags::SAMPLER_HEAP != 0 {
             features |= 0x400_0000;
+        }
+        if self.flags & flags::ATOMIC_TYPED64 != 0 {
+            features |= 0x40_0000;
+        }
+        if self.flags & flags::ATOMIC_HEAP64 != 0 {
+            features |= 0x1000_0000;
         }
         let sfi0 = features.to_le_bytes();
         let isg1 = container::signature(&self.inputs, true);
@@ -594,6 +699,7 @@ impl Shader {
         };
         let psv0 = container::psv(&Psv {
             stage: kind as u8,
+            gs_vertices: self.gs_vertices,
             flag: flag && self.threads.is_none(),
             inputs: &self.inputs,
             outputs: &self.outputs,
@@ -602,6 +708,7 @@ impl Shader {
             bindings: &bindings,
             threads: self.threads.unwrap_or_default(),
             wave_size: self.wave_size,
+            valver_1_8: self.cs_derivatives,
         });
         let hash = [0u8; 20];
         let psg1 = container::signature(&self.prims, false);

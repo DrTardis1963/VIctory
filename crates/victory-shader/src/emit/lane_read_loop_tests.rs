@@ -13,18 +13,12 @@
 //! run in the console flow (`lower::CONSOLE_FLOW`) on every host. Run on
 //! every hardware adapter; each wrong lane is listed.
 
-use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
-use windows::Win32::Graphics::Direct3D12::{D3D12CreateDevice, ID3D12Device};
-use windows::Win32::Graphics::Dxgi::{
-    CreateDXGIFactory1, DXGI_ADAPTER_FLAG_SOFTWARE, IDXGIAdapter1, IDXGIFactory1,
-};
-
-use super::host::{Dispatch, Host, Root, View};
+use super::host::{Dispatch, Host, Root, View, adapters};
 use crate::native::{ComputeIo, RootParam, RootType, StageIo};
 
 /// The program for waves of `wave` lanes, one wave per group, reading
 /// lane `lane`.
-fn program(wave: u32, lane: u32) -> crate::NativeProgram {
+fn program(wave: u32, lane: u32, joined_latch: bool) -> crate::NativeProgram {
     let wave64 = wave == 64;
     let k = |n: u32| 128 + n; // inline integer constant
     let (saveexec, and_exec, or_exec) = if wave64 {
@@ -40,7 +34,7 @@ fn program(wave: u32, lane: u32) -> crate::NativeProgram {
             0x887E_0A7E, // s_or_b32 exec_lo, exec_lo, s10
         )
     };
-    let words = [
+    let mut words = vec![
         0xBE82_0300, // s_mov_b32 s2, s0
         0xBE83_0380, // s_mov_b32 s3, 0
         0xF408_0101,
@@ -50,14 +44,31 @@ fn program(wave: u32, lane: u32) -> crate::NativeProgram {
         0x7E04_0280, // v_mov_b32 v2, 0
         0x7D8A_0080, // v_cmp_ne_u32 vcc, 0, v0
         saveexec,
-        0xBF88_0006, // s_cbranch_execz end
+        if joined_latch {
+            0xBF88_0009
+        } else {
+            0xBF88_0006
+        }, // s_cbranch_execz end
         // loop:
         0xD760_0009,
         k(lane) << 9 | 0x100, // v_readlane_b32 s9, v0, lane
         0x4A04_0481,          // v_add_nc_u32 v2, 1, v2
         0x7D82_0102,          // v_cmp_lt_u32 vcc, v2, v0
         and_exec,
-        0xBF89_FFFA, // s_cbranch_execnz loop
+    ];
+    if joined_latch {
+        // Keep a second predecessor of the latch in the CFG. The latch's
+        // EXEC phi feeds the loop header's loop-carried EXEC phi.
+        words.extend([
+            0xBF88_0003, // s_cbranch_execz end
+            0xBF85_0001, // s_cbranch_scc1 latch (and_exec set SCC)
+            0xBEFE_0480, // s_mov_b64 exec, 0, alternate CFG edge
+            0xBF82_FFF7, // latch: s_branch loop
+        ]);
+    } else {
+        words.push(0xBF89_FFFA); // s_cbranch_execnz loop
+    }
+    words.extend([
         // end:
         or_exec,
         0x4A04_0409, // v_add_nc_u32 v2, s9, v2
@@ -65,7 +76,7 @@ fn program(wave: u32, lane: u32) -> crate::NativeProgram {
         0xE070_1000,
         0x8001_0203, // buffer_store_dword v2, v3, s[4:7], 0 offen
         0xBF81_0000, // s_endpgm
-    ];
+    ]);
     crate::NativeProgram {
         stage: crate::HwStage::Cs,
         wave64,
@@ -87,33 +98,24 @@ fn program(wave: u32, lane: u32) -> crate::NativeProgram {
     }
 }
 
-/// Every hardware adapter's device, by name.
+/// Every hardware adapter's device that runs SM 6.6, by name. (Without
+/// the Agility SDK, Windows 10 offers none: the test then has nothing to
+/// run on, as in `split_tests`.)
 fn devices() -> Vec<(String, Host)> {
-    let mut out = Vec::new();
-    // SAFETY: plain DXGI and D3D12 calls with valid out pointers.
-    unsafe {
-        let Ok(factory) = CreateDXGIFactory1::<IDXGIFactory1>() else {
-            return out;
-        };
-        let mut i = 0;
-        while let Ok(a) = factory.EnumAdapters1(i) {
-            i += 1;
-            let a: IDXGIAdapter1 = a;
-            let Ok(d) = a.GetDesc1() else { continue };
-            if d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0 {
-                continue;
+    let Ok(names) = adapters() else {
+        eprintln!("no DXGI; skipped");
+        return Vec::new();
+    };
+    names
+        .into_iter()
+        .filter_map(|name| match Host::on(&name) {
+            Ok(host) => Some((name, host)),
+            Err(e) => {
+                eprintln!("{name}: no SM 6.6 device ({e}); skipped");
+                None
             }
-            let n = d.Description.iter().position(|&c| c == 0).unwrap_or(128);
-            let name = String::from_utf16_lossy(&d.Description[..n]);
-            let mut device: Option<ID3D12Device> = None;
-            if D3D12CreateDevice(&a, D3D_FEATURE_LEVEL_12_0, &mut device).is_ok()
-                && let Some(device) = device
-            {
-                out.push((name, Host { device }));
-            }
-        }
-    }
-    out
+        })
+        .collect()
 }
 
 fn emit(native: &crate::NativeProgram, target: super::Target) -> super::HostShader {
@@ -138,7 +140,7 @@ fn lane_reads_in_a_loop_lanes_leave_at_different_iterations() {
         for (name, host) in devices() {
             // For the host's waves: a wave64 program runs in two halves
             // where there are no 64-lane waves.
-            let cs = emit(&program(wave, lane), host.target());
+            let cs = emit(&program(wave, lane, false), host.target());
             let (root, pso) = host
                 .compute_pipeline(&cs)
                 .unwrap_or_else(|e| panic!("{name}: wave{wave}: {e}"));
@@ -174,6 +176,57 @@ fn lane_reads_in_a_loop_lanes_leave_at_different_iterations() {
             }
         }
     }
-    assert!(ran > 0, "no adapter ran the program");
+    if ran == 0 {
+        eprintln!("no SM 6.6 hardware device; skipped");
+        return;
+    }
     assert!(wrong.is_empty(), "wrong on {wrong:?}");
+}
+
+/// The same loop with a latch block two edges reach, so the EXEC the loop
+/// header joins on its back edge is itself a join. Lane t still runs the
+/// loop t times and stores t + 40.
+#[test]
+fn lane_read_loop_with_a_joined_exec_back_edge() {
+    const WAVE: u32 = 64;
+    const LANE: u32 = 40;
+    let native = program(WAVE, LANE, true);
+    // Emission for a host without 64-lane waves, where no device runs it.
+    emit(
+        &native,
+        super::Target {
+            lanes_min: 32,
+            lanes_max: 32,
+        },
+    );
+    let want: Vec<u32> = (LANE..LANE + WAVE).collect();
+    for (name, host) in devices() {
+        let mut cs = emit(&native, host.target());
+        if let Ok(mut v) = super::validator::Validator::load(
+            super::validator::Validator::default_path().as_deref(),
+        ) {
+            v.validate(&mut cs.dxil)
+                .unwrap_or_else(|e| panic!("{name}: validation: {e}"));
+        }
+        let (root, pso) = host
+            .compute_pipeline(&cs)
+            .unwrap_or_else(|e| panic!("{name}: {e}"));
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(
+                        0,
+                        Root::Constants(vec![0; (cs.user_data_dwords() as usize).max(1)]),
+                    )],
+                    views: &[View::RawUav(WAVE)],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("{name}: {e}"));
+        assert_eq!(out[0], want, "{name}");
+        eprintln!("{name}: joined back edge exact");
+    }
 }

@@ -72,9 +72,15 @@ What each part does today and what it still needs:
 | Audio | Menu, video and loading sound; XMA voices and Opus streams decode | Reverb is silent; Opus results unverified against the title |
 | GPU: menus | Draws, compute and presentation on host D3D12; only changed title memory is copied | Frame pacing drifts on one screen in release builds |
 | GPU: world | Mesh pipelines, shader-written buffers, descriptor lifetimes, indirect execution (arguments clamped), pipelines made by worker threads and kept on disk, depth bounds on supporting adapters (synthetic tests) | Most of the scene is still missing (untranslated shaders drop draws); frames take seconds; real queries, HDR and scaling are missing |
-| Shaders | Console GPU code recompiled to DXIL at first use, cached on disk. Menus: all. World: mesh 8,191 of 8,506, vertex/pixel 10,617 of 12,346, compute 1,643 of 2,539 | 64-bit image atomics, merged geometry stages, the ray-tracing builder's shaders; some compute programs need a GPU with 64-lane waves |
+| Shaders | Console GPU code recompiled to DXIL at first use, cached on disk. Menus: all. World: mesh 8,191 of 8,506, vertex/pixel 10,617 of 12,346, compute 1,643 of 2,539 | Merged geometry stages, the ray-tracing builder's shaders; some compute programs need a GPU with 64-lane waves |
 | Textures | Console tiled layouts and detiling for the modes the title uses | Render-target metadata planes |
 | Series S mode | Runs through the menus to the loading screen | The world, as above |
+
+In an offline scan of `shaders.rpf`, SM 6.6 texture atomics recovered
+520 shader translations. Specializing proven branch outcomes recovered
+another 108 by keeping descriptor words off paths that consume buffer data.
+Microsoft's DXIL validator accepted all 628 shaders. Game rendering with
+these shader changes still needs a Windows D3D12 run.
 
 ## Getting started
 
@@ -83,6 +89,11 @@ shader model 6.6 (and mesh shaders for the world), Rust (pinned in
 `rust-toolchain.toml`). On Linux, see
 [docs/linux-proton.md](docs/linux-proton.md) for which crates build and test
 natively today, cross-building `victory.exe` and running it under Proton.
+
+Under Wine or Proton, indirect execution also needs DXC's `dxcompiler.dll` (with
+its `dxil.dll`): Wine's `d3dcompiler_47` cannot compile the indirect-argument
+clamp. It is looked for in `VICTORY_DXC` (the DLL or its folder), beside the
+`dxil.dll` that shader validation finds, then the executable's folder and System32.
 
 The title also needs several GiB of available Windows commit at startup.
 Check **Committed** under **Task Manager → Performance → Memory**. If
@@ -199,6 +210,7 @@ cargo build --profile diag -p victory --features diagnostics   # target\diag\vic
 | `VICTORY_FPS=60` | a frame at most every 1/60 s when the title asks for fewer (Grand Theft Auto VI's intro asks for 30); works in release builds too |
 | `VICTORY_DYNAMIC_SLOTS=<n>` | on a host whose view heap is capped at 1,000,000 (NVIDIA), `n` of its slots (4096 to 500000, default 65536) hold the tables draws make afresh and the rest mirror the title's first slots; the 5-second `dynamic descriptor slots` line says how many were taken at most and how many tables were not made |
 | `VICTORY_SKIP_PIPELINES=<hash>,...` | omit draws and dispatches, including indirect ones, whose pipeline contains a listed 16-digit shader hash |
+| `VICTORY_SKIP_WAVE64=mesh,compute` | omit draws and dispatches whose pipeline has a program of a listed stage written for 64-lane waves (on hosts with 32-lane waves, such as NVIDIA's, these can hang the GPU) |
 | `VICTORY_GPU_TIMING=1` | with the above, each list of a submission run and timed on its own; slow lists logged with their slowest commands |
 | `VICTORY_D3D12_WARP=1` | host device on the software adapter (slow; cannot reset the driver) |
 | `VICTORY_SHADER_DUMP=<dir>` | writes each shader container and its DXIL as `<hash>.bin` / `<hash>.dxil` when it is translated, for the hashes DRED and timing lines name (`dxc -dumpbin <hash>.dxil`) |

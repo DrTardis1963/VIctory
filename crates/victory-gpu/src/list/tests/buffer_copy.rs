@@ -346,27 +346,24 @@ impl Shader {
             &list,
             &input.buffer,
             input.offset(args.address),
-            None,
             (2, 12, 1),
         ));
-        // SAFETY: the clamp performed the argument transition, and the
-        // resources and signature are kept by the list.
+        // SAFETY: the resources and signature are kept by the list.
         unsafe {
             list.list.SetComputeRootSignature(&self.root);
             list.list.SetPipelineState(&self.pipeline);
             list.list.SetComputeRoot32BitConstant(0, value, 0);
             list.list
                 .SetComputeRootUnorderedAccessView(1, target.gpu(&output, 0));
-            list.list.ExecuteIndirect(
-                &signature,
-                1,
-                &input.buffer,
-                input.offset(args.address),
-                None,
-                0,
-            );
         }
-        crate::indirect::done(&list, &input.buffer, None);
+        // The arguments move from the clamp's writes to indirect reads.
+        crate::indirect::execute(
+            &list,
+            &signature,
+            1,
+            (&input.buffer, input.offset(args.address)),
+            None,
+        );
     }
 }
 
