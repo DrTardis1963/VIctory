@@ -1,6 +1,6 @@
 //! Translated shaders kept on disk (decision 0003): under the configured
 //! cache folder, keyed by the container's content and by the VIctory build
-//! that translated it (the BLAKE3 of our executable), so a rebuilt
+//! that translated it (the BLAKE3 of the translator's sources), so a rebuilt
 //! translator never serves an old translation. Entries go through
 //! `victory-pipeline`'s content-addressed cache, which writes them
 //! atomically; an entry that does not read back is translated again.
@@ -103,13 +103,23 @@ pub(crate) fn counts() -> (u64, u64) {
     (HITS.load(Ordering::Relaxed), MISSES.load(Ordering::Relaxed))
 }
 
-/// What identifies this build: the BLAKE3 of our executable file and of
-/// the translation settings it runs with (the loop limit, which a
-/// diagnostics build can change at run time).
+/// Version of [`encode`] / [`decode`]'s on-disk format: bump it whenever it
+/// changes (the translator's source hash does not cover this file).
+const CACHE_SCHEMA_VERSION: u32 = 1;
+
+/// What identifies this build: the BLAKE3 of the translator's sources (or of
+/// our executable with `VICTORY_SHADER_CACHE_KEY=exe`) and of the
+/// translation settings it runs with (the loop limit, which a diagnostics
+/// build can change at run time). A rebuild that leaves `victory-shader`
+/// alone, or a diagnostics build beside a release one, keeps the cache.
 fn build() -> &'static [u8; 32] {
     static BUILD: OnceLock<[u8; 32]> = OnceLock::new();
     BUILD.get_or_init(|| {
-        let exe = std::env::current_exe().and_then(std::fs::read);
+        let exe = if std::env::var_os("VICTORY_SHADER_CACHE_KEY").is_some_and(|v| v == "exe") {
+            std::env::current_exe().and_then(std::fs::read)
+        } else {
+            Ok([&CACHE_SCHEMA_VERSION.to_le_bytes()[..], victory_shader::SOURCE_HASH.as_bytes()].concat())
+        };
         let limit = victory_shader::emit::loop_limit();
         if limit != victory_shader::emit::DEFAULT_LOOP_LIMIT {
             tracing::warn!(
