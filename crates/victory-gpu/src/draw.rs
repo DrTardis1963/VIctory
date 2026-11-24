@@ -2036,6 +2036,17 @@ impl State {
                         // Only what a shader can index is copied (#1640).
                         let size = size.min(crate::descriptor::host::CONSTANT_MOST);
                         let padded = padded.min(crate::descriptor::host::CONSTANT_MOST);
+                        // A view that lies 256-byte aligned in a shadow copy is
+                        // bound there, as `root_view` does (fxceless #144): no
+                        // upload scratch, no fill waiting on shader writes.
+                        if let Some(shadow) = crate::shadow::find(address, u64::from(padded))
+                            && shadow.gpu(address) % 256 == 0
+                            && shadow.left(address) >= u64::from(padded)
+                        {
+                            shadow.refresh(list, address, u64::from(padded));
+                            host.constant_at(index, shadow.gpu(address), padded);
+                            continue;
+                        }
                         let Some((gpu, to)) = list.scratch(u64::from(padded)) else {
                             host.make_null_constant(index);
                             continue;
