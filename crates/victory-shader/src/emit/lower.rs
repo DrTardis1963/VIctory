@@ -7690,7 +7690,7 @@ mod tests {
             usage: 0,
             half: false,
         };
-        lower(&Parts {
+        lower(&Parts { target: crate::emit::Target::ANY, console_cf: false, per_lane_only: false,
             native: &native,
             p: &p,
             st: &st,
@@ -7798,7 +7798,7 @@ mod tests {
         let io = io::raise(&p, &native).unwrap();
         let st = structure::structure(&p).unwrap();
 
-        let emitted = lower(&Parts {
+        let emitted = lower(&Parts { target: crate::emit::Target::ANY, console_cf: false, per_lane_only: false,
             native: &native,
             p: &p,
             st: &st,
@@ -7885,7 +7885,7 @@ mod tests {
         let res = resource::track(&p, &native.layout, native.stage).unwrap();
         let io = io::raise(&p, &native).unwrap();
         let st = structure::structure(&p).unwrap();
-        lower(&Parts {
+        lower(&Parts { target: crate::emit::Target::ANY, console_cf: false, per_lane_only: false,
             native: &native,
             p: &p,
             st: &st,
