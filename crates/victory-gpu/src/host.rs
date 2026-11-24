@@ -601,6 +601,14 @@ pub(crate) struct MemoryWait {
 /// How long a title wait is waited for before the list goes on (logged).
 const WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// How long a title wait is waited for while no other submission runs and
+/// its memory stays as it was: only a title thread could release it then.
+const SHORT_WAIT: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// Threads in [`Host::execute`], those waiting for the submission lock
+/// included.
+static SUBMITTING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 /// `lhs <comparison> rhs` for a `D3D12_COMPARISON_FUNC`; `None` if unknown.
 pub(crate) fn compare(comparison: u32, lhs: u64, rhs: u64) -> Option<bool> {
     Some(match comparison {
@@ -656,13 +664,18 @@ impl MemoryWait {
         })
     }
 
-    /// Waits until it holds, up to [`WAIT_TIMEOUT`]; whether it does.
-    fn wait(&self) -> bool {
+    /// Waits until it holds, up to [`WAIT_TIMEOUT`], or [`SHORT_WAIT`]
+    /// while no other submission runs and the memory does not change; else
+    /// how long it waited.
+    fn wait(&self) -> Result<(), std::time::Duration> {
         let started = std::time::Instant::now();
+        let first = self.read();
         while !self.holds() {
             let waited = started.elapsed();
-            if waited >= WAIT_TIMEOUT {
-                return false;
+            let others = SUBMITTING.load(Ordering::Relaxed) > 1;
+            if waited >= WAIT_TIMEOUT || (waited >= SHORT_WAIT && !others && self.read() == first)
+            {
+                return Err(waited);
             }
             std::thread::sleep(if waited < std::time::Duration::from_millis(10) {
                 std::time::Duration::from_micros(100)
@@ -670,7 +683,7 @@ impl MemoryWait {
                 std::time::Duration::from_millis(1)
             });
         }
-        true
+        Ok(())
     }
 
     fn written_by(&self, writes: &[(usize, crate::queue::Written, usize)]) -> bool {
@@ -1018,6 +1031,14 @@ impl Host {
 
     /// Runs closed lists and waits for them.
     pub(crate) fn execute(&self, runs: &[&HostList]) {
+        SUBMITTING.fetch_add(1, Ordering::Relaxed);
+        struct Done;
+        impl Drop for Done {
+            fn drop(&mut self) {
+                SUBMITTING.fetch_sub(1, Ordering::Relaxed);
+            }
+        }
+        let _done = Done;
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
@@ -1049,14 +1070,14 @@ impl Host {
         let mut written = vec![0; runs.len()];
         let mut ordered = Vec::new();
         // Title waits: before which entry of `ordered`, in which run.
-        let mut waits: Vec<(usize, usize, MemoryWait)> = Vec::new();
+        let mut waits: Vec<(usize, usize, usize, MemoryWait)> = Vec::new();
         let mut gpu_work = false;
         for (run, (&list, parts)) in runs.iter().zip(&continuations).enumerate() {
             ordered.push((list, QueueSegment::Commands));
             gpu_work |= has_copies && list.may_access_buffers();
             let mut copy_group: Vec<CopyAccess> = Vec::new();
             let mut previous_copy: Option<&BufferCopy> = None;
-            for part in parts {
+            for (p, part) in parts.iter().enumerate() {
                 match part {
                     Continuation::Commands(list) => {
                         ordered.push((list, QueueSegment::Commands));
@@ -1100,7 +1121,7 @@ impl Host {
                         run_mapped_copy(copy.to, copy.from, copy.len, true);
                     }
                     Continuation::Wait(wait) => {
-                        waits.push((ordered.len(), run, *wait));
+                        waits.push((ordered.len(), run, p, *wait));
                         // Copies after it read what is there once it holds.
                         gpu_work = true;
                         copy_group.clear();
@@ -1117,7 +1138,7 @@ impl Host {
             let mut pending = Vec::new();
             let mut waits = waits.into_iter().peekable();
             for i in 0..=ordered.len() {
-                while let Some((_, run, wait)) = waits.next_if(|&(at, ..)| at == i) {
+                while let Some((_, run, part, wait)) = waits.next_if(|&(at, ..)| at == i) {
                     // The bottom-of-pipe writes recorded before the wait.
                     let before: Vec<(usize, usize)> = (0..=run)
                         .map(|r| {
@@ -1133,6 +1154,16 @@ impl Host {
                     if wait.holds() && !unwritten {
                         continue;
                     }
+                    // What releases it runs after it in this submission:
+                    // blocking cannot help (on the console another queue
+                    // runs it meanwhile).
+                    if !unwritten
+                        && let Some(what) =
+                            released_later(runs, &continuations, &ordered[i..], run, part, &wait)
+                    {
+                        wait_not_waited(&wait, what);
+                        continue;
+                    }
                     if i != start {
                         self.execute_batch(&ordered[start..i], &mut submitted);
                         pending.clear();
@@ -1140,16 +1171,16 @@ impl Host {
                     }
                     for (r, &(from, end)) in before.iter().enumerate() {
                         for &(at, what, bytes) in &runs[r].deferred().writes[from..end] {
-                            what.write(at as *mut u8, bytes);
+                            perform_write(at, what, bytes);
                         }
                         written[r] = written[r].max(end);
                     }
                     if !wait.holds() {
                         drop(submitted);
-                        let held = wait.wait();
+                        let waited = wait.wait();
                         submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
-                        if !held {
-                            wait_timed_out(&wait);
+                        if let Err(waited) = waited {
+                            wait_timed_out(&wait, waited);
                         }
                     }
                 }
@@ -1175,7 +1206,7 @@ impl Host {
         for (r, list) in runs.iter().enumerate() {
             let deferred = list.deferred();
             for &(at, what, bytes) in &deferred.writes[written[r].min(deferred.writes.len())..] {
-                what.write(at as *mut u8, bytes);
+                perform_write(at, what, bytes);
             }
         }
         let error = self.log_messages();
@@ -1928,6 +1959,7 @@ impl HostList {
 
     /// Stores `what` (`bytes` of it) at `dst` once the list has run.
     pub(crate) fn defer_write(&self, dst: *mut u8, what: crate::queue::Written, bytes: usize) {
+        note_write(self, dst as usize, what);
         self.deferred().writes.push((dst as usize, what, bytes));
     }
 
@@ -2173,21 +2205,133 @@ impl HostList {
     }
 }
 
-/// A title wait did not hold within [`WAIT_TIMEOUT`]: the list went on.
-fn wait_timed_out(wait: &MemoryWait) {
-    static TIMEOUTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let n = TIMEOUTS.fetch_add(1, Ordering::Relaxed) + 1;
-    if n <= 20 || n.is_power_of_two() {
+/// What, after a title wait in this submission, may write its memory: a
+/// bottom-of-pipe write of a later list or segment, a shader write or a
+/// title buffer copy.
+fn released_later(
+    runs: &[&HostList],
+    continuations: &[Vec<Continuation>],
+    after: &[(&HostList, QueueSegment)],
+    run: usize,
+    part: usize,
+    wait: &MemoryWait,
+) -> Option<&'static str> {
+    let range = (wait.address, wait.len());
+    let mine = {
+        let deferred = runs[run].deferred();
+        wait.written_by(&deferred.writes[wait.writes_before.min(deferred.writes.len())..])
+    };
+    if mine || runs[run + 1..].iter().any(|l| wait.written_by(&l.deferred().writes)) {
+        return Some("bottom-of-pipe write");
+    }
+    if after.iter().any(|(l, _)| {
+        l.deferred().copies.iter().any(|step| match *step {
+            Step::GpuWrite(_, at, len) | Step::Copy(at, _, len) => overlaps((at, len), range),
+            _ => false,
+        })
+    }) {
+        return Some("shader write or title copy");
+    }
+    continuations[run][part + 1..]
+        .iter()
+        .chain(continuations[run + 1..].iter().flatten())
+        .any(|c| matches!(c, Continuation::Copy(copy) if overlaps((copy.to, copy.len), range)))
+        .then_some("buffer copy")
+}
+
+/// Whether a wait message is logged: the first 20, then powers of two.
+fn wait_logged(count: &std::sync::atomic::AtomicU64) -> Option<u64> {
+    let n = count.fetch_add(1, Ordering::Relaxed) + 1;
+    (n <= 20 || n.is_power_of_two()).then_some(n)
+}
+
+/// A title wait released only later in its own submission: not waited for.
+fn wait_not_waited(wait: &MemoryWait, what: &str) {
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    if let Some(n) = wait_logged(&N) {
         tracing::warn!(
-            "Wait{}BitValueX timed out after {} ms at {:#x} (comparison {}, value {:#x}, mask {:#x}; memory holds {:x?}); the list goes on (timeout {n})",
+            "Wait{}BitValueX at {:#x} (comparison {}, value {:#x}; memory holds {:x?}) is released by a {what} later in the same submission: not waited for ({n}){}",
             wait.len() * 8,
-            WAIT_TIMEOUT.as_millis(),
+            wait.address,
+            wait.comparison,
+            wait.value,
+            wait.read(),
+            write_history(wait.address)
+        );
+    }
+}
+
+/// A title wait did not hold in time: the list went on.
+fn wait_timed_out(wait: &MemoryWait, waited: std::time::Duration) {
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    if let Some(n) = wait_logged(&N) {
+        tracing::warn!(
+            "Wait{}BitValueX timed out after {} ms at {:#x} (comparison {}, value {:#x}, mask {:#x}; memory holds {:x?}); the list goes on (timeout {n}){}",
+            wait.len() * 8,
+            waited.as_millis(),
             wait.address,
             wait.comparison,
             wait.value,
             wait.mask,
-            wait.read()
+            wait.read(),
+            write_history(wait.address)
         );
+    }
+}
+
+/// Bottom-of-pipe writes recorded per address (diagnostics): what, by which
+/// list, on which thread, when, and whether it was done yet.
+#[cfg(feature = "diagnostics")]
+type WriteSeen = (crate::queue::Written, usize, String, std::time::Instant, bool);
+#[cfg(feature = "diagnostics")]
+static WRITES_SEEN: Mutex<Option<std::collections::HashMap<usize, WriteSeen>>> = Mutex::new(None);
+
+/// Notes a recorded bottom-of-pipe write (diagnostics).
+fn note_write(list: &HostList, at: usize, what: crate::queue::Written) {
+    #[cfg(feature = "diagnostics")]
+    {
+        let thread = std::thread::current();
+        let thread = thread.name().map_or_else(|| format!("{:?}", thread.id()), str::to_owned);
+        let mut seen = WRITES_SEEN.lock().unwrap_or_else(|e| e.into_inner());
+        seen.get_or_insert_with(Default::default).insert(
+            at,
+            (what, std::ptr::from_ref(list) as usize, thread, std::time::Instant::now(), false),
+        );
+    }
+    #[cfg(not(feature = "diagnostics"))]
+    let _ = (list, at, what);
+}
+
+/// Does a list's bottom-of-pipe write once it has run.
+fn perform_write(at: usize, what: crate::queue::Written, bytes: usize) {
+    what.write(at as *mut u8, bytes);
+    #[cfg(feature = "diagnostics")]
+    if let Some(seen) = WRITES_SEEN.lock().unwrap_or_else(|e| e.into_inner()).as_mut()
+        && let Some(entry) = seen.get_mut(&at)
+    {
+        entry.4 = true;
+    }
+}
+
+/// The last bottom-of-pipe write recorded to `address`, for wait reports
+/// (diagnostics builds; empty otherwise).
+fn write_history(address: usize) -> String {
+    #[cfg(feature = "diagnostics")]
+    {
+        let seen = WRITES_SEEN.lock().unwrap_or_else(|e| e.into_inner());
+        match seen.as_ref().and_then(|s| s.get(&address)) {
+            Some((what, list, thread, when, done)) => format!(
+                "; last write recorded there: {what:?} by list {list:#x} on thread {thread} {} ms ago, {}",
+                when.elapsed().as_millis(),
+                if *done { "done" } else { "not run yet" }
+            ),
+            None => "; no bottom-of-pipe write was ever recorded there".to_owned(),
+        }
+    }
+    #[cfg(not(feature = "diagnostics"))]
+    {
+        let _ = address;
+        String::new()
     }
 }
 
