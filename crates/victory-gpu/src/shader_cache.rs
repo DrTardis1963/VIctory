@@ -144,7 +144,7 @@ impl Converter for KeySpec {
     fn version(&self) -> u32 {
         // The build fingerprint in the input does the versioning; bumped
         // with MAGIC when the encoded HostShader layout changes.
-        2
+        3
     }
     fn convert(&self, _input: &[u8]) -> anyhow::Result<Vec<u8>> {
         unreachable!("KeySpec is only used for Cache::put key computation")
@@ -213,7 +213,7 @@ fn cached(
     (converter.translate)(container)
 }
 
-const MAGIC: &[u8; 4] = b"VSH2";
+const MAGIC: &[u8; 4] = b"VSH3";
 const STAGES: [HwStage; 8] = [
     HwStage::Ls,
     HwStage::Hs,
@@ -298,6 +298,7 @@ fn encode(s: &HostShader) -> Vec<u8> {
             word(&mut out, w);
         }
     }
+    word(&mut out, u32::from(s.stride_table));
     out
 }
 
@@ -363,6 +364,7 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
             props: (r.word()?, r.word()?),
         });
     }
+    let stride_table = r.word()? != 0;
     r.0.is_empty().then_some(HostShader {
         stage,
         dxil,
@@ -372,6 +374,7 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
         root_cbvs,
         root_srvs,
         table_views,
+        stride_table,
     })
 }
 
@@ -410,6 +413,7 @@ mod tests {
                     props: (12 | 0x1000, 32),
                 },
             ],
+            stride_table: true,
         }
     }
 
@@ -434,7 +438,7 @@ mod tests {
 
         // A damaged entry is a miss, translated and stored again.
         for e in walk(dir.path()) {
-            std::fs::write(e, b"VSH2 broken").unwrap();
+            std::fs::write(e, b"VSH3 broken").unwrap();
         }
         assert_eq!(cached(&cache, &build, container, translate), Ok(shader()));
         assert_eq!(runs.load(Ordering::Relaxed), 3);
@@ -499,6 +503,7 @@ mod tests {
         assert_eq!(decode(&[bytes.as_slice(), &[0]].concat()), None);
         assert_eq!(decode(b"VSH0"), None);
         assert_eq!(decode(b"VSH1"), None);
+        assert_eq!(decode(b"VSH2"), None);
     }
 
     #[test]
