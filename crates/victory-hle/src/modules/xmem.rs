@@ -595,8 +595,11 @@ pub extern "system" fn XMemMapPhysicalPages(
     pages: *const usize,
 ) -> *mut c_void {
     let base = address as usize;
+    let Some(len) = n.checked_mul(PAGE).filter(|&len| base.checked_add(len).is_some()) else {
+        return std::ptr::null_mut();
+    };
     let mut physical = physical();
-    unmap(&mut physical, base, n * PAGE);
+    unmap(&mut physical, base, len);
     if pages.is_null() {
         return address;
     }
@@ -661,19 +664,33 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
 /// VI maps pages into a pool view, then has the GPU map them into its tiled
 /// heap. Page by page; false if a source page is not mapped physical memory.
 pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
-    let (to, from, len) = (to as usize, from as usize, len as usize);
+    let (Ok(to), Ok(from), Ok(len)) = (
+        usize::try_from(to),
+        usize::try_from(from),
+        usize::try_from(len),
+    ) else {
+        return false;
+    };
+    if to.checked_add(len).is_none() || (from != 0 && from.checked_add(len).is_none()) {
+        return false;
+    }
     let mut physical = physical();
     unmap(&mut physical, to, len);
     for k in (0..len).step_by(PAGE) {
         if from == 0 {
             break;
         }
-        let at = from + k;
+        let Some(at) = from.checked_add(k) else {
+            return false;
+        };
+        let Some(dest) = to.checked_add(k).filter(|&d| d.checked_add(PAGE).is_some()) else {
+            return false;
+        };
         let Some(slice) = physical
             .views
             .range(..=at)
             .next_back()
-            .filter(|(base, (size, _))| at < *base + size)
+            .filter(|(base, (size, _))| at < base.saturating_add(*size))
             .map(|(base, (_, s))| Slice {
                 index: s.index + (at - base) / PAGE,
                 section: s.section.clone(),
@@ -681,7 +698,7 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
         else {
             return false;
         };
-        if !map(&mut physical, to + k, PAGE, slice) {
+        if !map(&mut physical, dest, PAGE, slice) {
             return false;
         }
     }
@@ -789,14 +806,16 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
     if len == 0 {
         return;
     }
-    let end = base + len;
+    let Some(end) = base.checked_add(len) else {
+        return;
+    };
     // Views do not overlap: the one holding `base`, then those starting
     // inside (the GPU's page mappings make one view per page).
     let first = physical
         .views
         .range(..=base)
         .next_back()
-        .filter(|(at, (size, _))| *at + size > base)
+        .filter(|(at, (size, _))| at.saturating_add(*size) > base)
         .map(|(at, _)| *at);
     let hit: Vec<usize> = first
         .into_iter()
@@ -1238,5 +1257,24 @@ mod tests {
         assert!(page_window(&[a[0], b[0]], 0, PAGE).is_some());
         assert_eq!(XMemFreePhysicalPages(3, a.as_ptr()), 1);
         assert_eq!(XMemFreePhysicalPages(1, b.as_ptr()), 1);
+    }
+
+    #[test]
+    fn physical_map_and_alias_reject_overflowing_ranges() {
+        assert!(
+            XMemMapPhysicalPages(
+                0x1_0000 as *mut c_void,
+                usize::MAX / PAGE + 1,
+                std::ptr::null(),
+            )
+            .is_null()
+        );
+        assert!(
+            XMemMapPhysicalPages((usize::MAX - PAGE + 1) as *mut c_void, 2, std::ptr::null())
+                .is_null()
+        );
+        assert!(!map_alias(u64::MAX - 0x100, 0, PAGE as u64));
+        assert!(!map_alias(0x1_0000, u64::MAX - 0x100, PAGE as u64));
+        unmap(&mut physical(), usize::MAX - 10, 100);
     }
 }
