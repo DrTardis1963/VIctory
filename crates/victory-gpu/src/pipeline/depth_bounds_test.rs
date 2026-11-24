@@ -65,6 +65,7 @@ fn host_shader(stage: &'static str, hw_stage: victory_shader::HwStage, bytes: &[
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
             table_views: Vec::new(),
+            stride_table: false,
         },
         used: Vec::new(),
         resource_heap: false,

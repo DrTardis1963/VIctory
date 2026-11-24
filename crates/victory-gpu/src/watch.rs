@@ -10,7 +10,11 @@
 //! copy leaves each 64 KiB block it took read-only, and our vectored handler
 //! takes the first write to it: it notes the block as written and gives the
 //! write access back. The runtime tells us when it maps or unmaps views
-//! ([`title_memory_remapped`]), which resets their protection.
+//! ([`title_memory_remapped`]), which resets their protection. Blocks found
+//! unmapped are not asked about again until it maps them: view memory
+//! comes from placeholders, which only the runtime's mapping fills.
+//! shortcut: so memory committed otherwise into such a block (a range
+//! reaching from a view into a plain reservation) is not seen.
 //!
 //! shortcut: writes into physical pages through another view (xmem's
 //! `write_physical`, DirectStorage's page destinations) are not seen at
@@ -198,12 +202,28 @@ struct Guards {
     /// Blocks with announced kernel writes still to land, and how many:
     /// left open until they have, however many refreshes come first.
     announced: BTreeMap<usize, u32>,
+    /// Blocks known to be view memory until remapped: asking at each check
+    /// of the world's big heap (~900 per frame) took 60 to 130 ms.
+    views: BTreeSet<usize>,
+    /// How often title memory was remapped: an answer from before the last
+    /// time is not remembered.
+    remaps: u64,
+    /// Blocks found unmapped (not committed) when a copy took them: the
+    /// copy holds their zeros until the runtime maps them
+    /// ([`title_memory_remapped`]). Without this, every asking found them
+    /// "written" again (they cannot be made read-only) and the copy read
+    /// them page by page through the kernel's failing reads, hundreds of
+    /// MB per world frame.
+    absent: BTreeSet<usize>,
 }
 
 static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     protected: BTreeSet::new(),
     clean: BTreeSet::new(),
     announced: BTreeMap::new(),
+    views: BTreeSet::new(),
+    remaps: 0,
+    absent: BTreeSet::new(),
 });
 
 fn guards() -> std::sync::MutexGuard<'static, Guards> {
@@ -214,16 +234,25 @@ fn guards() -> std::sync::MutexGuard<'static, Guards> {
 /// they were last guarded (all of a block's pages), guarding them again
 /// before the caller copies them. `None` if the memory is not a view.
 fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
-    if !mapped(start) {
-        return None;
-    }
-    install();
+    let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
     let mut g = guards();
+    if !g.views.contains(&first) {
+        let remaps = g.remaps;
+        // Not while holding the lock, which the title's threads take at
+        // their writes to guarded blocks.
+        drop(g);
+        let until = mapped_until(start)?;
+        install();
+        g = guards();
+        // An answer from before a remapping is not remembered.
+        if g.remaps == remaps {
+            g.views.extend(first..until.div_ceil(BLOCK).min(last).max(first + 1));
+        }
+    }
     let mut written = Vec::new();
     let mut run: Option<usize> = None;
-    let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
     for block in first..=last {
-        let open = block < last && !g.clean.contains(&block);
+        let open = block < last && !g.clean.contains(&block) && !g.absent.contains(&block);
         if open {
             written.extend(block * BLOCK / PAGE..(block + 1) * BLOCK / PAGE);
             if g.protected.contains(&block) {
@@ -244,7 +273,13 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
 /// Whether the current allocation at `at` is a mapped view. Asking only for
 /// the allocation type avoids enumerating pages with identical protection,
 /// which can span an entire large view after its blocks were guarded.
+#[cfg(test)]
 fn mapped(at: usize) -> bool {
+    mapped_until(at).is_some()
+}
+
+/// As [`mapped`], with the end of the view's region when it is one.
+fn mapped_until(at: usize) -> Option<usize> {
     use windows_sys::Win32::System::Memory::{
         MEM_MAPPED, MEMORY_BASIC_INFORMATION, MemoryRegionInfo, QueryVirtualMemoryInformation,
         VirtualQuery, WIN32_MEMORY_REGION_INFORMATION,
@@ -274,8 +309,10 @@ fn mapped(at: usize) -> bool {
         const MAPPED_PHYSICAL: u32 = 1 << 4;
         // SAFETY: this union was filled by the successful query above.
         match unsafe { region.Anonymous.Flags } {
-            MAPPED_DATA_FILE | MAPPED_PAGE_FILE | MAPPED_PHYSICAL => return true,
-            PRIVATE | MAPPED_IMAGE => return false,
+            MAPPED_DATA_FILE | MAPPED_PAGE_FILE | MAPPED_PHYSICAL => {
+                return Some(region.AllocationBase as usize + region.RegionSize);
+            }
+            PRIVATE | MAPPED_IMAGE => return None,
             _ => {}
         }
     }
@@ -284,11 +321,12 @@ fn mapped(at: usize) -> bool {
     let mut info = MEMORY_BASIC_INFORMATION::default();
     // SAFETY: the output buffer has the required layout and size.
     let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
-    n != 0 && info.Type == MEM_MAPPED
+    (n != 0 && info.Type == MEM_MAPPED).then(|| info.BaseAddress as usize + info.RegionSize)
 }
 
 /// Makes blocks `[from, to)` read-only and notes them guarded and clean;
-/// block by block if they span views, leaving out any that fail (unmapped).
+/// block by block if they span views, leaving out any that fail, and
+/// noting those not committed (unmapped) absent.
 fn protect(g: &mut Guards, from: usize, to: usize) {
     use windows_sys::Win32::System::Memory::{PAGE_READONLY, VirtualProtect};
     let set = |from: usize, to: usize| {
@@ -314,8 +352,20 @@ fn protect(g: &mut Guards, from: usize, to: usize) {
     for block in from..to {
         if set(block, block + 1) {
             note(g, block, block + 1);
+        } else if unmapped(block * BLOCK) {
+            g.absent.insert(block);
         }
     }
+}
+
+/// Whether nothing is committed at `at` (a placeholder between views).
+fn unmapped(at: usize) -> bool {
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQuery};
+    // SAFETY: plain data filled in by the query.
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid out pointer of the right size.
+    let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
+    n != 0 && info.State != MEM_COMMIT
 }
 
 /// Gives write access back to the guarded blocks of `[start, end)` and
@@ -375,8 +425,8 @@ pub fn kernel_wrote(at: usize, len: usize) {
 }
 
 /// The runtime mapped or unmapped title memory `[at, at + len)`: what it
-/// shows is new and read-write, so it is no longer guarded, and any placed
-/// textures backed by that range are evicted.
+/// shows is new and read-write, so it is no longer guarded (nor known
+/// unmapped), and any placed textures backed by that range are evicted.
 pub fn title_memory_remapped(at: usize, len: usize) {
     if len == 0 {
         return;
@@ -384,6 +434,7 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     let end = at.saturating_add(len);
     {
         let mut g = guards();
+        g.remaps += 1;
         let blocks: Vec<usize> = g
             .protected
             .range(at / BLOCK..end.div_ceil(BLOCK))
@@ -393,9 +444,42 @@ pub fn title_memory_remapped(at: usize, len: usize) {
             g.protected.remove(&block);
             g.clean.remove(&block);
         }
+        let views: Vec<usize> = g.views.range(at / BLOCK..end.div_ceil(BLOCK)).copied().collect();
+        for block in views {
+            g.views.remove(&block);
+        }
+        let absent: Vec<usize> = g.absent.range(at / BLOCK..end.div_ceil(BLOCK)).copied().collect();
+        for block in absent {
+            g.absent.remove(&block);
+        }
     }
     crate::resource::evict_placed_textures(at as u64, end as u64);
     crate::descriptor::host::bindless_viewed_changed();
+}
+
+/// Unmaps the view of `size` bytes at `at`, whose addresses become a
+/// placeholder again.
+///
+/// # Safety
+///
+/// A view the runtime mapped there, unmapped once.
+pub unsafe fn unmap_title_view(at: usize, size: usize) {
+    use windows_sys::Win32::System::Memory::{
+        MEM_PRESERVE_PLACEHOLDER, MEMORY_MAPPED_VIEW_ADDRESS, UnmapViewOfFile2,
+    };
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let view = MEMORY_MAPPED_VIEW_ADDRESS { Value: at as *mut _ };
+    unmapping(at, size, || {
+        // SAFETY: the caller's.
+        unsafe { UnmapViewOfFile2(GetCurrentProcess(), view, MEM_PRESERVE_PLACEHOLDER) };
+    });
+}
+
+/// Guards are forgotten once the memory is gone: a check before that would
+/// guard it, and remember it, for good.
+fn unmapping(at: usize, size: usize, unmap: impl FnOnce()) {
+    unmap();
+    title_memory_remapped(at, size);
 }
 
 /// Registers the handler that takes writes to guarded blocks, once, ahead
@@ -668,6 +752,102 @@ mod tests {
         unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
     }
 
+    /// That memory is a view is remembered only until it is remapped.
+    #[test]
+    fn remapped_memory_is_asked_about_again() {
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile, UnmapViewOfFile,
+        };
+        // SAFETY: a pagefile section of two blocks, mapped read-write.
+        let view = unsafe {
+            let section = CreateFileMappingW(
+                -1isize as _,
+                std::ptr::null(),
+                PAGE_READWRITE,
+                0,
+                (2 * BLOCK) as u32,
+                std::ptr::null(),
+            );
+            assert!(!section.is_null());
+            MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, 2 * BLOCK).Value as usize
+        };
+        assert_ne!(view, 0);
+        let (first, second) = (view / BLOCK, view / BLOCK + 1);
+        assert_eq!(guard(view, view + 2 * BLOCK), Some(vec![first, second]));
+        // The second block is known from the first one's asking.
+        assert!(guards().views.contains(&second));
+        assert_eq!(guard(view + BLOCK, view + 2 * BLOCK), Some(vec![]));
+        title_memory_remapped(view, 2 * BLOCK);
+        assert!(guards().views.range(first..=second).next().is_none());
+        // SAFETY: our view, unmapped once.
+        unsafe { UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: view as *mut _ }) };
+        assert_eq!(guard(view, view + 2 * BLOCK), None);
+    }
+
+    /// A copy that checks view memory while it is unmapped leaves nothing
+    /// behind: what comes next at its addresses is asked about, and not
+    /// made read-only.
+    #[test]
+    fn a_check_during_the_unmapping_leaves_nothing_behind() {
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, MEM_PRESERVE_PLACEHOLDER, MEM_REPLACE_PLACEHOLDER,
+            MEM_RESERVE_PLACEHOLDER, MapViewOfFile3, UnmapViewOfFile2, VirtualAlloc2,
+        };
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        const LEN: usize = 4 * BLOCK;
+        let placeholder = MEM_RESERVE | MEM_RESERVE_PLACEHOLDER;
+        // SAFETY: a placeholder and a section of its size, both ours.
+        let (at, section) = unsafe {
+            let (no, process) = (std::ptr::null_mut(), GetCurrentProcess());
+            let at = VirtualAlloc2(process, no, LEN, placeholder, 1, no.cast(), 0) as usize;
+            let len = LEN as u32;
+            (at, CreateFileMappingW(-1isize as _, no.cast(), PAGE_READWRITE, 0, len, no.cast()))
+        };
+        assert!(at != 0 && !section.is_null());
+        // SAFETY: the placeholder takes the view.
+        let view = unsafe {
+            MapViewOfFile3(
+                section,
+                GetCurrentProcess(),
+                at as *const _,
+                0,
+                LEN,
+                MEM_REPLACE_PLACEHOLDER,
+                PAGE_READWRITE,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        assert_eq!(view.Value as usize, at);
+        title_memory_remapped(at, LEN);
+        unmapping(at, LEN, || {
+            assert!(guard(at, at + LEN).is_some());
+            // SAFETY: our view; a placeholder again.
+            unsafe { UnmapViewOfFile2(GetCurrentProcess(), view, MEM_PRESERVE_PLACEHOLDER) };
+        });
+        {
+            let g = guards();
+            let blocks = at / BLOCK..(at + LEN) / BLOCK;
+            assert_eq!(g.views.range(blocks.clone()).next(), None);
+            assert_eq!(g.protected.range(blocks.clone()).next(), None);
+            assert_eq!(g.clean.range(blocks).next(), None);
+        }
+        assert_eq!(guard(at, at + LEN), None);
+        // SAFETY: the placeholder, replaced by private memory, freed.
+        unsafe {
+            VirtualFree(at as *mut _, LEN / 2, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER);
+            VirtualFree(at as *mut _, 0, MEM_RELEASE);
+            VirtualFree((at + LEN / 2) as *mut _, 0, MEM_RELEASE);
+        }
+        // SAFETY: fresh memory at the same addresses.
+        let fresh = unsafe { VirtualAlloc(at as *const _, LEN, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) };
+        assert_eq!(fresh as usize, at);
+        assert_eq!(guard(at, at + LEN), None);
+        assert!(writable(at));
+        // SAFETY: the memory above.
+        unsafe { VirtualFree(fresh, 0, MEM_RELEASE) };
+    }
+
     /// A kernel read into a guarded view block fails; opened first, it
     /// lands and the block counts as written.
     #[test]
@@ -700,14 +880,27 @@ mod tests {
             let into = unsafe { std::slice::from_raw_parts_mut((view + 100) as *mut u8, 13) };
             file.read(into).is_ok_and(|n| n == 13)
         };
-        assert!(!read(&mut file), "the kernel does not fault into our handler");
+        assert!(
+            !read(&mut file),
+            "the kernel does not fault into our handler"
+        );
         writing(view + 100, 13);
         assert!(read(&mut file));
         // SAFETY: the bytes just read.
-        assert_eq!(unsafe { std::slice::from_raw_parts((view + 100) as *const u8, 13) }, b"from the disk");
-        assert_eq!(guard(view, view + 2 * BLOCK), Some((view / PAGE..view / PAGE + 1).collect()));
+        let landed = unsafe { std::slice::from_raw_parts((view + 100) as *const u8, 13) };
+        assert_eq!(landed, b"from the disk");
+        assert_eq!(
+            guard(view, view + 2 * BLOCK),
+            Some((view / PAGE..view / PAGE + 1).collect())
+        );
         // SAFETY: our view.
-        unsafe { UnmapViewOfFile(windows_sys::Win32::System::Memory::MEMORY_MAPPED_VIEW_ADDRESS { Value: view as *mut _ }) };
+        unsafe {
+            UnmapViewOfFile(
+                windows_sys::Win32::System::Memory::MEMORY_MAPPED_VIEW_ADDRESS {
+                    Value: view as *mut _,
+                },
+            )
+        };
         title_memory_remapped(view, 2 * BLOCK);
     }
 
@@ -774,5 +967,89 @@ mod tests {
             )
         };
         title_memory_remapped(view, 2 * BLOCK);
+    }
+
+    /// Blocks of a placeholder between views are reported once, then not
+    /// again (they cannot be guarded) until the runtime maps them.
+    #[test]
+    fn unmapped_blocks_are_reported_once_until_mapped() {
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, MEM_PRESERVE_PLACEHOLDER, MEM_REPLACE_PLACEHOLDER,
+            MEM_RESERVE_PLACEHOLDER, MapViewOfFile3, PAGE_NOACCESS, UnmapViewOfFile2,
+            VirtualAlloc2,
+        };
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        // SAFETY: a fresh placeholder of three blocks and a pagefile
+        // section of two; block 0 shows the section's first block, as the
+        // runtime maps physical pages.
+        let (p, section) = unsafe {
+            let p = VirtualAlloc2(
+                GetCurrentProcess(),
+                std::ptr::null(),
+                3 * BLOCK,
+                MEM_RESERVE | MEM_RESERVE_PLACEHOLDER,
+                PAGE_NOACCESS,
+                std::ptr::null_mut(),
+                0,
+            ) as usize;
+            assert_ne!(p, 0);
+            let section = CreateFileMappingW(
+                -1isize as _,
+                std::ptr::null(),
+                PAGE_READWRITE,
+                0,
+                (2 * BLOCK) as u32,
+                std::ptr::null(),
+            );
+            assert!(!section.is_null());
+            (p, section)
+        };
+        let map = |block: usize| {
+            // SAFETY: splits the placeholder at the block and maps the
+            // section's block there.
+            let view = unsafe {
+                VirtualFree(
+                    (p + block * BLOCK) as *mut _,
+                    BLOCK,
+                    MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER,
+                );
+                MapViewOfFile3(
+                    section,
+                    GetCurrentProcess(),
+                    (p + block * BLOCK) as *const _,
+                    (block * BLOCK) as u64,
+                    BLOCK,
+                    MEM_REPLACE_PLACEHOLDER,
+                    PAGE_READWRITE,
+                    std::ptr::null_mut(),
+                    0,
+                )
+            };
+            assert_eq!(view.Value as usize, p + block * BLOCK);
+            view
+        };
+        let first = map(0);
+        let pages = |block: usize| (p + block * BLOCK) / PAGE..(p + (block + 1) * BLOCK) / PAGE;
+        let all: Vec<usize> = (0..3).flat_map(pages).collect();
+        assert_eq!(guard(p, p + 3 * BLOCK), Some(all));
+        assert_eq!(
+            guard(p, p + 3 * BLOCK),
+            Some(Vec::new()),
+            "nothing written since"
+        );
+        let second = map(1);
+        title_memory_remapped(p + BLOCK, BLOCK);
+        assert_eq!(guard(p, p + 3 * BLOCK), Some(pages(1).collect()));
+        assert_eq!(guard(p, p + 3 * BLOCK), Some(Vec::new()));
+        // SAFETY: our views and placeholder.
+        unsafe {
+            UnmapViewOfFile2(GetCurrentProcess(), first, MEM_PRESERVE_PLACEHOLDER);
+            UnmapViewOfFile2(GetCurrentProcess(), second, MEM_PRESERVE_PLACEHOLDER);
+            for block in 0..3 {
+                VirtualFree((p + block * BLOCK) as *mut _, 0, MEM_RELEASE);
+            }
+            windows_sys::Win32::Foundation::CloseHandle(section);
+        }
+        title_memory_remapped(p, 3 * BLOCK);
     }
 }

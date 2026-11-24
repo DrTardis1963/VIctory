@@ -169,6 +169,7 @@ fn lower_compute(native: &NativeProgram) -> HostShader {
         root_cbvs: lowered.root_cbvs,
         root_srvs: lowered.root_srvs,
         table_views: lowered.table_views,
+        stride_table: lowered.stride_table,
     };
 
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
@@ -183,14 +184,21 @@ fn lower_compute(native: &NativeProgram) -> HostShader {
 
 /// Runs `shader` on every available SM 6.6 host (hardware GPU and WARP) for
 /// each 4-dword input set and invokes `check(backend, case_index, inputs, result_dword)`.
-fn run_cases(
+fn run_cases(shader: &HostShader, cases: &[[u32; 4]], check: impl FnMut(&str, usize, [u32; 4], u32)) {
+    run_cases_on(shader, cases, &[("hardware", false), ("warp", true)], check);
+}
+
+/// `run_cases` on the given backends only (WARP cannot pin a wave size, which
+/// the lane-aware programs ask for).
+fn run_cases_on(
     shader: &HostShader,
     cases: &[[u32; 4]],
+    backends: &[(&str, bool)],
     mut check: impl FnMut(&str, usize, [u32; 4], u32),
 ) {
     let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let mut ran = 0;
-    for (label, warp) in [("hardware", false), ("warp", true)] {
+    for &(label, warp) in backends {
         let Ok(host) = Host::new(warp) else {
             eprintln!("no SM 6.6 {label} device; skipped");
             continue;
@@ -1454,6 +1462,7 @@ fn build_lanes(body: &[u32], wave64: bool) -> Result<HostShader, String> {
         root_cbvs: lowered.root_cbvs,
         root_srvs: lowered.root_srvs,
         table_views: Vec::new(),
+        stride_table: lowered.stride_table,
     })
 }
 
@@ -1688,4 +1697,148 @@ fn scalar_counted_in_a_divergent_wave32_loop_read_after_it() {
         .expect("dispatch");
     let got: Vec<u32> = out[0][..32].to_vec();
     assert!(got.iter().all(|&x| x == 32), "iterations counted: {got:?}");
+}
+
+/// A select whose mask is a plain SGPR (here a root constant), so the
+/// structure pass does not follow it: this lane takes its own bit of the
+/// number. Inline 0 and -1 masks pick src0 and src1 in every lane.
+#[test]
+fn v_cndmask_on_an_untracked_mask_tests_this_lanes_bit() {
+    // v_cndmask_b32_e64 v0, v1, v2, <mask> (VOP3 0x101); s3 holds the mask.
+    let from_sgpr = build_valu_cs(&vop3(0x101, 0, vgpr(1), vgpr(2), sgpr(3)));
+    let hw = &[("hardware", false)];
+    run_cases_on(
+        &from_sgpr,
+        &[[10, 20, 0, 0], [10, 20, 0, 1], [10, 20, 0, 2], [10, 20, 0, !0]],
+        hw,
+        |label, i, inp, got| {
+            let want = if inp[3] & 1 != 0 { inp[1] } else { inp[0] };
+            assert_eq!(got, want, "{label} case {i}");
+        },
+    );
+    for (mask, pick) in [(128u16, 0usize), (193, 1)] {
+        let k = build_valu_cs(&vop3(0x101, 0, vgpr(1), vgpr(2), mask));
+        run_cases_on(&k, &[[10, 20, 0, 0]], hw, |label, _, inp, got| {
+            assert_eq!(got, inp[pick], "{label} inline {mask}");
+        });
+    }
+}
+
+#[test]
+fn cvt_f32_f64_matches_rdna2() {
+    // v_cvt_f32_f64 v0, v[1:2] (VOP1 opcode 0x00f)
+    let shader = build_valu_cs(&[vop1(0x00f, 0, vgpr(1))]);
+
+    let cases: &[(f64, f32)] = &[
+        (0.0, 0.0),
+        (-0.0, -0.0),
+        (1.0, 1.0),
+        (-1.0, -1.0),
+        (std::f64::consts::PI, std::f32::consts::PI),
+        (65536.5, 65536.5),
+        (1.0e-30, (1.0e-30f64) as f32),
+        (1.0e38, 1.0e38),
+    ];
+
+    let inputs: Vec<[u32; 4]> = cases
+        .iter()
+        .map(|&(d, _)| {
+            let bits = d.to_bits();
+            [bits as u32, (bits >> 32) as u32, 0, 0]
+        })
+        .collect();
+
+    run_cases(&shader, &inputs, |backend, i, _, got| {
+        let want = cases[i].1.to_bits();
+        assert_eq!(
+            got,
+            want,
+            "{}: v_cvt_f32_f64({}) = {:#010x} ({}), want {:#010x} ({})",
+            backend,
+            cases[i].0,
+            got,
+            f32::from_bits(got),
+            want,
+            cases[i].1,
+        );
+    });
+}
+
+#[test]
+fn cvt_f32_f64_decodes_double_inline_constants() {
+    let values = [
+        0.5,
+        -0.5,
+        1.0,
+        -1.0,
+        2.0,
+        -2.0,
+        4.0,
+        -4.0,
+        f64::from_bits(0x3fc4_5f30_6dc9_c882) as f32,
+    ];
+    for (code, value) in (240..=248).zip(values) {
+        let shader = build_valu_cs(&[vop1(0x00f, 0, code)]);
+        run_cases(&shader, &[[0; 4]], |backend, _, _, got| {
+            assert_eq!(
+                got,
+                value.to_bits(),
+                "{backend}: FP64 inline constant {code} should convert to {value}"
+            );
+        });
+    }
+    // Integer inline 1 is a bit pattern, a tiny positive double.
+    let integer_one = build_valu_cs(&[vop1(0x00f, 0, 129)]);
+    run_cases(&integer_one, &[[0; 4]], |backend, _, _, got| {
+        assert_eq!(got, 0, "{backend}: integer inline bits");
+    });
+}
+
+#[test]
+fn cvt_f32_f64_uses_literal_as_the_high_word() {
+    for (high, value) in [
+        (0x4008_0000, 3.0f32),
+        (0xc00c_0000, -3.5),
+        (0x8000_0000, -0.0),
+    ] {
+        let shader = build_valu_cs(&[vop1(0x00f, 0, 255), high]);
+        run_cases(&shader, &[[0; 4]], |backend, _, _, got| {
+            assert_eq!(
+                got,
+                value.to_bits(),
+                "{backend}: FP64 literal {high:#010x} in the high dword"
+            );
+        });
+    }
+}
+
+#[test]
+fn cvt_f32_f64_applies_e64_source_and_output_modifiers() {
+    const ABS: u32 = 1 << 8;
+    const NEG: u32 = 1 << 29;
+    const CLAMP: u32 = 1 << 15;
+    const MUL_2: u32 = 1 << 27;
+    for (input, abs_clamp, neg_omod, expected) in [
+        (-1.25f64, ABS, 0, 1.25f32),
+        (-1.25, 0, NEG, 1.25),
+        (-1.25, ABS, NEG, -1.25),
+        (-0.75, ABS | CLAMP, MUL_2, 1.0),
+    ] {
+        let mut words = vop3(0x18f, 0, vgpr(1), 0, 0);
+        words[0] |= abs_clamp;
+        words[1] |= neg_omod;
+        let shader = build_valu_cs(&words);
+        let bits = input.to_bits();
+        run_cases(
+            &shader,
+            &[[bits as u32, (bits >> 32) as u32, 0, 0]],
+            |backend, _, _, got| {
+                assert_eq!(
+                    got,
+                    expected.to_bits(),
+                    "{backend}: {words:08x?} input {input}"
+                );
+            },
+        );
+    }
 }

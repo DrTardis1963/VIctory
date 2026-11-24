@@ -49,6 +49,7 @@ pub(crate) struct Lowered {
     pub cmp_samplers: u64,
     pub root_cbvs: Vec<u8>,
     pub root_srvs: Vec<u8>,
+    pub stride_table: bool,
     pub user_data: Vec<UserData>,
     pub samplers: Vec<[u32; 4]>,
     #[cfg(test)]
@@ -252,6 +253,9 @@ struct Lower<'a> {
     exports: HashMap<Site, &'a Export>,
     interps: HashMap<Site, &'a Interp>,
     handles: HashMap<(usize, Site, u8, bool, u32, u32), V>,
+    /// Runtime stride table entries read in a block, by the descriptor's
+    /// load: the raw slot, the stride and the bias.
+    entries: HashMap<(usize, Site, u8), [V; 3]>,
     /// Blocks splitting the edge from one IR block to another.
     edges: HashMap<(usize, usize), usize>,
     /// Per IR block: a `done` export is behind every lane entering it.
@@ -616,6 +620,24 @@ fn packed_half(elements: &[SigElement], a: u8, b: Option<u8>, h: u8) -> Option<(
     (c < extent(b)?).then_some((b, c))
 }
 
+/// A packed pixel input half, or `None` for padding explicitly described by
+/// the metadata. With an inferred partner, a missing half instead remains an
+/// error: the inference must not turn real data into zeroes.
+fn packed_input_half(
+    elements: &[SigElement],
+    a: u8,
+    b: Option<u8>,
+    h: u8,
+    explicit_second_row: bool,
+) -> Result<Option<(u8, u8)>, Why> {
+    let half = packed_half(elements, a, b, h);
+    if half.is_none() && !explicit_second_row {
+        Err("a packed input half no element holds")
+    } else {
+        Ok(half)
+    }
+}
+
 /// Vertex or mesh outputs of 16-bit values (see [`Lower::half_outputs`]):
 /// a packed row's partner is the next 16-bit row of the signature that no
 /// output entry names, taken in row order.
@@ -863,6 +885,22 @@ impl<'a> Lower<'a> {
                         .support(g)
                         .iter()
                         .any(|a| matches!(a, Atom::Opaque(_) | Atom::Constant(_)))
+                }) || live().any(|i| {
+                    // Selects try without console lanes first (`numeric_selects`
+                    // retries them).
+                    let mask_read = match i.name() {
+                        "v_cndmask_b32" => numeric_selects,
+                        n => matches!(n, "v_add_co_ci_u32" | "v_sub_co_ci_u32" | "v_subrev_co_ci_u32"),
+                    };
+                    mask_read && match &i.fields {
+                        Fields::Valu(v) => match v.src.get(2) {
+                            Some(&Operand::Scalar { code, .. }) => i
+                                .read(Reg::S(code))
+                                .is_none_or(|m| !x.st.masks.contains_key(&m)),
+                            _ => false,
+                        },
+                        _ => false,
+                    }
                 })
             };
             console_lanes = reads_whole || masks_held || live().any(in_half);
@@ -1037,6 +1075,7 @@ impl<'a> Lower<'a> {
             exports: x.io.exports.iter().map(|e| (e.site, e)).collect(),
             interps: x.io.interps.iter().map(|(s, i)| (*s, i)).collect(),
             handles: HashMap::new(),
+            entries: HashMap::new(),
             edges: HashMap::new(),
             exported: vec![false; p.blocks.len()],
             rpo: vec![usize::MAX; p.blocks.len()],
@@ -1607,6 +1646,7 @@ impl<'a> Lower<'a> {
         self.s.samplers = self.samplers.len() as u32;
         let root_cbvs = self.s.root_cbvs.iter().map(|r| r.0).collect();
         let root_srvs = self.s.root_srvs.iter().map(|r| r.0).collect();
+        let stride_table = self.s.stride_table.is_some();
         let cmp_samplers = self.s.cmp_samplers;
         #[cfg(test)]
         let has_isnan_op = self.s.m.has_dx_op("dx.op.isSpecialFloat.f32", 8);
@@ -1618,6 +1658,7 @@ impl<'a> Lower<'a> {
             cmp_samplers,
             root_cbvs,
             root_srvs,
+            stride_table,
             #[cfg(test)]
             spin_loops: self.spun,
             #[cfg(test)]
@@ -2597,6 +2638,10 @@ impl<'a> Lower<'a> {
                 let hi = hi.map(word).transpose()?;
                 Ok(self.lane_bit(at, lo, hi))
             }
+            Atom::Constant(0) => Ok(self.s.m.bool(false)),
+            Atom::Constant(k) if k == u64::MAX || (!self.x.native.wave64 && k as u32 == u32::MAX) => {
+                Ok(self.s.m.bool(true))
+            }
             Atom::Constant(k) if self.console_lanes => {
                 let lo = self.s.m.i32(k as u32);
                 let hi = self.s.m.i32((k >> 32) as u32);
@@ -2604,6 +2649,50 @@ impl<'a> Lower<'a> {
             }
             Atom::Opaque(_) => Err("an opaque lane mask"),
             Atom::Constant(_) => Err("a constant lane mask"),
+        }
+    }
+
+    /// This lane's bit from a mask operand (`v_cndmask_b32` / `*_ci_u32`):
+    /// uses the tracked boolean when `structure` followed it, handles inline
+    /// `0`/`-1` constants, or tests this console lane's bit of the scalar
+    /// mask register (pair in wave64) when console lanes are active.
+    fn mask_cond(
+        &mut self,
+        inst: &Inst,
+        op: Option<&Operand>,
+        at: usize,
+        err: Why,
+    ) -> Result<V, Why> {
+        match op {
+            Some(&Operand::Const(128)) => Ok(self.s.m.bool(false)),
+            Some(&Operand::Const(193)) => Ok(self.s.m.bool(true)),
+            Some(&Operand::Scalar { code, .. }) => {
+                // A selector that derives from neither EXEC nor a compare (a
+                // constant, a number built from scalars) is a mask held as a
+                // number: with console lanes the lane tests its own bit.
+                if let Some(m) = inst.read(Reg::S(code)).and_then(|m| {
+                    let others = self.console_lanes.then(|| self.x.st.others.get(&m));
+                    self.x.st.masks.get(&m).or(others.flatten()).copied()
+                }) {
+                    return self.boolean(m, at);
+                }
+                if !self.console_lanes || self.split && !self.console_cf {
+                    return Err(err);
+                }
+                let lo = inst.read(Reg::S(code)).ok_or(err)?;
+                let lo = self.i32_of(lo)?;
+                let hi = if self.x.native.wave64 {
+                    match inst.read(Reg::S(code + 1)) {
+                        Some(v) => Some(self.i32_of(v)?),
+                        None => Some(self.s.m.i32(0)),
+                    }
+                } else {
+                    None
+                };
+                self.s.flags |= flags::WAVE_OPS;
+                Ok(self.lane_bit(at, lo, hi))
+            }
+            _ => Err(err),
         }
     }
 
@@ -5048,6 +5137,93 @@ impl<'a> Lower<'a> {
         }
     }
 
+    /// The entry of the host's runtime stride table (`t0`,
+    /// [`super::STRIDE_SPACE`]) for the view-heap slot of `src`, read in the
+    /// current block: the slot holding a raw view of the buffer's bytes
+    /// (the slot itself when the table names none), the stride and the bias
+    /// ([`super::StrideEntry`]).
+    fn stride_entry(&mut self, src: &Source) -> Result<[V; 3], Why> {
+        let key = match src {
+            Source::Loaded { load, first } => Some((self.cur, *load, *first)),
+            _ => None,
+        };
+        if let Some(e) = key.and_then(|k| self.entries.get(&k)) {
+            return Ok(*e);
+        }
+        let slot = self
+            .uniform_heap_index(src, false, &mut Vec::new())
+            .map_err(|_| "a structured buffer of unknown stride")?;
+        let c = self.cur;
+        let table = self.s.stride_table_handle();
+        let bytes = self.s.m.i32(super::StrideEntry::BYTES);
+        let addr = self.s.m.bin(c, Bin::Mul, slot, bytes);
+        let iu = self.s.m.undef(self.s.t.i32);
+        let mask = self.s.m.i8(3);
+        let align = self.s.m.i32(4);
+        let res = self.s.op(
+            c,
+            "rawBufferLoad.f32",
+            Attr::ReadOnly,
+            self.s.t.res_ret,
+            139,
+            &[table, addr, iu, mask, align],
+        );
+        let stride = self.s.m.extract(c, res, 0);
+        let stride = self.as_int(stride);
+        let word = self.s.m.extract(c, res, 1);
+        let word = self.as_int(word);
+        // The raw slot plus one under the bias; 0: the slot itself.
+        let low = self.s.m.i32(super::StrideEntry::RAW_SLOTS);
+        let named = self.s.m.bin(c, Bin::And, word, low);
+        let zero = self.s.m.i32(0);
+        let own = self.s.m.cmp(c, pred::EQ, named, zero);
+        let one = self.s.m.i32(1);
+        let named = self.s.m.bin(c, Bin::Sub, named, one);
+        let raw = self.s.m.select(c, own, slot, named);
+        let k = self.s.m.i32(28);
+        let bias = self.s.m.bin(c, Bin::LShr, word, k);
+        let e = [raw, stride, bias];
+        if let Some(k) = key {
+            self.entries.insert(k, e);
+        }
+        Ok(e)
+    }
+
+    /// The raw handle (`props`: 11, with the UAV bit for one written) and
+    /// the byte offset of `off` in element `index` of a buffer whose stride
+    /// was not recovered statically. Both come from the host's runtime
+    /// stride table: the handle is of the slot the table names, which holds
+    /// a raw view of the buffer's bytes whatever view the title made (raw,
+    /// structured or typed), and the byte is `index * stride + off` past
+    /// that view's bias. The raw view ends with the title's view, so an
+    /// index past its elements reads zeros (and its writes are dropped).
+    /// shortcut: the console reads zeros (and drops writes) where `off` and
+    /// the access pass the element's end; here they reach the next element,
+    /// as the statically known strides' structured accesses may.
+    fn runtime_view(
+        &mut self,
+        src: &Source,
+        index: V,
+        off: V,
+        props: u32,
+    ) -> Result<(V, V), Why> {
+        let [raw, stride, bias] = self.stride_entry(src)?;
+        let c = self.cur;
+        let element = self.s.m.bin(c, Bin::Mul, index, stride);
+        let byte = self.s.m.bin(c, Bin::Add, element, off);
+        let byte = self.s.m.bin(c, Bin::Add, byte, bias);
+        // The raw alias varies with the heap slot of a waterfall load.
+        let from_waterfall = |arg: &Source| {
+            matches!(arg, Source::Loaded { load, .. } if self.x.res.waterfall.loads.contains(load))
+        };
+        let nonuniform = match src {
+            Source::Phi { args, .. } => args.iter().any(from_waterfall),
+            _ => from_waterfall(src),
+        };
+        let handle = self.s.heap_handle(c, raw, false, nonuniform, (props, 0));
+        Ok((handle, byte))
+    }
+
     /// The heap index of a descriptor that may differ between lanes,
     /// computed in the current block (or, chosen by control flow, at the
     /// join).
@@ -5907,6 +6083,11 @@ impl<'a> Lower<'a> {
                 let r = self.s.m.cast(c, op, a, self.s.t.i32);
                 int(self, r)
             }
+            "v_cvt_f32_f64" => {
+                let a = self.double_src(inst)?;
+                let r = self.s.m.cast(c, Cast::FPTrunc, a, self.s.t.f32);
+                float(self, r)
+            }
             "v_cvt_f32_i32" | "v_cvt_f32_u32" | "v_cvt_f32_ubyte0" | "v_cvt_f32_ubyte1"
             | "v_cvt_f32_ubyte2" | "v_cvt_f32_ubyte3" => {
                 let mut a = s(self, 0)?;
@@ -6032,20 +6213,7 @@ impl<'a> Lower<'a> {
                 float(self, r)
             }
             "v_cndmask_b32" => {
-                let mask = match v.src.get(2) {
-                    Some(&Operand::Scalar { code, .. }) => inst.read(Reg::S(code)),
-                    _ => None,
-                };
-                // A selector that derives from neither EXEC nor a compare
-                // (a constant, a number built from scalars) is a mask held as
-                // a number: with console lanes the lane tests its own bit.
-                let m = mask
-                    .and_then(|m| {
-                        let others = self.console_lanes.then(|| self.x.st.others.get(&m));
-                        self.x.st.masks.get(&m).or(others.flatten()).copied()
-                    })
-                    .ok_or(UNTRACKED_SELECT)?;
-                let cond = self.boolean(m, c)?;
+                let cond = self.mask_cond(inst, v.src.get(2), c, UNTRACKED_SELECT)?;
                 if v.abs != 0 || v.neg != 0 {
                     let (a, bb) = (f(self, 0)?, f(self, 1)?);
                     let r = self.s.m.select(c, cond, bb, a);
@@ -6063,14 +6231,12 @@ impl<'a> Lower<'a> {
                     std::mem::swap(&mut a, &mut bb);
                 }
                 let cin = if name.ends_with("_ci_u32") {
-                    let m = match v.src.get(2) {
-                        Some(&Operand::Scalar { code, .. }) => inst.read(Reg::S(code)),
-                        _ => None,
-                    };
-                    let m = m
-                        .and_then(|m| self.x.st.masks.get(&m).copied())
-                        .ok_or("a carry-in from an untracked mask")?;
-                    Some(self.boolean(m, c)?)
+                    Some(self.mask_cond(
+                        inst,
+                        v.src.get(2),
+                        c,
+                        "a carry-in from an untracked mask",
+                    )?)
                 } else {
                     None
                 };
@@ -6200,6 +6366,69 @@ impl<'a> Lower<'a> {
         }
     }
 
+    /// Decode the source of a double-to-float conversion by its FP64 layout.
+    fn double_src(&mut self, inst: &Inst) -> Result<V, Why> {
+        let Fields::Valu(v) = &inst.fields else {
+            unreachable!()
+        };
+        if v.sdwa.is_some() || v.dpp.is_some() {
+            return Err("64-bit operand modifiers");
+        }
+        let op = *v.src.first().ok_or("a missing operand")?;
+        let (lo, mut hi) = match op {
+            Operand::Vector { reg, .. } => self.read_pair(inst, Reg::V(reg), Reg::V(reg + 1))?,
+            Operand::Scalar { code, .. } if code != NULL => {
+                self.read_pair(inst, Reg::S(code), Reg::S(code + 1))?
+            }
+            Operand::Const(code @ 240..=248) => {
+                let constants = [
+                    0.5,
+                    -0.5,
+                    1.0,
+                    -1.0,
+                    2.0,
+                    -2.0,
+                    4.0,
+                    -4.0,
+                    f64::from_bits(0x3fc4_5f30_6dc9_c882), // AMD's inline 1/(2π)
+                ];
+                let bits = constants[usize::from(code - 240)].to_bits();
+                (self.s.m.i32(bits as u32), self.s.m.i32((bits >> 32) as u32))
+            }
+            // A floating double literal occupies the high dword.
+            Operand::Literal(bits) => (self.s.m.i32(0), self.s.m.i32(bits)),
+            _ => {
+                let lo = self.operand(inst, &op)?;
+                let hi = if matches!(op, Operand::Const(193..=208)) {
+                    u32::MAX
+                } else {
+                    0
+                };
+                (lo, self.s.m.i32(hi))
+            }
+        };
+        let block = self.cur;
+        if v.abs & 1 != 0 {
+            let mask = self.s.m.i32(0x7fff_ffff);
+            hi = self.s.m.bin(block, Bin::And, hi, mask);
+        }
+        if v.neg & 1 != 0 {
+            let sign = self.s.m.i32(0x8000_0000);
+            hi = self.s.m.bin(block, Bin::Xor, hi, sign);
+        }
+        self.s.flags |= flags::DOUBLES;
+        let ty = self.s.m.double();
+        Ok(self
+            .s
+            .op(block, "makeDouble.f64", Attr::ReadNone, ty, 101, &[lo, hi]))
+    }
+
+    fn read_pair(&mut self, inst: &Inst, lo: Reg, hi: Reg) -> Result<(V, V), Why> {
+        let lo = self.i32_of(inst.read(lo).ok_or("an unread operand")?)?;
+        let hi = self.i32_of(inst.read(hi).ok_or("an unread operand")?)?;
+        Ok((lo, hi))
+    }
+
     /// A 64-bit source (a register pair; inline constants sign-extend).
     fn src64(&mut self, inst: &Inst, k: usize) -> Result<V, Why> {
         let Fields::Valu(v) = &inst.fields else {
@@ -6213,8 +6442,7 @@ impl<'a> Lower<'a> {
         self.s.flags |= flags::INT64;
         let op = *v.src.get(k).ok_or("a missing operand")?;
         let pair = |l: &mut Self, r: Reg, r1: Reg| -> Result<V, Why> {
-            let lo = l.i32_of(inst.read(r).ok_or("an unread operand")?)?;
-            let hi = l.i32_of(inst.read(r1).ok_or("an unread operand")?)?;
+            let (lo, hi) = l.read_pair(inst, r, r1)?;
             Ok(l.join64(lo, hi))
         };
         match op {
@@ -7549,6 +7777,15 @@ impl<'a> Lower<'a> {
         };
         let packing = self.half_inputs.get(&attribute.row).copied();
         let f16 = name.ends_with("_f16");
+        // Whether the metadata names the packed row's partner itself (else
+        // `half_inputs` inferred it): then halves past it are padding.
+        let explicit_second_row = match &self.x.native.io {
+            StageIo::Ps { inputs, .. } => inputs
+                .iter()
+                .find(|i| i.row == attribute.row && i.fp16)
+                .is_some_and(|i| i.pack2 && i.row2 != i.row),
+            _ => false,
+        };
         // The evaluated channel plus `add`, as a float.
         let total = |l: &mut Self, row: u8, ch: u8| -> Result<V, Why> {
             let x = l.eval_channel(row, ch, eval)?;
@@ -7568,13 +7805,16 @@ impl<'a> Lower<'a> {
                 // 16-bit values: one in the low half of each dword, or two
                 // per dword (`packed_half`); the host's are 32-bit floats.
                 let half = |l: &mut Self, h: u8| -> Result<Option<V>, Why> {
-                    let src = if pack2 {
+                    let src = if pack2 && f16 {
+                        packed_input_half(&l.s.inputs, attribute.row, b, h, explicit_second_row)?
+                    } else if pack2 {
                         packed_half(&l.s.inputs, attribute.row, b, h)
                     } else {
                         h.is_multiple_of(2).then_some((attribute.row, h / 2))
                     };
                     match src {
                         Some((row, ch)) => total(l, row, ch).map(Some),
+                        None if f16 && explicit_second_row => Ok(Some(l.s.m.f32(0))),
                         None => Ok(None),
                     }
                 };
@@ -8785,11 +9025,18 @@ impl<'a> Lower<'a> {
             let (h, coords) = match index {
                 Some(index) => {
                     let stride = used.map_or(0, |u| u.stride);
-                    if stride < 4 || !stride.is_multiple_of(4) {
+                    if stride != 0 && (stride < 4 || !stride.is_multiple_of(4)) {
                         return Err("a structured buffer of unknown stride");
                     }
-                    let h = self.handle(site, src, false, (12 | u, stride))?;
-                    (h, [index, off, iu])
+                    if stride >= 4 && stride.is_multiple_of(4) {
+                        (
+                            self.handle(site, src, false, (12 | u, stride))?,
+                            [index, off, iu],
+                        )
+                    } else {
+                        let (h, byte) = self.runtime_view(src, index, off, 11 | u)?;
+                        (h, [byte, iu, iu])
+                    }
                 }
                 None => (self.handle(site, src, false, (11 | u, 0))?, [off, iu, iu]),
             };
@@ -8868,11 +9115,14 @@ impl<'a> Lower<'a> {
                 match index {
                     Some(index) => {
                         let stride = used.map_or(0, |u| u.stride);
-                        if stride < 4 || !stride.is_multiple_of(4) {
-                            return Err("a structured buffer of unknown stride");
+                        if stride >= 4 && stride.is_multiple_of(4) {
+                            args.push(self.handle(site, src, false, (12 | u, stride))?);
+                            args.extend([index, off]);
+                        } else {
+                            let (h, byte) = self.runtime_view(src, index, off, 11 | u)?;
+                            args.push(h);
+                            args.extend([byte, iu]);
                         }
-                        args.push(self.handle(site, src, false, (12 | u, stride))?);
-                        args.extend([index, off]);
                     }
                     None => {
                         args.push(self.handle(site, src, false, (11 | u, 0))?);
@@ -8933,18 +9183,30 @@ impl<'a> Lower<'a> {
             match index {
                 Some(index) => {
                     let stride = used.map_or(0, |u| u.stride);
-                    if stride < 4 || !stride.is_multiple_of(4) {
+                    if stride != 0 && (stride < 4 || !stride.is_multiple_of(4)) {
                         return Err("a structured buffer of unknown stride");
                     }
-                    let h = self.handle(site, src, false, (12 | u, stride))?;
-                    self.s.op(
-                        c,
-                        "rawBufferLoad.f32",
-                        Attr::ReadOnly,
-                        self.s.t.res_ret,
-                        139,
-                        &[h, index, off, mask, align],
-                    )
+                    if stride >= 4 && stride.is_multiple_of(4) {
+                        let h = self.handle(site, src, false, (12 | u, stride))?;
+                        self.s.op(
+                            c,
+                            "rawBufferLoad.f32",
+                            Attr::ReadOnly,
+                            self.s.t.res_ret,
+                            139,
+                            &[h, index, off, mask, align],
+                        )
+                    } else {
+                        let (h, byte) = self.runtime_view(src, index, off, 11 | u)?;
+                        self.s.op(
+                            c,
+                            "rawBufferLoad.f32",
+                            Attr::ReadOnly,
+                            self.s.t.res_ret,
+                            139,
+                            &[h, byte, iu, mask, align],
+                        )
+                    }
                 }
                 None => {
                     let h = self.handle(site, src, false, (11 | u, 0))?;
@@ -9954,6 +10216,30 @@ impl<'a> Lower<'a> {
                 }
             }
         }
+        // Mask dwords of a pixel or vertex join that stand as their ballot
+        // (below in `fill_phis`).
+        let mut balloted = HashSet::new();
+        for k in 0..self.data_phis.len() {
+            let (_, b, i) = self.data_phis[k];
+            let phi = &p.blocks[b].phis[i];
+            if self.mask_data != MaskData::Host
+                || phi.reg == Reg::Scc
+                || !self.read_phis.contains(&phi.value)
+            {
+                continue;
+            }
+            for (&q, &arg) in p.blocks[b].preds.iter().zip(&phi.args) {
+                let lo = self.x.st.highs.get(&arg).copied().unwrap_or(arg);
+                if self.tail[q].is_some()
+                    && !matches!(self.vals.get(&arg), Some(Val::I32(_)))
+                    && self.x.st.masks.contains_key(&lo)
+                    && self.def_block.get(&lo).is_some_and(|&d| d != self.cur_ir)
+                    && self.mask_dword(arg).is_ok()
+                {
+                    balloted.insert(arg);
+                }
+            }
+        }
         let mut found = Vec::new();
         let mut missing = HashMap::new();
         loop {
@@ -9983,6 +10269,7 @@ impl<'a> Lower<'a> {
                             (Some(Val::Bit(_)), false) => Some("an SCC joined with SGPR values"),
                             // Left undefined below (`descriptor_dword`).
                             (Some(Val::Missing(_)), _) if self.descriptor_dword(*arg) => None,
+                            (None | Some(Val::Missing(_)), false) if balloted.contains(arg) => None,
                             (Some(Val::Missing(why)), _) => Some(why),
                             _ => Some("a join of mismatched values"),
                         }
@@ -10034,6 +10321,18 @@ impl<'a> Lower<'a> {
                     Some(&(f, h)) if !self.loop_bodies[&h].contains(&q) => Some(f),
                     _ => self.vals.get(&arg).copied(),
                 };
+                let lo = self.x.st.highs.get(&arg).copied().unwrap_or(arg);
+                let ballot_ok = self.mask_data == MaskData::Host
+                    && !bit
+                    && self.read_phis.contains(&phi.value)
+                    && self.x.st.masks.contains_key(&lo)
+                    && self.def_block.get(&lo).is_some_and(|&d| d != self.cur_ir);
+                let ballot = if ballot_ok {
+                    self.mask_dword(arg).ok()
+                } else {
+                    None
+                };
+                let ballot_ok = ballot.is_some();
                 let x = match (looked, bit) {
                     (Some(Val::I32(x)), false) | (Some(Val::Bit(x)), true) => x,
                     (Some(Val::Bit(_)), false) if self.read_phis.contains(&phi.value) => {
@@ -10050,6 +10349,12 @@ impl<'a> Lower<'a> {
                             self.s.m.undef(self.s.t.i32)
                         }
                     }
+                    // A mask dword the other path left in the register: its ballot
+                    // (a pixel or vertex program reads such a join only through a
+                    // zero test or a count). shortcut: the ballot is the host
+                    // wave's, so a join read some other way would differ from the
+                    // console, which `mask_ok` does not see; upgrade if one shows up.
+                    (None | Some(Val::Missing(_)), false) if ballot_ok => ballot.unwrap(),
                     (Some(Val::Missing(why)), _) if self.read_phis.contains(&phi.value) => {
                         return Err(Stop::Retry(vec![(phi.value, why)]));
                     }
@@ -11107,6 +11412,36 @@ mod tests {
         assert!(f10(0x3FF).is_nan());
         // A 16-bit float is a half already, sign included.
         assert_eq!(half(0xBC00 << half_shift(16)), -1.0);
+    }
+
+    #[test]
+    fn explicit_packed_input_tail_is_padding() {
+        use super::super::container::SigElement;
+        use super::packed_input_half;
+        let element = |row, cols| SigElement {
+            name: "TEXCOORD".into(),
+            index: row,
+            kind: 0,
+            comp: 9,
+            interp: 2,
+            row: Some(row),
+            col: 0,
+            cols,
+            usage: 0,
+            half: true,
+        };
+        // Four halves in row 6 followed by only two in its explicit partner
+        // row 7. The next two reads address the packing's zero padding.
+        let sig = vec![element(6, 4), element(7, 2)];
+        assert_eq!(
+            packed_input_half(&sig, 6, Some(7), 5, true),
+            Ok(Some((7, 1)))
+        );
+        assert_eq!(packed_input_half(&sig, 6, Some(7), 6, true), Ok(None));
+        assert_eq!(packed_input_half(&sig, 6, Some(7), 7, true), Ok(None));
+        // With an inferred partner the same gap is not assumed to be zero.
+        assert!(packed_input_half(&sig, 6, Some(7), 6, false).is_err());
+        assert!(packed_input_half(&sig, 6, None, 4, false).is_err());
     }
 
     #[test]

@@ -36,6 +36,8 @@ pub mod object;
 pub mod pipeline;
 #[cfg(windows)]
 mod primitive;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod profile;
 pub mod query;
 pub mod queue;
 pub mod resource;
@@ -55,4 +57,4 @@ mod watch;
 #[cfg(windows)]
 pub use host::on_failure;
 #[cfg(windows)]
-pub use watch::{kernel_will_write, kernel_wrote, title_memory_remapped};
+pub use watch::{kernel_will_write, kernel_wrote, title_memory_remapped, unmap_title_view};

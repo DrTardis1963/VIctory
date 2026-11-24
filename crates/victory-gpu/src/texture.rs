@@ -12,18 +12,23 @@
 //! whole, of the written pages only, compared with the bytes read last; in
 //! physical-page views, which cannot be watched, at every submission that
 //! samples it.
+//! Only the subresources whose memory holds changed bytes are detiled
+//! again when the written pages are known (watched memory read before).
 //!
-//! shortcut: a change detiles the whole texture, not the pages written.
-//! Only textures read through descriptor tables are brought up to date
+//! shortcut: a changed subresource is detiled whole, not just its blocks in
+//! the pages written, and every subresource is still copied into the host
+//! texture. Only textures read through descriptor tables are brought up to date
 //! (directly indexed views are not known per draw); plane 0 is uploaded
 //! (every mip and array slice), depth and stencil planes are not.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use std::ops::Range;
 use std::sync::{Arc, Mutex};
 
 use windows::Win32::Graphics::Direct3D12::*;
+use windows::Win32::Graphics::Dxgi::*;
 
 use crate::host::{HostList, host};
 use crate::object::This;
@@ -33,6 +38,74 @@ macro_rules! once {
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(|| tracing::warn!($($arg)*));
     }};
+}
+
+/// Query the primary discrete GPU's dedicated video memory in bytes via DXGI.
+fn query_adapter_vram_bytes() -> Option<u64> {
+    // SAFETY: plain DXGI adapter queries to inspect video memory.
+    unsafe {
+        let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;
+        let mut max_vram = 0u64;
+        let mut i = 0u32;
+        while let Ok(adapter) = factory.EnumAdapters1(i) {
+            i += 1;
+            if let Ok(desc) = adapter.GetDesc1()
+                && (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 == 0)
+            {
+                max_vram = max_vram.max(desc.DedicatedVideoMemory as u64);
+            }
+        }
+        (max_vram > 0).then_some(max_vram)
+    }
+}
+
+/// The number of most detailed mips to drop for sampled host textures.
+/// 0: keep original resolution.
+/// 1: drop 1 mip (halves dimensions, ~75% VRAM savings).
+/// 2: drop 2 mips (quarters dimensions, ~93.75% VRAM savings).
+/// 3: drop 3 mips (eighths dimensions, ~98.4% VRAM savings).
+///
+/// When `VICTORY_TEXTURE_MIP_DROP` is not explicitly set in the environment,
+/// this automatically defaults to 1 on adapters with <= 8 GB dedicated VRAM
+/// to prevent host driver committed out-of-memory crashes on 6 GB and 8 GB GPUs.
+pub(crate) fn texture_mip_drop() -> u32 {
+    static DROP: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *DROP.get_or_init(|| {
+        if let Some(v) = std::env::var("VICTORY_TEXTURE_MIP_DROP")
+            .ok()
+            .and_then(|val| val.parse::<u32>().ok())
+        {
+            return v.min(3);
+        }
+        // Auto-detect based on adapter DedicatedVideoMemory.
+        // Threshold: 8.5 GiB comfortably covers 4 GB, 6 GB, and 8 GB GPUs
+        // (which report up to ~8192 MiB), while leaving >= 10 GB GPUs at full resolution (0).
+        if let Some(vram) = query_adapter_vram_bytes() {
+            const EIGHT_GB_THRESHOLD: u64 = 8 * 1024 * 1024 * 1024 + 512 * 1024 * 1024;
+            if vram <= EIGHT_GB_THRESHOLD {
+                tracing::info!(
+                    vram_mb = vram / (1024 * 1024),
+                    "auto-enabling VICTORY_TEXTURE_MIP_DROP=1 for <= 8 GB GPU"
+                );
+                return 1;
+            }
+        }
+        0
+    })
+}
+
+/// The minimum texture dimension (both width and height) eligible for mip-dropping.
+/// Defaults to 1024. Textures smaller than this on either axis (or under 2048 if configured)
+/// are preserved at full resolution. Configurable via `VICTORY_TEXTURE_MIP_DROP_MIN_SIZE`.
+pub(crate) fn texture_mip_drop_min_size() -> u64 {
+    static MIN_SIZE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MIN_SIZE.get_or_init(|| {
+        std::env::var("VICTORY_TEXTURE_MIP_DROP_MIN_SIZE")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(1024)
+    })
 }
 
 /// A texture's upload state: the staging buffer laid out as the host
@@ -48,6 +121,10 @@ pub(crate) struct Staging {
     layout: victory_formats::texture::Layout,
     /// Mips per array slice.
     mips: u32,
+    /// Per subresource, the byte ranges of the memory it is detiled from.
+    extents: Vec<Vec<Range<usize>>>,
+    /// Dropped mips count (offset into console mips for detiling).
+    pub(crate) mip_drop: u32,
     memory: *const u8,
     /// Original packed 16-bit format (86 or 115) when the host texture was
     /// widened to R8G8B8A8_UNORM, so detiled 2-byte texels expand into the
@@ -82,6 +159,23 @@ static RUNTIME_WRITES: AtomicU64 = AtomicU64::new(0);
 /// The runtime is about to write title memory (a title copy at submission).
 pub(crate) fn runtime_writes_title() {
     RUNTIME_WRITES.fetch_add(1, Relaxed);
+}
+
+/// Whether any of `changed` overlaps any of `extents` (both sorted).
+fn overlaps(extents: &[Range<usize>], changed: &[Range<usize>]) -> bool {
+    let (mut i, mut j) = (0, 0);
+    while i < extents.len() && j < changed.len() {
+        let (e, c) = (&extents[i], &changed[j]);
+        if e.start < c.end && c.start < e.end {
+            return true;
+        }
+        if e.end <= c.end {
+            i += 1;
+        } else {
+            j += 1;
+        }
+    }
+    false
 }
 
 // SAFETY: the staging mapping is written only at submission, under
@@ -225,7 +319,8 @@ impl Staging {
         let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
         let last = &mut *last;
         if let Some((now, written)) = crate::watch::writes(start, start + size, false) {
-            if last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked) {
+            let before = last.asked;
+            if before != 0 && written.iter().all(|&(_, w)| w <= before) {
                 return 0;
             }
             let since = std::mem::replace(&mut last.asked, now);
@@ -292,7 +387,7 @@ impl Staging {
         since: u64,
     ) -> usize {
         let start = self.memory as usize;
-        let (mut bytes, mut changed) = (0, false);
+        let (mut bytes, mut changed) = (0, Vec::new());
         for (from, to) in written_runs(written, since, start, start + read.len()) {
             SCRATCH.with_borrow_mut(|now| {
                 now.resize(to - from, 0);
@@ -300,17 +395,18 @@ impl Staging {
                 crate::host::copy_mapped(now.as_mut_ptr(), at, to - from, false);
                 if read[from..to] != now[..] {
                     read[from..to].copy_from_slice(now);
-                    changed = true;
+                    changed.push(from..to);
                 }
             });
             bytes += to - from;
         }
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexWatched, bytes as u64);
-        if changed {
+        if !changed.is_empty() {
             // The hash is of an older read: the next whole read detiles.
             last.hash = None;
-            self.detile(read);
+            // Only the subresources the changed runs (sorted) reach.
+            self.detile(read, Some(&changed));
             self.generation.fetch_add(1, Relaxed);
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::TexChanged, read.len() as u64);
@@ -329,15 +425,17 @@ impl Staging {
             return size;
         }
         last.hash = Some(hash);
-        self.detile(tiled);
+        self.detile(tiled, None);
         self.generation.fetch_add(1, Relaxed);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
         size
     }
 
-    /// Detiles `tiled` (the texture's memory) into the staging buffer.
-    fn detile(&self, tiled: &[u8]) {
+    /// Detiles `tiled` (the texture's memory) into the staging buffer: the
+    /// subresources whose memory overlaps `changed` (sorted byte ranges),
+    /// or all of them.
+    fn detile(&self, tiled: &[u8], changed: Option<&[Range<usize>]>) {
         #[cfg(feature = "diagnostics")]
         if tiled.iter().all(|&b| b == 0) {
             tracing::debug!(
@@ -348,7 +446,11 @@ impl Staging {
         }
         let mut packed = Vec::new();
         for (i, (footprint, &rows)) in self.footprints.iter().zip(&self.rows).enumerate() {
-            let (mip, slice) = (i as u32 % self.mips, i as u32 / self.mips);
+            if changed.is_some_and(|c| !overlaps(&self.extents[i], c)) {
+                continue;
+            }
+            let (host_mip, slice) = (i as u32 % self.mips, i as u32 / self.mips);
+            let console_mip = host_mip + self.mip_drop;
             let f = footprint.Footprint;
             let pitch = f.RowPitch as usize;
             let lines = rows as usize * f.Depth as usize;
@@ -365,7 +467,7 @@ impl Staging {
             if let Err(e) = detile_subresource(
                 &self.layout,
                 tiled,
-                mip,
+                console_mip,
                 slice,
                 linear,
                 pitch,
@@ -374,7 +476,7 @@ impl Staging {
                 self.widened_from,
                 &mut packed,
             ) {
-                tracing::warn!(?e, mip, slice, "texture not detiled");
+                tracing::warn!(?e, console_mip, slice, "texture not detiled");
                 return;
             }
         }
@@ -521,6 +623,7 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     let widened_from = (d.Format.0 as u32 == crate::resource::RGBA8_UNORM
         && crate::resource::PACKED_16.contains(&title_format))
     .then_some(title_format);
+    let mip_drop = u32::from(desc.mip_levels).saturating_sub(u32::from(d.MipLevels));
     let count = if d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D {
         u32::from(d.MipLevels)
     } else {
@@ -549,7 +652,20 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
             d.Width, d.Height, d.DepthOrArraySize, d.Format.0
         )
     });
-    tracing::debug!(?desc, total, "texture contents uploaded from title memory");
+    tracing::debug!(?desc, total, mip_drop, "texture contents uploaded from title memory");
+    let mips = u32::from(d.MipLevels).max(1);
+    let whole: Vec<_> = std::iter::once(0..layout.size as usize).collect();
+    let extents = (0..count)
+        // Host subresources skip the dropped mips of the title's layout.
+        .map(|i| match layout.extents(i % mips + mip_drop, i / mips) {
+            Ok(e) => e
+                .into_iter()
+                .map(|r| r.start as usize..r.end as usize)
+                .collect(),
+            // Detiling it fails too; any change "touches" it.
+            Err(_) => whole.clone(),
+        })
+        .collect();
     let s = Arc::new(Staging {
         buffer,
         #[cfg(feature = "diagnostics")]
@@ -559,6 +675,8 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         rows,
         layout,
         mips: u32::from(d.MipLevels),
+        extents,
+        mip_drop,
         memory,
         widened_from,
         last: Mutex::default(),
@@ -572,6 +690,29 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
 mod tests {
     use super::*;
     use victory_formats::texture::{Dimension, Swizzle, Texture, TextureDesc};
+
+    #[test]
+    fn adapter_vram_query_does_not_panic() {
+        if let Some(bytes) = query_adapter_vram_bytes() {
+            assert!(bytes > 0);
+        }
+    }
+
+    #[test]
+    fn ranges_overlap_only_when_they_share_a_byte() {
+        let extents = [10..20, 40..50];
+        assert!(overlaps(&extents, &[15..16]));
+        assert!(overlaps(&extents, &[0..5, 49..60]));
+        assert!(overlaps(&extents, &[0..11]));
+        // Touching ends share no byte.
+        assert!(!overlaps(&extents, &[20..40]));
+        assert!(!overlaps(&extents, &[0..10, 20..40, 50..90]));
+        assert!(!overlaps(&extents, &[]));
+        assert!(!overlaps(&[], &[0..100]));
+        // A long change across several extents, and the reverse.
+        assert!(overlaps(&[10..20, 40..50], &[0..100]));
+        assert!(overlaps(&[0..100], &[10..20, 40..50]));
+    }
 
     #[test]
     fn committed_regions_answer_as_a_query_and_remember_the_region() {
