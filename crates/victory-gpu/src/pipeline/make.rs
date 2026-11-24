@@ -488,6 +488,8 @@ mod tests {
             hash: hash.to_owned(),
             container: Vec::new(),
             translated: OnceLock::new(),
+            #[cfg(feature = "diagnostics")]
+            wave64: OnceLock::new(),
         })
     }
 
