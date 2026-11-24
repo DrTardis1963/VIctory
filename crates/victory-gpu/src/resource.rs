@@ -463,8 +463,11 @@ pub(crate) extern "system" fn allocation_info(
         // SAFETY: the title passes `count` descriptions.
         unsafe { std::slice::from_raw_parts(descs, count as usize) }
     };
-    // SAFETY: the caller passes room for the value.
-    unsafe { out.write(place(descs.iter(), |_, _| ())) };
+    let info = place(descs.iter(), |_, _| ());
+    if !out.is_null() {
+        // SAFETY: checked non-null; the caller passes room for the value.
+        unsafe { out.write(info) };
+    }
     out
 }
 
@@ -507,8 +510,10 @@ pub(crate) extern "system" fn allocation_info2(
             unsafe { each.add(i).write(info) };
         }
     });
-    // SAFETY: the caller passes room for the value.
-    unsafe { out.write(total) };
+    if !out.is_null() {
+        // SAFETY: checked non-null; the caller passes room for the value.
+        unsafe { out.write(total) };
+    }
     out
 }
 
@@ -523,7 +528,12 @@ fn place<'a>(
         alignment: KIB_64,
     };
     for (i, desc) in descs.enumerate() {
-        let Some(one) = footprint(desc) else {
+        let placed = footprint(desc).and_then(|one| {
+            let offset = total.size.checked_next_multiple_of(one.alignment)?;
+            let next = offset.checked_add(one.size)?;
+            Some((one, offset, next))
+        });
+        let Some((one, offset, next)) = placed else {
             tracing::warn!(?desc, "no size for this resource");
             each(
                 i,
@@ -539,7 +549,6 @@ fn place<'a>(
             };
         };
         tracing::debug!(?desc, ?one, "allocation info");
-        let offset = total.size.next_multiple_of(one.alignment);
         each(
             i,
             AllocationInfo1 {
@@ -548,7 +557,7 @@ fn place<'a>(
                 size: one.size,
             },
         );
-        total.size = offset + one.size;
+        total.size = next;
         total.alignment = total.alignment.max(one.alignment);
     }
     total
@@ -1064,7 +1073,15 @@ pub(crate) extern "system" fn register_page_pool(
     pages: u32,
     out: *mut usize,
 ) -> HRESULT {
-    if out.is_null() || pages == 0 || !address.is_multiple_of(KIB_64) {
+    if out.is_null()
+        || address == 0
+        || pages == 0
+        || !address.is_multiple_of(KIB_64)
+        || u64::from(pages)
+            .checked_mul(KIB_64)
+            .and_then(|bytes| address.checked_add(bytes))
+            .is_none()
+    {
         return E_INVALIDARG;
     }
     tracing::debug!(address = format_args!("{address:#x}"), pages, "page pool");
@@ -1840,5 +1857,121 @@ mod tests {
         // The resource keeps the heap alive.
         assert_eq!(slot::<Release>(heap, 0x10)(heap), 1);
         assert_eq!(slot::<Release>(placed, 0x10)(placed), 0);
+    }
+
+    #[test]
+    fn allocation_info_and_page_pools_reject_overflows() {
+        let mut info = AllocationInfo {
+            size: 0,
+            alignment: 0,
+        };
+        let huge = [buffer(1 << 63), buffer(1 << 63)];
+        allocation_info(&mut info, std::ptr::null(), 0, 2, huge.as_ptr());
+        assert_eq!(
+            info,
+            AllocationInfo {
+                size: u64::MAX,
+                alignment: 0,
+            }
+        );
+
+        let d1 = [
+            ResourceDesc1 {
+                desc: buffer(u64::MAX - KIB_64),
+                mip_region: [0; 3],
+            },
+            ResourceDesc1 {
+                desc: ResourceDesc {
+                    alignment: MIB_4,
+                    ..buffer(KIB_64)
+                },
+                mip_region: [0; 3],
+            },
+        ];
+        let mut each = [
+            AllocationInfo1 {
+                offset: 0,
+                alignment: 0,
+                size: 0,
+            },
+            AllocationInfo1 {
+                offset: 0,
+                alignment: 0,
+                size: 0,
+            },
+        ];
+        allocation_info2(
+            &mut info,
+            std::ptr::null(),
+            0,
+            2,
+            d1.as_ptr(),
+            each.as_mut_ptr(),
+        );
+        assert_eq!(
+            info,
+            AllocationInfo {
+                size: u64::MAX,
+                alignment: 0,
+            }
+        );
+        assert_eq!(
+            (each[1].offset, each[1].alignment, each[1].size),
+            (u64::MAX, 0, u64::MAX)
+        );
+
+        let sum_overflow = [
+            ResourceDesc1 {
+                desc: buffer(1 << 63),
+                mip_region: [0; 3],
+            },
+            ResourceDesc1 {
+                desc: buffer(1 << 63),
+                mip_region: [0; 3],
+            },
+        ];
+        allocation_info2(
+            &mut info,
+            std::ptr::null(),
+            0,
+            2,
+            sum_overflow.as_ptr(),
+            each.as_mut_ptr(),
+        );
+        assert_eq!(
+            info,
+            AllocationInfo {
+                size: u64::MAX,
+                alignment: 0,
+            }
+        );
+        assert_eq!(
+            (each[1].offset, each[1].alignment, each[1].size),
+            (u64::MAX, 0, u64::MAX)
+        );
+
+        let plain = ResourceDesc1 {
+            desc: buffer(256),
+            mip_region: [0; 3],
+        };
+        allocation_info(std::ptr::null_mut(), std::ptr::null(), 0, 1, &plain.desc);
+        allocation_info2(
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            0,
+            1,
+            &plain,
+            std::ptr::null_mut(),
+        );
+
+        let mut pool = 0usize;
+        assert_eq!(
+            register_page_pool(std::ptr::null(), 0, 1, &mut pool),
+            E_INVALIDARG
+        );
+        assert_eq!(
+            register_page_pool(std::ptr::null(), u64::MAX - KIB_64 + 1, 2, &mut pool),
+            E_INVALIDARG
+        );
     }
 }
