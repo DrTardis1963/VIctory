@@ -13,7 +13,8 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use victory_pipeline::{Cache, CacheKey, Converter};
+pub use victory_pipeline::Cache;
+use victory_pipeline::{CacheKey, Converter};
 use victory_shader::emit::{HostShader, StaticSampler, UserData};
 use victory_shader::resource::RootIndexedView;
 use victory_shader::{HwStage, RootType};
@@ -30,6 +31,18 @@ pub fn use_shader_cache(dir: PathBuf) {
         }
         Err(e) => tracing::warn!(error = %e, "no shader cache"),
     }
+}
+
+/// Translates `container` into `cache` as a run of this executable would,
+/// unless its entry is there already (`victory translate --write-cache`):
+/// `Ok(true)` if it was translated now.
+pub fn warm(cache: &Cache, container: &[u8]) -> Result<bool, String> {
+    let input = [&build()[..], container].concat();
+    if cache.path_for(&CacheKey::new(&KeySpec, &input)).is_file() {
+        return Ok(false);
+    }
+    let translate = |c: &[u8]| victory_shader::emit::translate(c).map_err(|e| e.to_string());
+    cached(cache, build(), last(), container, translate).map(|_| true)
 }
 
 /// Shaders found in the cache and translated since the start.
@@ -93,6 +106,10 @@ fn settings() -> Vec<u8> {
     }
     // And which clean-up passes ran over the translated code.
     bytes.extend_from_slice(&victory_shader::emit::shader_opt().to_le_bytes());
+    // And what the host GPU told the translator (its widest wave, a capped
+    // view heap): an offline warm-up made without them must not serve a run.
+    bytes.extend_from_slice(&victory_shader::emit::host_max_wave().to_le_bytes());
+    bytes.extend_from_slice(&victory_shader::emit::view_heap_limit().to_le_bytes());
     bytes
 }
 

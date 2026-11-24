@@ -7,6 +7,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::Result;
+use victory_gpu::shader_cache;
 use victory_shader::emit::host::{self, Host};
 use victory_shader::emit::{self, validator::Validator};
 use victory_shader::structure::{self, Atom, LaneExit};
@@ -74,6 +75,10 @@ struct Tally {
     /// With `--list`: one line per program and outcome.
     list: bool,
     lines: Vec<String>,
+    /// Containers written to the runtime shader cache (`--write-cache`), and
+    /// those already there.
+    cached: usize,
+    cache_hits: usize,
 }
 
 impl Tally {
@@ -134,6 +139,8 @@ impl Tally {
             *self.exports.entry(k).or_default() += n;
         }
         self.lines.extend(other.lines);
+        self.cached += other.cached;
+        self.cache_hits += other.cache_hits;
         for (reason, (n, example)) in other.failed {
             self.failed.entry(reason).or_insert((0, example)).0 += n;
         }
@@ -144,19 +151,27 @@ impl Tally {
 type Kept = std::sync::Arc<Mutex<Vec<(String, emit::HostShader)>>>;
 
 /// The optional checks after emission, one set per thread.
-struct Checks {
+struct Checks<'a> {
     /// Shaders named in `VICTORY_PAIRS` (`vs+ps,...`, label substrings),
     /// kept to build those pipelines after the walk.
     keep: Option<Kept>,
     validator: Option<Validator>,
     host: Option<(Host, emit::HostShader)>,
+    /// With `--write-cache`: the runtime shader cache.
+    cache: Option<&'a shader_cache::Cache>,
+    /// The walk only warms the cache (no checks, listing or pairs asked
+    /// for): the analysis is skipped.
+    warm_only: bool,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn run(
     paths: Vec<PathBuf>,
     validate: bool,
     pipelines: bool,
     list: bool,
+    write_cache: bool,
+    host_lanes: Option<(u32, u32)>,
     jobs: Option<usize>,
 ) -> Result<()> {
     let paths = crate::default_paths(paths)?;
@@ -177,6 +192,29 @@ pub fn run(
     if pipelines {
         Host::new(false).map_err(anyhow::Error::msg)?;
     }
+    let cache = if write_cache {
+        // What a run on this GPU tells the translator; the cache key holds it,
+        // so entries made without it are never served to such a run.
+        match Host::new(false) {
+            Ok(h) => h.set_translation_limits(),
+            Err(e) => println!("no host GPU ({e}): entries only serve a run of the same limits"),
+        }
+        let dir = victory_core::Config::load()?.cache_subdir("shaders")?;
+        let store = shader_cache::Cache::open(&dir)?;
+        Some((dir, store))
+    } else {
+        None
+    };
+    if let Some((_, max)) = host_lanes {
+        victory_shader::emit::set_host_max_wave(max);
+    }
+    if write_cache || host_lanes.is_some() {
+        println!(
+            "host         waves of up to {} lanes, view heap limit {}",
+            emit::host_max_wave(),
+            emit::view_heap_limit()
+        );
+    }
     let pairs: Vec<(String, String)> = std::env::var("VICTORY_PAIRS")
         .unwrap_or_default()
         .split(',')
@@ -188,6 +226,7 @@ pub fn run(
         jobs.unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()));
     let seen = Mutex::new(HashSet::new());
     let total = Mutex::new(Tally::default());
+    let warm_only = !validate && !pipelines && !list && pairs.is_empty();
     for root in &paths {
         for entry in walkdir::WalkDir::new(root)
             .into_iter()
@@ -216,6 +255,8 @@ pub fn run(
                             host: pipelines
                                 .then(|| Host::new(false).ok().map(|h| (h, host::stub_ps())))
                                 .flatten(),
+                            cache: cache.as_ref().map(|(_, c)| c),
+                            warm_only,
                         };
                         while let Some(job) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) {
                             translate(job, entry.path(), &seen, &mut t, &mut checks);
@@ -275,6 +316,14 @@ pub fn run(
         "             {} emitted of {} mesh programs; {} validated, {} pipelines",
         t.ms_emitted, t.ms_programs, t.ms_validated, t.ms_pipelines
     );
+    if let Some((dir, _)) = &cache {
+        println!(
+            "cache        {} written ({} already cached) -> {}",
+            t.cached,
+            t.cache_hits,
+            dir.display()
+        );
+    }
     if !pairs.is_empty() {
         let host = Host::new(false).map_err(anyhow::Error::msg)?;
         let kept = lock(&kept);
@@ -311,7 +360,7 @@ fn translate(
     path: &Path,
     seen: &Mutex<HashSet<blake3::Hash>>,
     t: &mut Tally,
-    checks: &mut Checks,
+    checks: &mut Checks<'_>,
 ) {
     let example = || format!("{}{}", path.display(), source.label());
     let Some(bytes) = source.bytes() else {
@@ -365,12 +414,27 @@ fn translate(
             let _ = std::fs::write(std::path::Path::new(dir).join(format!("{name}.{hash}.cdxil")), &bytes[..]);
         }
     }
+    // The container as a run hands it over (`parse` checked the size).
+    let total = u32::from_le_bytes(bytes[0x18..0x1c].try_into().expect("4 bytes")) as usize;
+    let container_bytes = &bytes[..total];
     if !lock(seen).insert(code) {
         t.duplicates += 1;
         if t.list {
             t.lines.push(format!("{}  duplicate", example()));
         }
         return;
+    }
+    if let Some(cache) = checks.cache {
+        match shader_cache::warm(cache, container_bytes) {
+            Ok(true) => t.cached += 1,
+            Ok(false) => t.cache_hits += 1,
+            Err(e) if checks.warm_only => return t.fail(e, example),
+            // The analysis below names it.
+            Err(_) => {}
+        }
+        if checks.warm_only {
+            return;
+        }
     }
     let programs = match native_programs(dxil) {
         Ok(p) => p,
@@ -393,7 +457,7 @@ fn translate(
     }
 }
 
-fn translate_programs(container: &Container, programs: Vec<NativeProgram>, example: &dyn Fn() -> String, t: &mut Tally, checks: &mut Checks) {
+fn translate_programs(container: &Container, programs: Vec<NativeProgram>, example: &dyn Fn() -> String, t: &mut Tally, checks: &mut Checks<'_>) {
     for p in programs {
         t.programs += 1;
         match victory_shader::spill::build(&p) {
@@ -531,7 +595,7 @@ fn census_line(label: &str, native: &NativeProgram, p: &ir::Program, shader: &em
 fn check(
     mut shader: emit::HostShader,
     t: &mut Tally,
-    checks: &mut Checks,
+    checks: &mut Checks<'_>,
     label: impl Fn() -> String,
 ) {
     if let Some(keep) = &checks.keep {
