@@ -979,6 +979,27 @@ fn wait_released_by_a_later_list_of_the_submission_is_not_waited_for() {
 }
 
 #[test]
+fn wait_released_only_by_a_later_write_of_the_submission_is_not_waited_for() {
+    let Some(gpu) = test_gpu() else { return };
+    let flag = Box::new(0u64);
+    let at = std::ptr::from_ref(&*flag) as u64;
+    let earlier = TitleList::new();
+    write64(earlier.list, at, 0x5c3, 0, 0);
+    earlier.close();
+    let waiter = TitleList::new();
+    wait64(waiter.list, at, GREATER_EQUAL, 0x5c4, 0, 0);
+    waiter.close();
+    let producer = TitleList::new();
+    write64(producer.list, at, 0x5c4, 0, 0);
+    producer.close();
+    let started = std::time::Instant::now();
+    gpu.execute(&[earlier.host(), waiter.host(), producer.host()]);
+    assert!(started.elapsed() < std::time::Duration::from_millis(40), "it was waited for");
+    // SAFETY: written by the submission, which finished.
+    assert_eq!(unsafe { std::ptr::from_ref(&*flag).read_volatile() }, 0x5c4);
+}
+
+#[test]
 fn wait_nothing_releases_gives_up_and_the_list_goes_on() {
     let Some(gpu) = test_gpu() else { return };
     let writer = Shader::new(gpu.host, s!("write_word"));

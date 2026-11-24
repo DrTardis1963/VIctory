@@ -1180,6 +1180,14 @@ impl Host {
                         written[r] = written[r].max(end);
                     }
                     if !wait.holds() {
+                        // Earlier writes did not release it: a later one may
+                        // (a counter written again further on).
+                        if let Some(what) =
+                            released_later(runs, &continuations, &ordered[i..], run, part, &wait)
+                        {
+                            wait_not_waited(&wait, what);
+                            continue;
+                        }
                         drop(submitted);
                         #[cfg(feature = "diagnostics")]
                         let waiting = std::time::Instant::now();
