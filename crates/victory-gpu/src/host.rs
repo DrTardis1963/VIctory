@@ -1225,6 +1225,21 @@ fn timing() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_GPU_TIMING").is_some())
 }
 
+/// Runs allowed in one `ExecuteCommandLists` of a submission that is
+/// waited for (`VICTORY_SUBMIT_MAX_RUNS`, default: all): splitting keeps
+/// one heavy batch from stalling the card past the host's device-removed
+/// threshold (port of PR #1463).
+fn max_submit_runs() -> usize {
+    static RUNS: OnceLock<usize> = OnceLock::new();
+    *RUNS.get_or_init(|| {
+        std::env::var("VICTORY_SUBMIT_MAX_RUNS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(usize::MAX)
+    })
+}
+
 /// Names a host object for the device-removed report, which names the
 /// allocations a page fault hit (only with device-removed data on).
 pub(crate) fn name(object: &impl Interface, text: impl FnOnce() -> String) {
@@ -4005,19 +4020,23 @@ impl Host {
             working(was_working);
             return Some((submitted, sent));
         }
-        // Diagnostics: each list on its own, timed (`VICTORY_GPU_TIMING`).
+        // At most `VICTORY_SUBMIT_MAX_RUNS` runs (each its prelude and list)
+        // per `ExecuteCommandLists`; diagnostics: each run on its own, timed
+        // (`VICTORY_GPU_TIMING`).
         #[cfg(feature = "diagnostics")]
-        let groups: Vec<&[Option<ID3D12CommandList>]> = if timing() {
-            firsts
-                .iter()
-                .zip(firsts.iter().skip(1).chain([&lists.len()]))
-                .map(|(&a, &b)| &lists[a..b])
-                .collect()
-        } else {
-            vec![&lists[..]]
-        };
+        let per = if timing() { 1 } else { max_submit_runs() };
         #[cfg(not(feature = "diagnostics"))]
-        let groups = [&lists[..]];
+        let per = max_submit_runs();
+        let ends: Vec<usize> = firsts.iter().skip(1).copied().chain([lists.len()]).collect();
+        let groups: Vec<&[Option<ID3D12CommandList>]> = if per >= firsts.len() {
+            vec![&lists[..]]
+        } else {
+            firsts
+                .chunks(per)
+                .zip(ends.chunks(per))
+                .map(|(a, b)| &lists[a[0]..b[b.len() - 1]])
+                .collect()
+        };
         submitting(2, runs.len());
         for (i, group) in groups.iter().enumerate() {
             *submitted += 1;
@@ -4066,7 +4085,6 @@ impl Host {
             }
             let _ = (i, started);
         }
-        let _ = &firsts;
         FINISHED.store(this_submission, Ordering::Release);
         bury(this_submission);
         let gpu = prepared.elapsed();
