@@ -2,6 +2,7 @@
 
 mod diagnostics;
 mod policy;
+mod progress;
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -32,6 +33,8 @@ enum Cmd {
         /// File created by victory --diagnostic-jsonl.
         input: PathBuf,
     },
+    /// Write the README's progress tracker from docs/progress/progress.json.
+    Progress,
 }
 
 fn main() -> Result<()> {
@@ -39,6 +42,7 @@ fn main() -> Result<()> {
     match Cli::parse().command {
         Cmd::Policy { staged } => policy::run(&root, staged),
         Cmd::Diagnostics { input } => diagnostics::run(&input),
+        Cmd::Progress => progress::run(&root),
         Cmd::InstallHooks => {
             let status = Command::new("git")
                 .args(["config", "core.hooksPath", ".githooks"])
