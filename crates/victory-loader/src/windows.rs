@@ -139,6 +139,19 @@ fn map_imports(
     Ok(())
 }
 
+/// True only for a single plain file name (no directory separators,
+/// parent traversal, drive prefix, or NTFS stream colon).
+fn is_plain_dll_name(name: &str) -> bool {
+    if name.contains(['\\', '/', ':']) {
+        return false;
+    }
+    let mut components = Path::new(name).components();
+    matches!(
+        (components.next(), components.next()),
+        (Some(std::path::Component::Normal(_)), None)
+    )
+}
+
 fn map_dll(
     name: &str,
     dirs: (&Path, &Path),
@@ -147,6 +160,9 @@ fn map_dll(
     loaded: &mut Vec<(String, LoadedImage)>,
 ) -> Result<()> {
     let name = name.to_ascii_lowercase();
+    if !is_plain_dll_name(&name) {
+        return Ok(());
+    }
     let path = dirs.0.join(&name);
     if !seen.insert(name.clone()) || !wanted(&name) || !path.is_file() {
         return Ok(());
