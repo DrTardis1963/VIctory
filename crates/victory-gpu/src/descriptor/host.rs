@@ -405,6 +405,24 @@ macro_rules! once {
     }};
 }
 
+/// The element count of a buffer view of `count` elements from `first` on a
+/// host copy of `capacity` elements, cut to fit; `None` for a view that would
+/// be an invalid call (the debug layer removes the device, drivers may fault):
+/// one starting at or past the end, or one of no elements (the title's own
+/// record count can be 0). A null view reads 0 and drops writes.
+///
+/// `capacity` comes from the host copy's width, which `shadow` rounds up to
+/// 64 KiB on purpose (so views ending in the buffer's last 256 bytes fit):
+/// views into that padding stay legal, and this never refuses a view the
+/// host would take.
+fn cut_to_copy(first: u64, count: u32, capacity: u64) -> Option<u32> {
+    if first >= capacity {
+        return None;
+    }
+    let count = u64::from(count).min(capacity - first) as u32;
+    (count > 0).then_some(count)
+}
+
 /// A view description from its words, with the format as the host has it.
 fn srv_desc(words: &[u32; 10]) -> D3D12_SHADER_RESOURCE_VIEW_DESC {
     let mut words = *words;
@@ -516,26 +534,14 @@ fn buffer_srv(
         return None;
     }
     buffer.FirstElement += offset / element;
-    // A view past its host copy's end is an invalid call (the debug layer
-    // removes the device; drivers may fault): none past the end, the rest
-    // cut to fit.
     // SAFETY: a live buffer.
     let capacity = unsafe { shadow.buffer.GetDesc() }.Width / element;
-    if buffer.FirstElement >= capacity {
-        let first = buffer.FirstElement;
-        once!(first, capacity, "buffer view past the end of its host copy");
+    let Some(count) = cut_to_copy(buffer.FirstElement, buffer.NumElements, capacity) else {
+        let (first, count) = (buffer.FirstElement, buffer.NumElements);
+        once!(first, count, capacity, "buffer view past the end of its host copy, or of no elements: null");
         return None;
-    }
-    if buffer.FirstElement + u64::from(buffer.NumElements) > capacity {
-        buffer.NumElements = (capacity - buffer.FirstElement) as u32;
-    }
-    // A view of no elements is an invalid call too (the title's own record
-    // count can be 0): null, which reads 0 and drops writes.
-    if buffer.NumElements == 0 {
-        let first = buffer.FirstElement;
-        once!(first, "buffer view of no elements");
-        return None;
-    }
+    };
+    buffer.NumElements = count;
     let host = host()?;
     // SAFETY: a live buffer and a slot of our heap.
     unsafe {
@@ -578,26 +584,14 @@ fn buffer_uav(
         return None;
     }
     buffer.FirstElement += offset / element;
-    // A view past its host copy's end is an invalid call (the debug layer
-    // removes the device; drivers may fault): none past the end, the rest
-    // cut to fit.
     // SAFETY: a live buffer.
     let capacity = unsafe { shadow.buffer.GetDesc() }.Width / element;
-    if buffer.FirstElement >= capacity {
-        let first = buffer.FirstElement;
-        once!(first, capacity, "buffer view past the end of its host copy");
+    let Some(count) = cut_to_copy(buffer.FirstElement, buffer.NumElements, capacity) else {
+        let (first, count) = (buffer.FirstElement, buffer.NumElements);
+        once!(first, count, capacity, "buffer view past the end of its host copy, or of no elements: null");
         return None;
-    }
-    if buffer.FirstElement + u64::from(buffer.NumElements) > capacity {
-        buffer.NumElements = (capacity - buffer.FirstElement) as u32;
-    }
-    // A view of no elements is an invalid call too (the title's own record
-    // count can be 0): null, which reads 0 and drops writes.
-    if buffer.NumElements == 0 {
-        let first = buffer.FirstElement;
-        once!(first, "buffer view of no elements");
-        return None;
-    }
+    };
+    buffer.NumElements = count;
     buffer.CounterOffsetInBytes = 0;
     let host = host()?;
     // SAFETY: a live buffer and a slot of our heap.
@@ -1039,6 +1033,20 @@ mod tests {
         null_for(&view, heap.cpu(0));
         // SAFETY: a plain device query.
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+    }
+
+    /// Views past their host copy's end are null, views running past it
+    /// are cut, and views of no elements are null; with no device.
+    #[test]
+    fn views_are_cut_to_their_host_copy() {
+        // A copy of 4,096 elements (a 0x1000-byte title buffer of 16-byte
+        // elements, padded to 64 KiB).
+        assert_eq!(cut_to_copy(0, 16, 4096), Some(16));
+        assert_eq!(cut_to_copy(4095, 4, 4096), Some(1), "cut to the last element");
+        assert_eq!(cut_to_copy(4096, 1, 4096), None, "starts at the end");
+        assert_eq!(cut_to_copy(u64::MAX, 1, 4096), None, "far past the end");
+        assert_eq!(cut_to_copy(8, 0, 4096), None, "no elements");
+        assert_eq!(cut_to_copy(0, u32::MAX, 4096), Some(4096), "cut to the whole copy");
     }
 
     /// Dynamic slots stay taken until given back, and runs do not wrap.
