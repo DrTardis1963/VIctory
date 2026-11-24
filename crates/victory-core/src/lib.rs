@@ -11,5 +11,5 @@ pub mod diagnostics;
 pub mod logging;
 pub mod policy;
 
-pub use config::Config;
+pub use config::{Config, Origin, Origins};
 pub use policy::{PolicyError, ensure_outside_repo};
