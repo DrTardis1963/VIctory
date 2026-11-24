@@ -445,10 +445,20 @@ pub(crate) extern "system" fn create_stream(
             );
             break;
         };
+        if size > desc.size - at {
+            tracing::warn!(
+                kind,
+                at,
+                size,
+                total = desc.size,
+                "truncated pipeline subobject"
+            );
+            return E_INVALIDARG;
+        }
         if let Some(stage) = stage {
-            // SAFETY: a shader subobject has its bytecode at +8.
-            let code = unsafe { &*desc.stream.add(at + 8).cast::<Bytecode>() };
-            shaders.extend(copy(stage, code));
+            // SAFETY: a shader subobject has its bytecode at +8 (may be unaligned).
+            let code = unsafe { desc.stream.add(at + 8).cast::<Bytecode>().read_unaligned() };
+            shaders.extend(copy(stage, &code));
         }
         #[cfg(windows)]
         // SAFETY: a whole subobject of this kind lies at `at`.
@@ -620,5 +630,50 @@ mod tests {
                 (1, 28)
             );
         }
+    }
+
+    #[test]
+    fn truncated_stream_subobject_returns_invalidarg() {
+        let mut buf = [0u8; 64];
+        let mut out = std::ptr::null();
+
+        // Kind 15 (RT format array) requires 40 bytes, only 16 remain.
+        buf[..4].copy_from_slice(&15u32.to_le_bytes());
+        let rt_desc = StreamDesc {
+            size: 16,
+            stream: buf.as_ptr(),
+        };
+        assert_eq!(
+            create_stream(std::ptr::null(), &rt_desc, &PIPELINE_IIDS[0], &mut out),
+            E_INVALIDARG
+        );
+
+        // Kind 1 (vertex shader) requires 24 bytes, only 16 remain.
+        buf[..4].copy_from_slice(&1u32.to_le_bytes());
+        let vs_desc = StreamDesc {
+            size: 16,
+            stream: buf.as_ptr(),
+        };
+        assert_eq!(
+            create_stream(std::ptr::null(), &vs_desc, &PIPELINE_IIDS[0], &mut out),
+            E_INVALIDARG
+        );
+
+        // A complete VS subobject starting at an unaligned +4 offset reads cleanly.
+        let vs = [11u8, 22, 33, 44];
+        let mut unaligned = [0u8; 32];
+        unaligned[4..8].copy_from_slice(&1u32.to_le_bytes());
+        unaligned[12..20].copy_from_slice(&(vs.as_ptr() as u64).to_le_bytes());
+        unaligned[20..28].copy_from_slice(&(vs.len() as u64).to_le_bytes());
+        let ok_desc = StreamDesc {
+            size: 24,
+            stream: unaligned[4..].as_ptr(),
+        };
+        assert_eq!(
+            create_stream(std::ptr::null(), &ok_desc, &PIPELINE_IIDS[0], &mut out),
+            S_OK
+        );
+        assert_eq!(shaders(out), [("vertex", vs.to_vec())]);
+        assert_eq!(slot::<extern "system" fn(This) -> u32>(out, 0x10)(out), 0);
     }
 }
