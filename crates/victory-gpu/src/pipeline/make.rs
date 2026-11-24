@@ -271,8 +271,11 @@ impl Queue {
         Some(prev == NOT_QUEUED)
     }
 
-    fn pop(&mut self) -> Option<Arc<Pending>> {
-        let p = self.requested.pop_front().or_else(|| {
+    /// The next pipeline to make: a requested one first, unless only early
+    /// ones are taken (a spare worker, which can starve).
+    fn pop(&mut self, early_only: bool) -> Option<Arc<Pending>> {
+        let requested = if early_only { None } else { self.requested.pop_front() };
+        let p = requested.or_else(|| {
             // An early entry can have been promoted and claimed already.
             std::iter::from_fn(|| self.early.pop_front())
                 .find(|p| p.queue_state.load(Ordering::Relaxed) == EARLY)
@@ -302,14 +305,15 @@ fn start(p: &Arc<Pending>, priority: u8) {
         if new {
             PEAK.fetch_max(WAITING.fetch_add(1, Ordering::Relaxed) + 1, Ordering::Relaxed);
         }
-        AVAILABLE.notify_one();
+        // All: a spare worker woken for a requested one would not take it.
+        AVAILABLE.notify_all();
     }
 }
 
-fn next() -> Arc<Pending> {
+fn next(early_only: bool) -> Arc<Pending> {
     let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
     loop {
-        if let Some(p) = queue.pop() {
+        if let Some(p) = queue.pop(early_only) {
             return p;
         }
         queue = AVAILABLE.wait(queue).unwrap_or_else(|e| e.into_inner());
@@ -320,27 +324,50 @@ fn next() -> Arc<Pending> {
 /// which runs on it (reserved address space; committed only as used).
 const PIPELINE_STACK: usize = 64 << 20;
 
-/// Starts the workers (half the logical processors, 2 to 8) on first use.
+/// Workers at the title's priority (half the logical processors, 2 to 8)
+/// and spare ones below it, up to all processors but two (at most 16
+/// workers in all), for `logical` processors. The spare ones run while the
+/// title waits (loading, a world whose pipelines are not made yet: 8
+/// workers made ~8 a second of a cold library while the rest of a 24-thread
+/// processor stood idle) and starve when it is busy, as all workers did
+/// below its priority (PR #1505), so they cost the world's frames nothing;
+/// they take only early pipelines, so none a frame waits for starves there.
+/// shortcut: 16 caps the driver compiles' memory unmeasured; raise it after
+/// a cold run shows the commit charge with all of them compiling.
+fn worker_counts(logical: usize) -> (usize, usize) {
+    let normal = (logical / 2).clamp(2, 8);
+    (normal, logical.saturating_sub(2).min(16).saturating_sub(normal))
+}
+
+/// Starts the workers ([`worker_counts`]) on first use.
 fn workers() -> bool {
     static RUNNING: OnceLock<bool> = OnceLock::new();
     *RUNNING.get_or_init(|| {
         let mut running = false;
-        let workers = std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8));
-        for i in 0..workers {
+        let (normal, spare) = worker_counts(std::thread::available_parallelism().map_or(4, |n| n.get()));
+        tracing::info!(normal, spare, "host pipeline workers");
+        for i in 0..normal + spare {
             let spawned = std::thread::Builder::new()
                 .name(format!("victory-pipelines-{i}"))
                 // The driver compiles pipelines on this thread, recursively:
                 // NVIDIA's compiler (nvgpucomp64) overflowed the default 2 MB
                 // on a world compute program and refused it as out of memory.
                 .stack_size(PIPELINE_STACK)
-                .spawn(|| {
-                    // At the title's own priority: below it, the world's
-                    // busy threads starved the workers (236 pipelines a
-                    // minute at the start screen, 7 a minute in the world on
-                    // a 16-thread laptop, PR #1505), and draws stay dropped
-                    // until their pipelines exist.
+                .spawn(move || {
+                    if i >= normal {
+                        // SAFETY: a plain call on our own thread.
+                        unsafe {
+                            use windows::Win32::System::Threading::*;
+                            let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+                        }
+                    }
+                    // The others at the title's own priority: below it,
+                    // the world's busy threads starved the workers (236
+                    // pipelines a minute at the start screen, 7 a minute in
+                    // the world on a 16-thread laptop, PR #1505), and draws
+                    // stay dropped until their pipelines exist.
                     loop {
-                        next().make();
+                        next(i >= normal).make();
                         if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
                             drained();
                         } else {
@@ -420,6 +447,16 @@ mod tests {
     }
 
     #[test]
+    fn spare_workers_fill_all_processors_but_two() {
+        assert_eq!(worker_counts(1), (2, 0));
+        assert_eq!(worker_counts(4), (2, 0));
+        assert_eq!(worker_counts(8), (4, 2));
+        assert_eq!(worker_counts(16), (8, 6));
+        assert_eq!(worker_counts(24), (8, 8));
+        assert_eq!(worker_counts(64), (8, 8));
+    }
+
+    #[test]
     fn pending_pipeline_is_recorded_for_the_next_launch() {
         let mut p = Pending::new(Vec::new(), None);
         p.key = "pending-pipeline-test".to_owned();
@@ -446,10 +483,28 @@ mod tests {
         assert_eq!(queue.push(&promoted, REQUESTED), Some(false));
         assert_eq!(queue.push(&promoted, REQUESTED), None);
 
-        assert!(Arc::ptr_eq(&queue.pop().unwrap(), &requested));
-        assert!(Arc::ptr_eq(&queue.pop().unwrap(), &promoted));
+        assert!(Arc::ptr_eq(&queue.pop(false).unwrap(), &requested));
+        assert!(Arc::ptr_eq(&queue.pop(false).unwrap(), &promoted));
         assert_eq!(queue.push(&promoted, REQUESTED), None);
-        assert!(Arc::ptr_eq(&queue.pop().unwrap(), &earlier));
-        assert!(queue.pop().is_none());
+        assert!(Arc::ptr_eq(&queue.pop(false).unwrap(), &earlier));
+        assert!(queue.pop(false).is_none());
+    }
+
+    #[test]
+    fn spare_workers_take_only_early_pipelines() {
+        let early_one = Arc::new(Pending::new(Vec::new(), None));
+        let promoted = Arc::new(Pending::new(Vec::new(), None));
+        let requested = Arc::new(Pending::new(Vec::new(), None));
+        let mut queue = Queue::new();
+        queue.push(&early_one, EARLY);
+        queue.push(&promoted, EARLY);
+        queue.push(&requested, REQUESTED);
+        queue.push(&promoted, REQUESTED);
+
+        // The promoted one's early entry is skipped: it is requested now.
+        assert!(Arc::ptr_eq(&queue.pop(true).unwrap(), &early_one));
+        assert!(queue.pop(true).is_none());
+        assert!(Arc::ptr_eq(&queue.pop(false).unwrap(), &requested));
+        assert!(Arc::ptr_eq(&queue.pop(false).unwrap(), &promoted));
     }
 }
