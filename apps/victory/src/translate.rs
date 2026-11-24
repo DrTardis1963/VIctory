@@ -301,6 +301,10 @@ pub fn run(
     let total = Mutex::new(Tally::default());
     let queue = WorkQueue::new();
     let cache_ref = cache.as_ref().map(|(_, c)| c);
+    // One line kept current while the walk runs: a long cache build shows it
+    // is moving (the summary only comes at the end).
+    let done = AtomicUsize::new(0);
+    let started = std::time::Instant::now();
 
     std::thread::scope(|s| {
         for _ in 0..threads {
@@ -336,6 +340,13 @@ pub fn run(
                     if let Some(src_ref) = batch.sources.get(idx) {
                         if let Some(source) = src_ref.resolve(&batch.data) {
                             translate(&source, &batch.path, &seen, &mut t, &mut checks);
+                            let n = done.fetch_add(1, Ordering::Relaxed) + 1;
+                            if n.is_multiple_of(100) {
+                                eprint!(
+                                    "\r  {n} shaders checked ({:.0} s)   ",
+                                    started.elapsed().as_secs_f64()
+                                );
+                            }
                         }
                     } else {
                         queue.finish_batch(batch);
