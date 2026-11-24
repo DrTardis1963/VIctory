@@ -677,6 +677,25 @@ mod tests {
         view
     }
 
+    /// Tests that take address ranges or remap, one at a time: the kernel
+    /// may give one's freed addresses to another (taken at fixed addresses,
+    /// or with journal entries left), and remapping resets what every
+    /// test's guards remember.
+    static SERIAL: Mutex<()> = Mutex::new(());
+
+    fn serial() -> std::sync::MutexGuard<'static, ()> {
+        SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Forgets the journal's pages of `[start, end)`: a previous test may
+    /// have used these virtual addresses.
+    fn forget(start: usize, end: usize) {
+        let mut journal = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+        for page in start / PAGE..end.div_ceil(PAGE) {
+            journal.written.remove(&page);
+        }
+    }
+
     /// Unmaps a view from [`view`], first forgetting its pages' journal
     /// entries: the next allocation there is not written.
     fn unmap(view: usize, blocks: usize) {
@@ -696,6 +715,7 @@ mod tests {
     /// kernel; a write to it (by the title, or announced) is still seen.
     #[test]
     fn clean_guarded_views_are_answered_from_the_journal() {
+        let _serial = serial();
         let v = view(4);
         let (start, end) = (v, v + 4 * BLOCK);
         let first = v / PAGE;
@@ -753,6 +773,7 @@ mod tests {
     /// A range only partly guarded and clean asks the kernel.
     #[test]
     fn partly_clean_ranges_ask_the_kernel() {
+        let _serial = serial();
         let v = view(2);
         let asked = kernel_asked();
         // Only block 0 is guarded.
@@ -772,6 +793,7 @@ mod tests {
 
     #[test]
     fn allocation_query_recognizes_file_views_and_rejects_nonviews() {
+        let _serial = serial();
         use std::os::windows::io::AsRawHandle;
         use windows_sys::Win32::Foundation::CloseHandle;
         use windows_sys::Win32::System::Memory::{
@@ -807,6 +829,7 @@ mod tests {
 
     #[test]
     fn written_pages_are_reported_to_every_asker() {
+        let _serial = serial();
         // SAFETY: a fresh write-watched allocation, freed at the end.
         let p = unsafe {
             VirtualAlloc(
@@ -818,12 +841,7 @@ mod tests {
         } as usize;
         assert_ne!(p, 0);
         let (start, end) = (p, p + 4 * PAGE);
-        // A previous test may have used these virtual addresses.
-        let mut journal = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
-        for page in start / PAGE..end / PAGE {
-            journal.written.remove(&page);
-        }
-        drop(journal);
+        forget(start, end);
         let (_, before) = writes(start, end, false).expect("watched");
         assert!(before.is_empty());
         // SAFETY: committed pages of ours.
@@ -850,6 +868,7 @@ mod tests {
     /// That memory is a view is remembered only until it is remapped.
     #[test]
     fn remapped_memory_is_asked_about_again() {
+        let _serial = serial();
         use windows_sys::Win32::System::Memory::{
             CreateFileMappingW, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile, UnmapViewOfFile,
         };
@@ -884,6 +903,7 @@ mod tests {
     /// made read-only.
     #[test]
     fn a_check_during_the_unmapping_leaves_nothing_behind() {
+        let _serial = serial();
         use windows_sys::Win32::System::Memory::{
             CreateFileMappingW, MEM_PRESERVE_PLACEHOLDER, MEM_REPLACE_PLACEHOLDER,
             MEM_RESERVE_PLACEHOLDER, MapViewOfFile3, UnmapViewOfFile2, VirtualAlloc2,
@@ -948,6 +968,7 @@ mod tests {
     /// a buffer spanning them is: the pages written in each are reported.
     #[test]
     fn a_range_over_several_watched_allocations_is_watched() {
+        let _serial = serial();
         let (a, b) = loop {
             // SAFETY: a probe reservation, released at once to find room for two.
             let span =
@@ -977,6 +998,7 @@ mod tests {
                 unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
             }
         };
+        forget(a, b + 2 * PAGE);
         let _ = writes(a, b + 2 * PAGE, false);
         // SAFETY: committed pages of ours.
         unsafe {
@@ -994,9 +1016,11 @@ mod tests {
     /// once committed.
     #[test]
     fn a_range_never_committed_has_no_writes() {
+        let _serial = serial();
         // SAFETY: a fresh write-watched reservation, freed at the end.
         let p = unsafe { VirtualAlloc(std::ptr::null(), 2 * PAGE, MEM_RESERVE | MEM_WRITE_WATCH, PAGE_READWRITE) } as usize;
         assert_ne!(p, 0);
+        forget(p, p + 2 * PAGE);
         let (_, none) = writes(p, p + 2 * PAGE, false).expect("nothing can be written there");
         assert!(none.is_empty());
         // SAFETY: committing and writing a page of our reservation.
@@ -1015,6 +1039,7 @@ mod tests {
     /// cleared in the kernel, is still reported to the next asker.
     #[test]
     fn writes_found_before_a_refusal_are_kept() {
+        let _serial = serial();
         let (a, b) = loop {
             // SAFETY: a probe reservation, released at once to find room for two.
             let span = unsafe { VirtualAlloc(std::ptr::null(), 4 * PAGE, MEM_RESERVE, PAGE_READWRITE) };
@@ -1038,6 +1063,7 @@ mod tests {
                 unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
             }
         };
+        forget(a, b + 2 * PAGE);
         let _ = writes(a, a + 2 * PAGE, false);
         // SAFETY: committed pages of ours.
         unsafe { ((a + 8) as *mut u8).write(1) };
@@ -1052,6 +1078,7 @@ mod tests {
     /// lands and the block counts as written.
     #[test]
     fn kernel_reads_into_guarded_blocks_after_opening() {
+        let _serial = serial();
         use std::io::{Read, Seek, Write};
         use windows_sys::Win32::System::Memory::{
             CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile, UnmapViewOfFile,
@@ -1109,6 +1136,7 @@ mod tests {
     /// to overflow. Up there no test has guarded blocks.
     #[test]
     fn ranges_past_the_address_space_end_do_not_overflow() {
+        let _serial = serial();
         let top = usize::MAX - 16;
         writing(top, PAGE);
         title_memory_remapped(top, usize::MAX);
@@ -1119,6 +1147,7 @@ mod tests {
     /// the next refresh guards its block again.
     #[test]
     fn an_announced_kernel_read_survives_a_refresh_before_it() {
+        let _serial = serial();
         use std::io::{Read, Seek, Write};
         use windows_sys::Win32::System::Memory::{
             CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile, UnmapViewOfFile,
@@ -1173,6 +1202,7 @@ mod tests {
     /// again (they cannot be guarded) until the runtime maps them.
     #[test]
     fn unmapped_blocks_are_reported_once_until_mapped() {
+        let _serial = serial();
         use windows_sys::Win32::System::Memory::{
             CreateFileMappingW, MEM_PRESERVE_PLACEHOLDER, MEM_REPLACE_PLACEHOLDER,
             MEM_RESERVE_PLACEHOLDER, MapViewOfFile3, PAGE_NOACCESS, UnmapViewOfFile2,
