@@ -184,6 +184,7 @@ pub(crate) struct State {
     host_pipeline: usize,
     /// Graphics, compute.
     host_roots: [usize; 2],
+    /// The host heaps set on the list (their pointers).
     host_heaps: [usize; 2],
     /// Tables made afresh in this list: (table, slot count, contents) → first
     /// dynamic slot.
@@ -865,18 +866,25 @@ impl State {
         let l = &list.list;
         // Heaps first: a root signature with directly indexed heaps must be
         // set after them.
-        if self.host_heaps != self.heaps {
-            let heaps: Vec<Option<ID3D12DescriptorHeap>> = self
-                .heaps
-                .iter()
-                .filter(|&&h| h != 0)
-                .filter_map(|&h| crate::descriptor::heap(h as This).host())
-                .map(|h| Some(h.heap.clone()))
-                .collect();
+        // Compared by the host heaps, not the title's: a title heap freed
+        // and another made at its address, or one whose host heap came
+        // later, is a change too (port of PR #1444).
+        let heaps: Vec<Option<ID3D12DescriptorHeap>> = self
+            .heaps
+            .iter()
+            .filter(|&&h| h != 0)
+            .filter_map(|&h| crate::descriptor::heap(h as This).host())
+            .map(|h| Some(h.heap.clone()))
+            .collect();
+        let mut wanted = [0usize; 2];
+        for (w, h) in wanted.iter_mut().zip(heaps.iter().flatten()) {
+            *w = h.as_raw() as usize;
+        }
+        if self.host_heaps != wanted {
             heaps.iter().flatten().for_each(|h| list.keep(h));
             // SAFETY: an open list and shader-visible heaps.
             unsafe { l.SetDescriptorHeaps(&heaps) };
-            self.host_heaps = self.heaps;
+            self.host_heaps = wanted;
             self.host_roots = [0; 2];
         }
         // The depth target a draw only tests, for the views of it that the
