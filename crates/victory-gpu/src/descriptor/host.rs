@@ -209,6 +209,34 @@ const DYNAMIC: u32 = 1 << 19;
 /// [`PORTABLE_VIEWS`].
 const DYNAMIC_CAPPED: u32 = 1 << 16;
 
+/// [`DYNAMIC_CAPPED`], or `VICTORY_DYNAMIC_SLOTS` in diagnostics builds: more
+/// slots for tables made afresh, fewer title slots mirrored one to one.
+fn capped_reserve() -> u32 {
+    #[cfg(feature = "diagnostics")]
+    if let Some(n) = std::env::var("VICTORY_DYNAMIC_SLOTS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+    {
+        return n.clamp(1 << 12, PORTABLE_VIEWS / 2);
+    }
+    DYNAMIC_CAPPED
+}
+
+/// Dynamic slots taken now, the most taken since the last
+/// [`take_dynamic_stats`], and requests that found no run free.
+static TAKEN: AtomicU64 = AtomicU64::new(0);
+static PEAK: AtomicU64 = AtomicU64::new(0);
+static SHORT: AtomicU64 = AtomicU64::new(0);
+
+/// The most dynamic slots taken at once and the requests that ran short,
+/// since the last call (all view heaps).
+pub(crate) fn take_dynamic_stats() -> (u64, u64) {
+    (
+        PEAK.swap(TAKEN.load(Ordering::Relaxed), Ordering::Relaxed),
+        SHORT.swap(0, Ordering::Relaxed),
+    )
+}
+
 impl HostHeap {
     pub(crate) fn new(sampler: bool, count: u32) -> Option<Self> {
         let host = host()?;
@@ -235,11 +263,18 @@ impl HostHeap {
             Err(e) if !sampler && count + extra > PORTABLE_VIEWS => {
                 // shortcut: descriptors past the host's limit are left out;
                 // a title that reaches them needs remapping.
-                tracing::warn!(error = %e, count, "host view heap capped at {PORTABLE_VIEWS}");
+                let reserve = capped_reserve();
+                tracing::warn!(
+                    error = %e,
+                    count,
+                    mirrored = PORTABLE_VIEWS - reserve,
+                    dynamic = reserve,
+                    "host view heap capped at {PORTABLE_VIEWS}"
+                );
                 (
                     make(PORTABLE_VIEWS).ok()?,
-                    PORTABLE_VIEWS - DYNAMIC_CAPPED,
-                    DYNAMIC_CAPPED,
+                    PORTABLE_VIEWS - reserve,
+                    reserve,
                 )
             }
             Err(e) => {
@@ -384,11 +419,14 @@ impl HostHeap {
             }
         }
         let Some(first) = found else {
+            SHORT.fetch_add(1, Ordering::Relaxed);
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!(n, cap, "no free dynamic descriptor slots: a table is not made"));
             return None;
         };
         taken[first..first + n].fill(true);
+        let now = TAKEN.fetch_add(n as u64, Ordering::Relaxed) + n as u64;
+        PEAK.fetch_max(now, Ordering::Relaxed);
         *next = ((first + n) % cap) as u32;
         Some(self.count + first as u32)
     }
@@ -420,7 +458,9 @@ impl HostHeap {
         let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
         let end = (at + n).min(self.dynamic) as usize;
         if let Some(slots) = guard.1.get_mut(at as usize..end) {
+            let freed = slots.iter().filter(|&&t| t).count();
             slots.fill(false);
+            TAKEN.fetch_sub(freed as u64, Ordering::Relaxed);
         }
     }
 
@@ -532,9 +572,11 @@ impl HostHeap {
     pub(crate) fn mirror(&self, index: u32, handle: u64, for_draw: bool) -> Option<View> {
         if index >= self.count {
             // Diagnostic (NVIDIA heap cap): the highest title slot past the
-            // host heap seen so far.
-            static HIGHEST: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-            if HIGHEST.fetch_max(index, Ordering::Relaxed) < index {
+            // host heap seen so far, written (title views, bindless ones
+            // among them, that shaders cannot reach) and read by draws.
+            static HIGHEST: [std::sync::atomic::AtomicU32; 2] =
+                [const { std::sync::atomic::AtomicU32::new(0) }; 2];
+            if HIGHEST[usize::from(for_draw)].fetch_max(index, Ordering::Relaxed) < index {
                 tracing::warn!(
                     index,
                     count = self.count,

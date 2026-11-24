@@ -2314,6 +2314,12 @@ impl Meter {
                  {indirect:.0} indirect",
                 making = crate::pipeline::making()
             );
+            let (peak, short) = crate::descriptor::host::take_dynamic_stats();
+            if peak > 0 {
+                tracing::info!(
+                    "dynamic descriptor slots: at most {peak} taken; {short} requests ran short"
+                );
+            }
             #[cfg(feature = "diagnostics")]
             {
                 crate::copystat::log(std::mem::take(&mut self.copy_stats_frames) as f64);
