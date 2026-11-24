@@ -141,6 +141,9 @@ struct Last {
     asked: u64,
     /// The frame a partly mapped texture was last read in.
     partial: Option<u64>,
+    /// The frame a refresh without the lock last found a page of the
+    /// texture not there ([`no_wait`]): it is not read again that frame.
+    left: Option<u64>,
 }
 
 // SAFETY: the staging mapping is written only at submission, under
@@ -355,8 +358,8 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
 }
 
 /// Whether a texture refresh that finds the runtime remapping title memory
-/// goes on without waiting for it (`VICTORY_TEXTURE_NO_WAIT=1`; off by
-/// default).
+/// goes on without waiting for it (on by default; `VICTORY_TEXTURE_NO_WAIT=0`
+/// waits, as before).
 ///
 /// A texture whose memory is all mapped is read in place, under a lock
 /// the runtime takes alone while it changes a mapping
@@ -376,9 +379,16 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
 ///
 /// What changes for the picture: a texture that arrives while the runtime
 /// is remapping may show a frame later. It never shows partly read.
+///
+/// On by default since the opening cutscene's stream-in: the runtime maps
+/// pages one at a time (`XMemMapPhysicalPagesScatter`), each under the lock,
+/// for seconds on end, and the submitting thread waited 2.1-7.0 s a frame
+/// for it (99% of the frame line's "textures"; the reads themselves 16-45
+/// ms). A read through the kernel only fails on its own pages, so a refresh
+/// now waits for nothing but a remapping of the texture itself.
 fn no_wait() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_NO_WAIT").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_NO_WAIT").is_none_or(|v| v != "0"))
 }
 
 /// Since the last frame-rate line, with [`no_wait`]: refreshes that read
@@ -903,6 +913,14 @@ impl Staging {
     /// Returns the bytes read.
     fn refresh_unlocked(&self, last: &mut Last, size: usize) -> usize {
         use std::sync::atomic::Ordering::Relaxed;
+        // A texture streaming in fails here at every submission that
+        // samples it (32 a frame), each read running up to its first page
+        // not there: once a frame is enough.
+        let frame = crate::frame::current();
+        if last.left == Some(frame) {
+            last.asked = 0;
+            return 0;
+        }
         let read = with_read(size, |read| {
             if !crate::host::read_into(self.memory, read) {
                 return false;
@@ -920,6 +938,7 @@ impl Staging {
         } else {
             UNLOCKED[1].fetch_add(1, Relaxed);
             last.asked = 0;
+            last.left = Some(frame);
             0
         }
     }

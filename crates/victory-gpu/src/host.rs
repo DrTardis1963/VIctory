@@ -2866,6 +2866,52 @@ mod late_tests {
         drop((first, next, staging));
         release(resource);
     }
+
+    /// A check at submission while the runtime remaps title memory does not
+    /// wait for it to finish (the opening cutscene waited seconds a frame):
+    /// the texture is read through the kernel instead.
+    #[test]
+    fn a_texture_check_does_not_wait_for_a_remapping() {
+        use std::sync::mpsc;
+        let Some(host) = super::host() else { return };
+        let resource = title_texture();
+        let tex = crate::resource::host_resource(resource).expect("host texture");
+        let list = host.new_list().expect("host list");
+        crate::texture::upload(&list, resource, tex);
+        let staging = list
+            .deferred()
+            .copies
+            .iter()
+            .find_map(|step| match step {
+                super::Step::Texture(staging, _) => Some(staging.clone()),
+                _ => None,
+            })
+            .expect("a texture step");
+        let (held, holding) = mpsc::channel();
+        let (let_go, until) = mpsc::channel::<()>();
+        let remapping = std::thread::spawn(move || {
+            let _changing = crate::watch::title_memory_remapping();
+            held.send(()).unwrap();
+            let _ = until.recv();
+        });
+        holding.recv().unwrap();
+        let (done, checked) = mpsc::channel();
+        let check = {
+            let staging = staging.clone();
+            std::thread::spawn(move || {
+                staging.refresh();
+                done.send(()).unwrap();
+            })
+        };
+        let in_time = checked.recv_timeout(std::time::Duration::from_secs(5)).is_ok();
+        drop(let_go);
+        remapping.join().unwrap();
+        check.join().unwrap();
+        assert!(in_time, "the check waited for the remapping");
+        list.close();
+        drop((list, staging));
+        release(resource);
+    }
 }
 
 /// Whether a title buffer copy that continues the one recorded before it
@@ -6205,7 +6251,7 @@ impl Meter {
             let [through, left] = [0, 1].map(|i| crate::texture::UNLOCKED[i].swap(0, Ordering::Relaxed) as f64 / frames);
             if through + left > 0.0 {
                 tracing::info!(
-                    "texture refreshes that did not wait for title memory to hold still, per frame (VICTORY_TEXTURE_NO_WAIT=1): \
+                    "texture refreshes that did not wait for title memory to hold still, per frame (VICTORY_TEXTURE_NO_WAIT=0 waits): \
                      {through:.1} read through the kernel, {left:.1} left for the next refresh (a page was not there)"
                 );
             }
