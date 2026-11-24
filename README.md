@@ -187,6 +187,10 @@ Nothing from the title's data belongs in the report: no shader dumps, no
 frames, no memory, per [docs/asset-policy.md](docs/asset-policy.md). Names of
 our own functions, error codes and timings are enough to start.
 
+[docs/debugging-notes-from-a-gta-v-port.md](docs/debugging-notes-from-a-gta-v-port.md)
+collects what got another RAGE port from "the world loads" to "the game
+runs": what the title waited for, and how each wait was found.
+
 ## License
 
 GPL-3.0-or-later. See [LICENSE](LICENSE).
