@@ -127,10 +127,12 @@ const _: () = assert!(offset_of!(List, pipeline_shadow) + 32 == 0x560);
 /// is a host GPU.
 #[cfg(windows)]
 fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::draw::State)) {
-    let Some(list) = host_list(this) else { return };
+    let Some(list) = recording_list(this) else {
+        return;
+    };
     // SAFETY: the title passes one of our lists.
     let state = unsafe { &(*this.cast::<List>()).state };
-    f(list, &mut state.lock().unwrap_or_else(|e| e.into_inner()));
+    f(&list, &mut state.lock().unwrap_or_else(|e| e.into_inner()));
 }
 
 /// Before a submission of a title list: false if it must not run (its
@@ -156,6 +158,44 @@ pub(crate) fn host_list<'a>(this: This) -> Option<&'a crate::host::HostList> {
     }
     // SAFETY: the title passes one of our lists.
     unsafe { (*this.cast::<List>()).host.as_ref() }
+}
+
+#[cfg(windows)]
+enum RecordingList<'a> {
+    Original(&'a crate::host::HostList),
+    Continuation(std::sync::Arc<crate::host::HostList>),
+}
+
+#[cfg(windows)]
+impl std::ops::Deref for RecordingList<'_> {
+    type Target = crate::host::HostList;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Original(list) => list,
+            Self::Continuation(list) => list,
+        }
+    }
+}
+
+#[cfg(windows)]
+fn recording_list<'a>(this: This) -> Option<RecordingList<'a>> {
+    let root = host_list(this)?;
+    let recording = if let Some((list, resumed)) = root.recording() {
+        if resumed {
+            // SAFETY: the title passes one of our lists.
+            let state = unsafe { &(*this.cast::<List>()).state };
+            state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .resume(&list);
+        }
+        RecordingList::Continuation(list)
+    } else {
+        RecordingList::Original(root)
+    };
+    recording.mark_buffer_access();
+    Some(recording)
 }
 
 pub(crate) extern "system" fn create_allocator(
@@ -231,7 +271,7 @@ fn new_list(kind: u32, allocator: This, iid: *const Iid, out: *mut This) -> HRES
         newer: [0; 256],
         uploads: Default::default(),
         #[cfg(windows)]
-        host: crate::host::host().and_then(|h| match h.new_list() {
+        host: crate::host::host().and_then(|h| match h.new_title_list() {
             Ok(list) => Some(list),
             Err(e) => {
                 tracing::warn!(error = %e, "no host command list");
@@ -282,10 +322,15 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
     let uploads = unsafe { &(*this.cast::<List>()).uploads };
     uploads.lock().unwrap_or_else(|e| e.into_inner()).clear();
     #[cfg(windows)]
-    with_state(this, |host, state| {
-        host.reset();
-        state.reset(pipeline);
-    });
+    if let Some(host) = host_list(this) {
+        host.reset_title();
+        // SAFETY: the title passes one of our lists.
+        let state = unsafe { &(*this.cast::<List>()).state };
+        state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .reset(pipeline);
+    }
     #[cfg(not(windows))]
     let _ = (this, pipeline);
     S_OK
@@ -390,14 +435,14 @@ const UAV_BARRIER: Barrier = Barrier {
 /// Returns the console's barrier "actions" (none).
 extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> u32 {
     #[cfg(windows)]
-    if let Some(list) = host_list(this)
+    if let Some(list) = recording_list(this)
         && !barriers.is_null()
     {
         // SAFETY: the title passes `count` barriers.
         let barriers = unsafe { std::slice::from_raw_parts(barriers, count as usize) };
         let mut host: Vec<Barrier> = barriers
             .iter()
-            .filter_map(|b| host_barrier(list, b))
+            .filter_map(|b| host_barrier(&list, b))
             .collect();
         // Buffers have host copies, not resources the barrier can name:
         // a barrier on one waits for every shader write before it.
@@ -407,7 +452,7 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
             host.push(UAV_BARRIER);
         }
         if !host.is_empty() {
-            record_barriers(list, &host);
+            record_barriers(&list, &host);
         }
     }
     0
@@ -474,7 +519,7 @@ fn buffer_range(buffer: This, offset: u64, len: u64) -> Option<*mut u8> {
     Some(unsafe { data.add(offset as usize) })
 }
 
-/// Buffer to buffer: both are host memory, copied at submission.
+/// Buffer to buffer: record an ordered host copy of the checked ranges.
 extern "system" fn copy_buffer_region(
     this: This,
     dst: This,
@@ -484,22 +529,25 @@ extern "system" fn copy_buffer_region(
     len: u64,
 ) {
     #[cfg(windows)]
-    if let Some(list) = host_list(this)
-        && let Some(to) = buffer_range(dst, dst_offset, len)
+    if let Some(to) = buffer_range(dst, dst_offset, len)
         && let Some(from) = buffer_range(src, src_offset, len)
     {
-        list.defer_copy(to, from, len as usize);
+        record_buffer_copy(this, dst, to, src, from, len);
     }
     #[cfg(not(windows))]
     let _ = (this, dst, dst_offset, src, src_offset, len);
 }
 
+#[cfg(windows)]
+fn record_buffer_copy(this: This, dst: This, to: *mut u8, src: This, from: *mut u8, len: u64) {
+    if let Some(root) = host_list(this) {
+        root.buffer_copy(dst, to as usize, src, from as usize, len as usize);
+    }
+}
+
 extern "system" fn copy_resource(this: This, dst: This, src: This) {
     #[cfg(windows)]
     {
-        let Some(list) = host_list(this) else {
-            return;
-        };
         if let (Some(to), Some(from)) = (
             crate::resource::host_resource(dst),
             crate::resource::host_resource(src),
@@ -507,8 +555,11 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             if crate::resource::skip_mixed_packed_copy("CopyResource", to, from) {
                 return;
             }
-            ensure_state(list, dst, COPY_DEST);
-            ensure_state(list, src, COPY_SOURCE);
+            let Some(list) = recording_list(this) else {
+                return;
+            };
+            ensure_state(&list, dst, COPY_DEST);
+            ensure_state(&list, src, COPY_SOURCE);
             crate::texture::host_written(dst);
             #[cfg(feature = "diagnostics")]
             list.note_op(|| format!("copy resource {src:?} to {dst:?}"));
@@ -518,7 +569,7 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             crate::resource::buffer_bytes(dst),
             crate::resource::buffer_bytes(src),
         ) {
-            list.defer_copy(to, from, a.min(b) as usize);
+            record_buffer_copy(this, dst, to, src, from, a.min(b));
         }
     }
     #[cfg(not(windows))]
@@ -596,7 +647,7 @@ fn prepare_footprint_upload(
             widened.row_pitch as usize,
         );
         let (src_at, dst_at) = (data as usize, staging as usize);
-        list.defer_host(move || {
+        list.defer_host((src_at, src_len), move || {
             let mut packed = vec![0u8; src_len];
             crate::host::copy_mapped(packed.as_mut_ptr(), src_at as *const u8, src_len, false);
             // SAFETY: `staging` is the persistent mapping of `buffer`, kept
@@ -611,7 +662,7 @@ fn prepare_footprint_upload(
         return Some((buffer, from, dst_bytes));
     }
     let (buffer, staging) = list.upload(host, bytes)?;
-    list.defer_copy(staging, data, bytes as usize);
+    list.defer_fill(staging, data, bytes as usize);
     from.resource = buffer.as_raw().cast_const().cast();
     from.footprint.offset = 0;
     Some((buffer, from, bytes))
@@ -636,7 +687,7 @@ extern "system" fn copy_texture_region(
         const FOOTPRINT: u32 = 1;
         // SAFETY: the title passes both locations (null is tolerated).
         let (Some(list), Some(&dst), Some(&src)) =
-            (host_list(this), unsafe { dst.as_ref() }, unsafe {
+            (recording_list(this), unsafe { dst.as_ref() }, unsafe {
                 src.as_ref()
             })
         else {
@@ -652,7 +703,7 @@ extern "system" fn copy_texture_region(
         #[cfg(feature = "diagnostics")]
         let mut read = None;
         if src.kind == FOOTPRINT {
-            let Some((buffer, staged, bytes)) = prepare_footprint_upload(list, to, src) else {
+            let Some((buffer, staged, bytes)) = prepare_footprint_upload(&list, to, src) else {
                 return;
             };
             from = staged;
@@ -671,10 +722,10 @@ extern "system" fn copy_texture_region(
             if crate::resource::skip_mixed_packed_copy("CopyTextureRegion", to, texture) {
                 return;
             }
-            ensure_state(list, src.resource, COPY_SOURCE);
+            ensure_state(&list, src.resource, COPY_SOURCE);
             from.resource = texture.as_raw().cast_const().cast();
         }
-        ensure_state(list, dst.resource, COPY_DEST);
+        ensure_state(&list, dst.resource, COPY_DEST);
         crate::texture::host_written(dst.resource);
         let mut to_location = dst;
         to_location.resource = to.as_raw().cast_const().cast();
@@ -743,7 +794,7 @@ extern "system" fn resolve(
     format: u32,
 ) {
     #[cfg(windows)]
-    if let Some(list) = host_list(this)
+    if let Some(list) = recording_list(this)
         && let (Some(to), Some(from)) = (
             crate::resource::host_resource(dst),
             crate::resource::host_resource(src),
@@ -760,8 +811,8 @@ extern "system" fn resolve(
         use windows::core::Interface;
         const RESOLVE_DEST: u32 = 0x1000;
         const RESOLVE_SOURCE: u32 = 0x2000;
-        ensure_state(list, dst, RESOLVE_DEST);
-        ensure_state(list, src, RESOLVE_SOURCE);
+        ensure_state(&list, dst, RESOLVE_DEST);
+        ensure_state(&list, src, RESOLVE_SOURCE);
         crate::texture::host_written(dst);
         let format = crate::resource::target_format(format);
         #[cfg(feature = "diagnostics")]
@@ -816,7 +867,8 @@ extern "system" fn clear_rtv(
 ) {
     #[cfg(windows)]
     {
-        let (Some(list), Some(record)) = (host_list(this), crate::descriptor::rtv_record(handle))
+        let (Some(list), Some(record)) =
+            (recording_list(this), crate::descriptor::rtv_record(handle))
         else {
             return;
         };
@@ -867,7 +919,8 @@ extern "system" fn clear_dsv(
     #[cfg(windows)]
     {
         use windows::Win32::Graphics::Direct3D12::D3D12_CLEAR_FLAGS;
-        let (Some(list), Some(record)) = (host_list(this), crate::descriptor::dsv_record(handle))
+        let (Some(list), Some(record)) =
+            (recording_list(this), crate::descriptor::dsv_record(handle))
         else {
             return;
         };
@@ -882,7 +935,7 @@ extern "system" fn clear_dsv(
             unsafe { std::slice::from_raw_parts(rects.cast(), count as usize) }
         });
         const DEPTH_WRITE: u32 = 0x10;
-        ensure_state(list, record.resource, DEPTH_WRITE);
+        ensure_state(&list, record.resource, DEPTH_WRITE);
         let dsv = host.dsv(texture, record.depth_desc().as_ref());
         // SAFETY: an open list, a fresh view of a live texture.
         unsafe {
@@ -898,7 +951,7 @@ extern "system" fn clear_dsv(
 /// are title memory, copied at submission like buffer copies (if mapped).
 extern "system" fn copy_memory(this: This, dst: u64, src: u64, len: u64, _flags: u32) {
     #[cfg(windows)]
-    if let Some(list) = host_list(this)
+    if let Some(list) = recording_list(this)
         && dst != 0
         && src != 0
     {
@@ -1055,7 +1108,7 @@ extern "system" fn depth_bounds(this: This, min: f32, max: f32) {
 /// set on the host list at once. Without a host GPU these do nothing.
 #[cfg(windows)]
 mod state {
-    use super::{This, host_list, with_state};
+    use super::{This, with_state};
     use crate::draw::{IndexView, VertexView};
     use windows::Win32::Foundation::RECT;
     use windows::Win32::Graphics::Direct3D12::D3D12_VIEWPORT;
@@ -1077,25 +1130,20 @@ mod state {
         count: u32,
         viewports: *const D3D12_VIEWPORT,
     ) {
-        if let Some(list) = host_list(this) {
-            crate::draw::viewports(list, items(viewports, count));
-        }
+        with_state(this, |list, s| {
+            s.set_viewports(list, items(viewports, count))
+        });
     }
     pub(super) extern "system" fn scissors(this: This, count: u32, rects: *const RECT) {
-        if let Some(list) = host_list(this) {
-            crate::draw::scissors(list, items(rects, count));
-        }
+        with_state(this, |list, s| s.set_scissors(list, items(rects, count)));
     }
     pub(super) extern "system" fn blend_factor(this: This, factor: *const [f32; 4]) {
-        if let Some(list) = host_list(this) {
-            // SAFETY: the title passes four floats or null.
-            crate::draw::blend_factor(list, unsafe { factor.as_ref() });
-        }
+        // SAFETY: the title passes four floats or null.
+        let factor = unsafe { factor.as_ref() };
+        with_state(this, |list, s| s.set_blend_factor(list, factor));
     }
     pub(super) extern "system" fn stencil_ref(this: This, reference: u32) {
-        if let Some(list) = host_list(this) {
-            crate::draw::stencil_ref(list, reference);
-        }
+        with_state(this, |list, s| s.set_stencil_ref(list, reference));
     }
     pub(super) extern "system" fn heaps(this: This, count: u32, heaps: *const This) {
         with_state(this, |_, s| s.set_heaps(items(heaps, count)));
@@ -1413,7 +1461,7 @@ extern "system" fn wait_value(_: This, _address: u64, _comparison: u32, _referen
 extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
     #[cfg(windows)]
     if count > 0
-        && let Some(list) = host_list(this)
+        && let Some(list) = recording_list(this)
     {
         use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
         // SAFETY: the same layout; no resource named.
@@ -1686,3 +1734,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(all(test, windows))]
+#[path = "list/tests/buffer_copy.rs"]
+mod buffer_copy_tests;

@@ -186,17 +186,17 @@ impl Shadow {
         list.defer_gpu_write(self, address as usize, len as usize);
     }
 
-    /// At submission, after the range's refresh: a submitted list's shaders
-    /// write this range. Its bytes are kept to tell later what the GPU wrote:
-    /// one snapshot per copy and submission, grown to cover every range the
-    /// submission declares (the world declares overlapping views of its
-    /// 174 MB heap dozens of times), in reused memory (fresh snapshots cost
-    /// ~2.3 million page faults per world frame).
-    pub(crate) fn writing(&self, address: usize, len: usize) {
+    /// Prevent later CPU refreshes from replacing a pending GPU write.
+    pub(crate) fn queue_write(&self, address: usize, len: usize) {
         self.pending
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .push((address, address + len));
+    }
+
+    /// Once all CPU refreshes are done, keep the bytes the GPU starts with.
+    /// Refreshes can still fill gaps between earlier queued writes.
+    pub(crate) fn snapshot(&self, address: usize, len: usize) {
         let (from, to) = self.inside(address, len);
         // SAFETY: inside the mapping.
         let host =
@@ -301,17 +301,20 @@ impl Shadow {
                 }
             }
         }
-        // Every submitted step that declared the range is done with it (one
-        // submission runs at a time), and the snapshot with the last range.
-        let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
-        pending.retain(|&r| r != (address, address + len));
-        if pending.is_empty()
-            && let Some((_, bytes)) = snapshot.take()
-        {
-            unchanged.clear();
+        written
+    }
+
+    /// After every range from this shadow has been copied back.
+    pub(crate) fn finish_writes(&self) {
+        let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
+        self.pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        before.unchanged.clear();
+        if let Some((_, bytes)) = before.snapshot.take() {
             give_back(bytes);
         }
-        written
     }
 
     /// At submission: copies what changed of `[address, address + len)`
