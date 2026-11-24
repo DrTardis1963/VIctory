@@ -179,10 +179,6 @@ pub fn track(
     // Group accesses in the same loop so a shared mask can select several
     // descriptors together.
     let mut first_lane_at = std::collections::BTreeMap::<usize, (Vec<usize>, Vec<Value>)>::new();
-    // The console compiler's waterfall reads the first lane's table offset
-    // and loads that entry: accesses, offset reads and loads by block.
-    let mut offset_at =
-        std::collections::BTreeMap::<usize, (Vec<usize>, Vec<Value>, Vec<Site>)>::new();
     for (b, block) in p.blocks.iter().enumerate() {
         for (i, inst) in block.insts.iter().enumerate() {
             let site = (b, i);
@@ -191,17 +187,9 @@ pub fn track(
                 what,
             };
             let mut first_lane = Vec::new();
-            let mut offset = Vec::new();
             let mut descriptor = |op: &Operand, role| -> Result<(), ShaderError> {
                 let source = t.descriptor(inst, op, b).map_err(fail)?;
                 first_lane.extend(t.first_lane_words(inst, op).unwrap_or_default());
-                if let Source::Loaded { load, .. } = source
-                    && let Some((_, a)) = out.scalar.iter().find(|s| s.0 == load)
-                    && let Some(Term::Value(v)) = a.dynamic.map(|d| t.origin(d))
-                    && t.first_lane_source(v).is_some()
-                {
-                    offset.push((v, load));
-                }
                 out.descriptors.push(Descriptor { site, role, source });
                 Ok(())
             };
@@ -252,14 +240,6 @@ pub fn track(
                 accesses.push(i);
                 reads.extend(first_lane);
             }
-            if !offset.is_empty() {
-                let (accesses, reads, loads) = offset_at.entry(b).or_default();
-                accesses.push(i);
-                for (v, load) in offset {
-                    reads.push(v);
-                    loads.push(load);
-                }
-            }
         }
     }
     // The proof needs the per-lane form. Without it nothing is emitted, and
@@ -267,27 +247,88 @@ pub fn track(
     if t.lanes.is_none() {
         return Ok(out);
     }
-    for (block, (accesses, mut reads)) in first_lane_at {
-        reads.sort_unstable();
-        reads.dedup();
-        let proof = t
-            .waterfall(block, &accesses, &reads)
-            .map_err(|what| ShaderError::Unsupported {
-                offset: t.inst((block, accesses[0])).machine.offset,
-                what,
-            })?;
-        out.waterfall.compares.extend(proof.compares);
-        out.waterfall.reads.extend(proof.reads);
+    // The console compiler's waterfall reads the first lane's table offset
+    // and loads that entry: collect proven-comparable offset loads across all
+    // descriptor leaves after `out.scalar` and `out.descriptors` are complete.
+    let scalar_by_site: std::collections::HashMap<Site, Address> =
+        out.scalar.iter().copied().collect();
+    let mut offset_at =
+        std::collections::BTreeMap::<usize, (Vec<usize>, Vec<Value>, Vec<Site>)>::new();
+    for d in &out.descriptors {
+        let (b, i) = d.site;
+        for leaf in d.source.leaves() {
+            if let Source::Loaded { load, .. } = *leaf
+                && let Some(a) = scalar_by_site.get(&load)
+                && let Some(Term::Value(v)) = a.dynamic.map(|d| t.origin(d))
+                && t.first_lane_source(v).is_some()
+                && t.offset_compared_at(b, i, v)
+            {
+                let (accesses, reads, loads) = offset_at.entry(b).or_default();
+                accesses.push(i);
+                reads.push(v);
+                loads.push(load);
+            }
+        }
+    }
+    fn push_unique<T: PartialEq>(dst: &mut Vec<T>, src: impl IntoIterator<Item = T>) {
+        for x in src {
+            if !dst.contains(&x) {
+                dst.push(x);
+            }
+        }
+    }
+    let mut record = |proof: Waterfall, loads: Vec<Site>| {
+        push_unique(&mut out.waterfall.compares, proof.compares);
+        push_unique(&mut out.waterfall.reads, proof.reads);
+        push_unique(&mut out.waterfall.loads, loads);
+    };
+    for (block, (mut fl_accesses, mut fl_reads)) in first_lane_at {
+        fl_accesses.sort_unstable();
+        fl_accesses.dedup();
+        fl_reads.sort_unstable();
+        fl_reads.dedup();
+        // When a block narrows EXEC for both first-lane descriptor words and a
+        // first-lane table offset together, prove them in one combined pass.
+        if let Some((off_accesses, off_reads, off_loads)) = offset_at.remove(&block) {
+            let mut all_accesses = fl_accesses.clone();
+            all_accesses.extend(off_accesses);
+            all_accesses.sort_unstable();
+            all_accesses.dedup();
+            let mut all_reads = fl_reads.clone();
+            all_reads.extend(off_reads);
+            all_reads.sort_unstable();
+            all_reads.dedup();
+            if let Ok(proof) = t.waterfall(block, &all_accesses, &all_reads) {
+                record(proof, off_loads);
+                continue;
+            }
+        }
+        let proof =
+            t.waterfall(block, &fl_accesses, &fl_reads)
+                .map_err(|what| ShaderError::Unsupported {
+                    offset: t.inst((block, fl_accesses[0])).machine.offset,
+                    what,
+                })?;
+        record(proof, Vec::new());
     }
     // Unproven, an offset read stays the first lane's (one uniform entry),
     // which is what the hardware reads outside a waterfall loop.
-    for (block, (accesses, mut reads, loads)) in offset_at {
+    for (block, (mut accesses, mut reads, loads)) in offset_at {
+        accesses.sort_unstable();
+        accesses.dedup();
         reads.sort_unstable();
         reads.dedup();
         if let Ok(proof) = t.waterfall(block, &accesses, &reads) {
-            out.waterfall.compares.extend(proof.compares);
-            out.waterfall.reads.extend(proof.reads);
-            out.waterfall.loads.extend(loads);
+            record(proof, loads);
+        }
+    }
+    // Lowering turns every `v_readfirstlane_b32` in `waterfall.reads` into each
+    // lane's own value, so every scalar load using one must also be per-lane.
+    for &(load, a) in &out.scalar {
+        if let Some(Term::Value(v)) = a.dynamic.map(|d| t.origin(d))
+            && out.waterfall.reads.contains(&v)
+        {
+            push_unique(&mut out.waterfall.loads, [load]);
         }
     }
     Ok(out)
@@ -1813,6 +1854,115 @@ impl<'a> Tracer<'a> {
         false
     }
 
+    /// The lane mask for `low` (and `high` in wave64).
+    fn mask_of(
+        &self,
+        lanes: &Structured,
+        low: Option<Value>,
+        high: Option<Value>,
+    ) -> Option<Bool> {
+        let high = if self.p.wave64 { Some(high?) } else { None };
+        lanes.mask_bits(low?, high)
+    }
+
+    /// The `EXEC` mask active when `inst` runs.
+    fn exec_mask(&self, lanes: &Structured, inst: &Inst) -> Option<Bool> {
+        self.mask_of(lanes, inst.read(Reg::S(EXEC)), inst.read(Reg::S(EXEC + 1)))
+    }
+
+    /// A plain `v_cmp_eq_{u32,i32,u64,i64}` or `v_cmpx_eq_*` compare: its
+    /// width in dwords, its two operands, and the lane mask it writes.
+    fn cmp_eq_mask(&self, lanes: &Structured, inst: &Inst) -> Option<(u8, [Operand; 2], Bool)> {
+        let Fields::Valu(f) = &inst.fields else {
+            return None;
+        };
+        let ty = inst
+            .name()
+            .strip_prefix("v_cmp_eq_")
+            .or_else(|| inst.name().strip_prefix("v_cmpx_eq_"))?;
+        let dwords = match ty {
+            "u32" | "i32" => 1,
+            "u64" | "i64" => 2,
+            _ => return None,
+        };
+        if f.abs != 0 || f.neg != 0 || f.sdwa.is_some() || f.dpp.is_some() {
+            return None;
+        }
+        let code = if inst.name().starts_with("v_cmpx_") {
+            EXEC
+        } else if let Some(Operand::Scalar { code, .. }) = f.dst {
+            code
+        } else {
+            return None;
+        };
+        let matched = self.mask_of(lanes, inst.write(Reg::S(code)), inst.write(Reg::S(code + 1)))?;
+        Some((dwords, [*f.src.first()?, *f.src.get(1)?], matched))
+    }
+
+    /// If `first == own` compares consecutive `v_readfirstlane_b32` values in
+    /// `reads` against their lane values, returns those first-lane values.
+    fn matched_first_lane_pair(
+        &self,
+        inst: &Inst,
+        cmp_idx: usize,
+        dwords: u8,
+        first: &Operand,
+        own: &Operand,
+        reads: &[Value],
+    ) -> Option<Vec<Value>> {
+        let (&Operand::Scalar { code, .. }, &Operand::Vector { reg, .. }) = (first, own) else {
+            return None;
+        };
+        (0..dwords)
+            .map(|k| {
+                let Term::Value(x) = self.origin(inst.read(Reg::S(code + k))?) else {
+                    return None;
+                };
+                let lane = inst.read(Reg::V(reg + k))?;
+                let (_, read) = self.defs[x.0 as usize]?;
+                let same = reads.contains(&x)
+                    && read < cmp_idx
+                    && self.lane_term(Term::Value(self.first_lane_source(x)?))
+                        == self.lane_term(Term::Value(lane));
+                same.then_some(x)
+            })
+            .collect()
+    }
+
+    /// Whether the `v_readfirstlane_b32` result `v` is compared against its
+    /// source lane value before `(b, access)` in a way that holds for every
+    /// lane active at the access.
+    fn offset_compared_at(&self, b: usize, access: usize, v: Value) -> bool {
+        let Some(lanes) = self.lanes else {
+            return false;
+        };
+        let Some((def_b, read_idx)) = self.defs[v.0 as usize] else {
+            return false;
+        };
+        if def_b != b || read_idx >= access {
+            return false;
+        }
+        let block = &self.p.blocks[b];
+        let Some(selected) = self.exec_mask(lanes, &block.insts[access]) else {
+            return false;
+        };
+        let reach = (lanes.reach[b], true);
+        let one = [v];
+        block.insts[..access].iter().enumerate().any(|(i, inst)| {
+            let Some((dwords, [a, c], matched)) = self.cmp_eq_mask(lanes, inst) else {
+                return false;
+            };
+            i > read_idx
+                && !meet(lanes, &vec![reach, (selected, true), (matched, false)])
+                && (self
+                    .matched_first_lane_pair(inst, i, dwords, &a, &c, &one)
+                    .is_some()
+                    || self
+                        .matched_first_lane_pair(inst, i, dwords, &c, &a, &one)
+                        .is_some())
+        })
+    }
+
     /// Prove a single-block waterfall at the descriptor access. In each
     /// iteration the access serves exactly the matching lanes, and the
     /// back edge keeps exactly the other lanes active. Otherwise, why not.
@@ -1841,11 +1991,6 @@ impl<'a> Tracer<'a> {
         {
             return Err(LOOP);
         }
-        let mask = |low: Option<Value>, high: Option<Value>| {
-            let high = if self.p.wave64 { Some(high?) } else { None };
-            lanes.mask_bits(low?, high)
-        };
-        let exec = |inst: &Inst| mask(inst.read(Reg::S(EXEC)), inst.read(Reg::S(EXEC + 1)));
         // The reads belong to this loop's own block: a loop around this one
         // (one per operand, as LLVM nests them for a per-lane image and
         // sampler) is not followed.
@@ -1855,19 +2000,20 @@ impl<'a> Tracer<'a> {
         {
             return Err(SPLIT);
         }
-        let selected = exec(&block.insts[access]).ok_or(SELECT)?;
+        let selected = self.exec_mask(lanes, &block.insts[access]).ok_or(SELECT)?;
         if accesses
             .iter()
-            .any(|&i| exec(&block.insts[i]) != Some(selected))
+            .any(|&i| self.exec_mask(lanes, &block.insts[i]) != Some(selected))
         {
             return Err(SELECT);
         }
-        let retry = exec(exit).ok_or(RETRY)?;
+        let retry = self.exec_mask(lanes, exit).ok_or(RETRY)?;
         let first = self.defs[reads[0].0 as usize].ok_or(LOOP)?;
-        let remaining = exec(self.inst(first)).ok_or(SELECT)?;
+        let remaining = self.exec_mask(lanes, self.inst(first)).ok_or(SELECT)?;
         if reads.iter().any(|v| {
-            self.defs[v.0 as usize]
-                .is_none_or(|at| at.1 >= access || exec(self.inst(at)) != Some(remaining))
+            self.defs[v.0 as usize].is_none_or(|at| {
+                at.1 >= access || self.exec_mask(lanes, self.inst(at)) != Some(remaining)
+            })
         }) {
             return Err(SELECT);
         }
@@ -1876,60 +2022,13 @@ impl<'a> Tracer<'a> {
         let mut out = Waterfall::default();
         let mut required = vec![(remaining, true)];
         for (i, inst) in block.insts[..access].iter().enumerate() {
-            let Fields::Valu(f) = &inst.fields else {
+            let Some((dwords, [a, c], matched)) = self.cmp_eq_mask(lanes, inst) else {
                 continue;
             };
-            let Some(ty) = inst
-                .name()
-                .strip_prefix("v_cmp_eq_")
-                .or(inst.name().strip_prefix("v_cmpx_eq_"))
-            else {
-                continue;
-            };
-            let dwords = match ty {
-                "u32" | "i32" => 1,
-                "u64" | "i64" => 2,
-                _ => continue,
-            };
-            if f.abs != 0 || f.neg != 0 || f.sdwa.is_some() || f.dpp.is_some() {
-                continue;
-            }
-            // The first lane's dwords on one side, the lane's own on the
-            // other.
-            let pair = |first: &Operand, own: &Operand| -> Option<Vec<Value>> {
-                let (&Operand::Scalar { code, .. }, &Operand::Vector { reg, .. }) = (first, own)
-                else {
-                    return None;
-                };
-                (0..dwords)
-                    .map(|k| {
-                        let Term::Value(x) = self.origin(inst.read(Reg::S(code + k))?) else {
-                            return None;
-                        };
-                        let lane = inst.read(Reg::V(reg + k))?;
-                        let (_, read) = self.defs[x.0 as usize]?;
-                        let same = reads.contains(&x)
-                            && read < i
-                            && self.lane_term(Term::Value(self.first_lane_source(x)?))
-                                == self.lane_term(Term::Value(lane));
-                        same.then_some(x)
-                    })
-                    .collect()
-            };
-            let (Some(a), Some(c)) = (f.src.first(), f.src.get(1)) else {
-                continue;
-            };
-            if let Some(xs) = pair(a, c).or_else(|| pair(c, a)) {
-                let code = if inst.name().starts_with("v_cmpx_") {
-                    EXEC
-                } else if let Some(Operand::Scalar { code, .. }) = f.dst {
-                    code
-                } else {
-                    continue;
-                };
-                let Some(matched) = mask(inst.write(Reg::S(code)), inst.write(Reg::S(code + 1))) else {
-                    continue;
-                };
+            if let Some(xs) = self
+                .matched_first_lane_pair(inst, i, dwords, &a, &c, reads)
+                .or_else(|| self.matched_first_lane_pair(inst, i, dwords, &c, &a, reads))
+            {
                 if meet(&[reach, (selected, true), (matched, false)]) {
                     continue;
                 }
@@ -3572,5 +3671,313 @@ pub(crate) mod tests {
         assert_eq!(table_offset(&r, other), 0x20);
         assert_eq!(r.waterfall.compares.len(), 2);
         assert_eq!(r.waterfall.reads.len(), 4);
+    }
+
+    /// A single waterfall loop narrowing EXEC for both a per-lane table
+    /// offset (texture) and a per-lane fetched descriptor (sampler).
+    pub(crate) const WATERFALL_MIXED_OFFSET_AND_SAMPLER_WAVE32: &[u32] = &[
+        0xBE84_0300, // s_mov_b32 s4, s0
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0xBE86_0301, // s_mov_b32 s6, s1
+        0xBE87_0380, // s_mov_b32 s7, 0
+        0xF408_0A02,
+        0xFA00_0040, // s_load_dwordx4 s[40:43], s[4:5], 0x40
+        0x7E04_0D00, // v_cvt_f32_u32 v2, v0
+        0x7E06_0302, // v_mov_b32 v3, v2
+        0x3420_0082, // v_lshlrev_b32 v16, 2, v0
+        0x360E_0081, // v_and_b32 v7, 1, v0
+        0x340E_0E85, // v_lshlrev_b32 v7, 5, v7
+        0x3622_0081, // v_and_b32 v17, 1, v0
+        0x3422_2284, // v_lshlrev_b32 v17, 4, v17
+        0xDC38_8000,
+        0x1406_0011, // global_load_dwordx4 v[20:23], v17, s[6:7]
+        0xBF8C_0070, // s_waitcnt vmcnt(0) lgkmcnt(0)
+        0xBE97_037E, // s_mov_b32 s23, exec_lo
+        // L:
+        0x7E28_0507, // v_readfirstlane_b32 s20, v7
+        0x7E10_0514, // v_readfirstlane_b32 s8, v20
+        0x7E12_0515, // v_readfirstlane_b32 s9, v21
+        0x7E14_0516, // v_readfirstlane_b32 s10, v22
+        0x7E16_0517, // v_readfirstlane_b32 s11, v23
+        0xD4C2_0015,
+        0x0002_0E14, // v_cmp_eq_u32_e64 s21, s20, v7
+        0xD4E2_0016,
+        0x0002_2808, // v_cmp_eq_u64_e64 s22, s[8:9], v[20:21]
+        0x8715_1615, // s_and_b32 s21, s21, s22
+        0xD4E2_0016,
+        0x0002_2C0A, // v_cmp_eq_u64_e64 s22, s[10:11], v[22:23]
+        0x8715_1615, // s_and_b32 s21, s21, s22
+        0xBE95_3C15, // s_and_saveexec_b32 s21, s21
+        0xF40C_0302,
+        0x2800_0000, // s_load_dwordx8 s[12:19], s[4:5], s20
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xF09C_0F08,
+        0x0043_0C02, // image_sample_lz v[12:15], v[2:3], s[12:19], s[8:11] dmask:0xf dim:2D
+        0xBF8C_3F70, // s_waitcnt vmcnt(0)
+        0x897E_157E, // s_xor_b32 exec_lo, exec_lo, s21
+        0xBF89_FFEA, // s_cbranch_execnz -> L
+        0xBEFE_0317, // s_mov_b32 exec_lo, s23
+        0xE070_1000,
+        0x800A_0C10, // buffer_store_dword v12, v16, s[40:43], 0 offen
+        S_ENDPGM,
+    ];
+
+    /// [`WATERFALL_INDEXED_WAVE32`] with the sampler loaded before the loop at
+    /// a `v_readfirstlane_b32` table offset (uniform across the loop).
+    pub(crate) const WATERFALL_INDEXED_WITH_PRELOOP_OFFSET_SAMPLER_WAVE32: &[u32] = &[
+        0xBE84_0300, // s_mov_b32 s4, s0
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0xBE86_0301, // s_mov_b32 s6, s1
+        0xBE87_0380, // s_mov_b32 s7, 0
+        0x3622_0080, // v_and_b32 v17, 0, v0
+        0x7E2C_0511, // v_readfirstlane_b32 s22, v17
+        0xF408_0203,
+        0x2C00_0000, // s_load_dwordx4 s[8:11], s[6:7], s22
+        0xF408_0A02,
+        0xFA00_0040, // s_load_dwordx4 s[40:43], s[4:5], 0x40
+        0x7E04_0D00, // v_cvt_f32_u32 v2, v0
+        0x7E06_0302, // v_mov_b32 v3, v2
+        0x3420_0082, // v_lshlrev_b32 v16, 2, v0
+        0x360E_0081, // v_and_b32 v7, 1, v0
+        0x340E_0E85, // v_lshlrev_b32 v7, 5, v7
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xBE97_037E, // s_mov_b32 s23, exec_lo
+        0xBE95_037E, // s_mov_b32 s21, exec_lo
+        // L:
+        0x7E28_0507, // v_readfirstlane_b32 s20, v7
+        0x7DA4_0E14, // v_cmpx_eq_u32 exec_lo, s20, v7
+        0xF40C_0302,
+        0x2800_0000, // s_load_dwordx8 s[12:19], s[4:5], s20
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xF09C_0F08,
+        0x0043_0C02, // image_sample_lz v[12:15], v[2:3], s[12:19], s[8:11] dmask:0xf dim:2D
+        0xBF8C_3F70, // s_waitcnt vmcnt(0)
+        0xBE95_4715, // s_andn2_wrexec_b32 s21, s21
+        0xBF89_FFF6, // s_cbranch_execnz -> L
+        0xBEFE_0317, // s_mov_b32 exec_lo, s23
+        0xE070_1000,
+        0x800A_0C10, // buffer_store_dword v12, v16, s[40:43], 0 offen
+        S_ENDPGM,
+    ];
+
+    /// [`WATERFALL_INDEXED_WAVE32`] where `s_cselect_b64` (controlled by root
+    /// constant `s2`) selects between the waterfall-offset texture load and a
+    /// preloaded uniform texture descriptor before `image_sample_lz`.
+    pub(crate) const WATERFALL_INDEXED_SELECT_WAVE32: &[u32] = &[
+        0xBE84_0300, // s_mov_b32 s4, s0
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0xBE86_0301, // s_mov_b32 s6, s1
+        0xBE87_0380, // s_mov_b32 s7, 0
+        0xF408_0203,
+        0xFA00_0000, // s_load_dwordx4 s[8:11], s[6:7], 0x0
+        0xF408_0A02,
+        0xFA00_0040, // s_load_dwordx4 s[40:43], s[4:5], 0x40
+        0xF40C_0602,
+        0xFA00_0020, // s_load_dwordx8 s[24:31], s[4:5], 0x20
+        0x7E04_0D00, // v_cvt_f32_u32 v2, v0
+        0x7E06_0302, // v_mov_b32 v3, v2
+        0x3420_0082, // v_lshlrev_b32 v16, 2, v0
+        0x360E_0081, // v_and_b32 v7, 1, v0
+        0x340E_0E85, // v_lshlrev_b32 v7, 5, v7
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xBE97_037E, // s_mov_b32 s23, exec_lo
+        0xBE95_037E, // s_mov_b32 s21, exec_lo
+        // L:
+        0x7E28_0507, // v_readfirstlane_b32 s20, v7
+        0x7DA4_0E14, // v_cmpx_eq_u32 exec_lo, s20, v7
+        0xF40C_0802,
+        0x2800_0000, // s_load_dwordx8 s[32:39], s[4:5], s20
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xBF06_8002, // s_cmp_eq_u32 s2, 0
+        0x858C_1820, // s_cselect_b64 s[12:13], s[32:33], s[24:25]
+        0x858E_1A22, // s_cselect_b64 s[14:15], s[34:35], s[26:27]
+        0x8590_1C24, // s_cselect_b64 s[16:17], s[36:37], s[28:29]
+        0x8592_1E26, // s_cselect_b64 s[18:19], s[38:39], s[30:31]
+        0xF09C_0F08,
+        0x0043_0C02, // image_sample_lz v[12:15], v[2:3], s[12:19], s[8:11] dmask:0xf dim:2D
+        0xBF8C_3F70, // s_waitcnt vmcnt(0)
+        0xBE95_4715, // s_andn2_wrexec_b32 s21, s21
+        0xBF89_FFF0, // s_cbranch_execnz -> L
+        0xBEFE_0317, // s_mov_b32 exec_lo, s23
+        0xE070_1000,
+        0x800A_0C10, // buffer_store_dword v12, v16, s[40:43], 0 offen
+        S_ENDPGM,
+    ];
+
+    #[test]
+    fn mixed_waterfall_over_offset_and_first_lane_descriptor_is_proven() {
+        let r = waterfall(WATERFALL_MIXED_OFFSET_AND_SAMPLER_WAVE32, false).unwrap();
+        let image = r
+            .descriptors
+            .iter()
+            .find(|d| d.role == Role::Resource)
+            .unwrap();
+        let Source::Loaded { load, first: 0 } = image.source else {
+            panic!("{:?}", image.source);
+        };
+        assert_eq!(r.waterfall.compares.len(), 3);
+        assert_eq!(r.waterfall.reads.len(), 5);
+        assert_eq!(r.waterfall.loads, [load]);
+    }
+
+    #[test]
+    fn cross_block_uniform_offset_load_does_not_poison_waterfall() {
+        let r = waterfall(WATERFALL_INDEXED_WITH_PRELOOP_OFFSET_SAMPLER_WAVE32, false).unwrap();
+        let image = r
+            .descriptors
+            .iter()
+            .find(|d| d.role == Role::Resource)
+            .unwrap();
+        let sampler = r
+            .descriptors
+            .iter()
+            .find(|d| d.role == Role::Sampler)
+            .unwrap();
+        let Source::Loaded { load: tex_load, .. } = image.source else {
+            panic!("{:?}", image.source);
+        };
+        let Source::Loaded { load: samp_load, .. } = sampler.source else {
+            panic!("{:?}", sampler.source);
+        };
+        assert_ne!(tex_load, samp_load);
+        assert_eq!(r.waterfall.compares.len(), 1);
+        assert_eq!(r.waterfall.reads.len(), 1);
+        assert_eq!(r.waterfall.loads, [tex_load]);
+    }
+
+    #[test]
+    fn uncompared_in_block_offset_load_does_not_poison_waterfall() {
+        let words = [
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xBE86_0301, // s_mov_b32 s6, s1
+            0xBE87_0380, // s_mov_b32 s7, 0
+            0xF408_0A02,
+            0xFA00_0040, // s_load_dwordx4 s[40:43], s[4:5], 0x40
+            0x7E04_0D00, // v_cvt_f32_u32 v2, v0
+            0x7E06_0302, // v_mov_b32 v3, v2
+            0x3420_0082, // v_lshlrev_b32 v16, 2, v0
+            0x360E_0081, // v_and_b32 v7, 1, v0
+            0x340E_0E85, // v_lshlrev_b32 v7, 5, v7
+            0x3622_0080, // v_and_b32 v17, 0, v0
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0xBE97_037E, // s_mov_b32 s23, exec_lo
+            0xBE95_037E, // s_mov_b32 s21, exec_lo
+            // L:
+            0x7E28_0507, // v_readfirstlane_b32 s20, v7
+            0x7DA4_0E14, // v_cmpx_eq_u32 exec_lo, s20, v7
+            0xF40C_0302,
+            0x2800_0000, // s_load_dwordx8 s[12:19], s[4:5], s20
+            0x7E2C_0511, // v_readfirstlane_b32 s22, v17 (uncompared)
+            0xF408_0203,
+            0x2C00_0000, // s_load_dwordx4 s[8:11], s[6:7], s22
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0xF09C_0F08,
+            0x0043_0C02, // image_sample_lz v[12:15], v[2:3], s[12:19], s[8:11] dmask:0xf dim:2D
+            0xBF8C_3F70, // s_waitcnt vmcnt(0)
+            0xBE95_4715, // s_andn2_wrexec_b32 s21, s21
+            0xBF89_FFF3, // s_cbranch_execnz -> L
+            0xBEFE_0317, // s_mov_b32 exec_lo, s23
+            0xE070_1000,
+            0x800A_0C10, // buffer_store_dword v12, v16, s[40:43], 0 offen
+            S_ENDPGM,
+        ];
+        let r = waterfall(&words, false).unwrap();
+        let image = r
+            .descriptors
+            .iter()
+            .find(|d| d.role == Role::Resource)
+            .unwrap();
+        let Source::Loaded { load: tex_load, .. } = image.source else {
+            panic!("{:?}", image.source);
+        };
+        assert_eq!(r.waterfall.compares.len(), 1);
+        assert_eq!(r.waterfall.reads.len(), 1);
+        assert_eq!(r.waterfall.loads, [tex_load]);
+    }
+
+    #[test]
+    fn select_wrapped_waterfall_offset_load_is_proven() {
+        let code: Vec<u8> = WATERFALL_INDEXED_SELECT_WAVE32
+            .iter()
+            .flat_map(|w| w.to_le_bytes())
+            .collect();
+        let p = crate::ir::build(&code, false, 256).unwrap();
+        let layout = [
+            param(Table, 0, 1),
+            param(Table, 1, 1),
+            param(Constants, 2, 1),
+        ];
+        let r = track(&p, &layout, HwStage::Cs, lanes(&p).as_ref()).unwrap();
+        let image = r
+            .descriptors
+            .iter()
+            .find(|d| d.role == Role::Resource)
+            .unwrap();
+        let Source::Select { args, .. } = &image.source else {
+            panic!("{:?}", image.source);
+        };
+        let Source::Loaded { load: wf_load, .. } = args[0] else {
+            panic!("{args:?}");
+        };
+        assert_eq!(r.waterfall.compares.len(), 1);
+        assert_eq!(r.waterfall.reads.len(), 1);
+        assert_eq!(r.waterfall.loads, [wf_load]);
+    }
+
+    #[test]
+    fn second_scalar_load_sharing_proven_waterfall_offset_is_marked_per_lane() {
+        let words = [
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xBE86_0301, // s_mov_b32 s6, s1
+            0xBE87_0380, // s_mov_b32 s7, 0
+            0xF408_0203,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[6:7], 0x0
+            0xF408_0A02,
+            0xFA00_0040, // s_load_dwordx4 s[40:43], s[4:5], 0x40
+            0x7E04_0D00, // v_cvt_f32_u32 v2, v0
+            0x7E06_0302, // v_mov_b32 v3, v2
+            0x3420_0082, // v_lshlrev_b32 v16, 2, v0
+            0x360E_0081, // v_and_b32 v7, 1, v0
+            0x340E_0E85, // v_lshlrev_b32 v7, 5, v7
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0xBE97_037E, // s_mov_b32 s23, exec_lo
+            0xBE95_037E, // s_mov_b32 s21, exec_lo
+            // L:
+            0x7E28_0507, // v_readfirstlane_b32 s20, v7
+            0x7DA4_0E14, // v_cmpx_eq_u32 exec_lo, s20, v7
+            0xF40C_0302,
+            0x2800_0000, // s_load_dwordx8 s[12:19], s[4:5], s20
+            0xF40C_0602,
+            0x2800_0000, // s_load_dwordx8 s[24:31], s[4:5], s20 (data reload)
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0xD54E_0008,
+            0x0278_321A, // v_alignbit_b32 v8, s26, s25, 30
+            0xF09C_0F08,
+            0x0043_0C02, // image_sample_lz v[12:15], v[2:3], s[12:19], s[8:11] dmask:0xf dim:2D
+            0xBF8C_3F70, // s_waitcnt vmcnt(0)
+            0xBE95_4715, // s_andn2_wrexec_b32 s21, s21
+            0xBF89_FFF2, // s_cbranch_execnz -> L
+            0xBEFE_0317, // s_mov_b32 exec_lo, s23
+            0xE070_1000,
+            0x800A_0C10, // buffer_store_dword v12, v16, s[40:43], 0 offen
+            0xE070_1000,
+            0x800A_0810, // buffer_store_dword v8, v16, s[40:43], 0 offen
+            S_ENDPGM,
+        ];
+        let r = waterfall(&words, false).unwrap();
+        let read = r.waterfall.reads[0];
+        let mut expected_loads: Vec<Site> = r
+            .scalar
+            .iter()
+            .filter(|(_, a)| a.dynamic == Some(read))
+            .map(|(s, _)| *s)
+            .collect();
+        expected_loads.sort_unstable();
+        let mut actual_loads = r.waterfall.loads.clone();
+        actual_loads.sort_unstable();
+        assert_eq!(actual_loads.len(), 2);
+        assert_eq!(actual_loads, expected_loads);
     }
 }

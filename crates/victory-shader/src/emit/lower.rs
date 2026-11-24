@@ -4787,7 +4787,8 @@ impl<'a> Lower<'a> {
                 let phi = self.s.m.phi(join, self.s.t.i32);
                 self.s.m.set_phi(phi, incoming);
                 let index = self.buffer_guard(src, phi, sampler, props);
-                Ok(self.s.heap_handle(self.cur, index, sampler, false, props))
+                let per_lane = self.is_waterfall_load(src);
+                Ok(self.s.heap_handle(self.cur, index, sampler, per_lane, props))
             }
             Source::Select { scc, args } => {
                 // The heap index of each choice, picked by SCC (uniform).
@@ -4806,7 +4807,8 @@ impl<'a> Lower<'a> {
                 let clear = self.heap_index(b, fb, sampler)?;
                 let index = self.s.m.select(self.cur, cond, set, clear);
                 let index = self.buffer_guard(src, index, sampler, props);
-                Ok(self.s.heap_handle(self.cur, index, sampler, false, props))
+                let per_lane = self.is_waterfall_load(src);
+                Ok(self.s.heap_handle(self.cur, index, sampler, per_lane, props))
             }
             Source::Fetched { .. } | Source::Lanes { .. } | Source::LanePhi { .. } => {
                 // A descriptor each lane has its own of (a waterfall loop
@@ -4848,6 +4850,13 @@ impl<'a> Lower<'a> {
         let null = super::NULL_BUFFER_VIEW - u32::from(props.0 & 0x1000 != 0);
         let null = self.s.m.i32(null);
         self.s.m.select(c, none, null, index)
+    }
+
+    /// Whether any leaf load of `src` is a proven waterfall table-offset load.
+    fn is_waterfall_load(&self, src: &Source) -> bool {
+        src.leaves().iter().any(|l| {
+            matches!(l, Source::Loaded { load, .. } if self.x.res.waterfall.loads.contains(load))
+        })
     }
 
     /// Whether a descriptor comes from the resource heap itself (root type
@@ -9984,6 +9993,59 @@ mod tests {
             assert_eq!(l.nonuniform_handles, 1);
             assert!(!l.wave_ops);
         }
+    }
+
+    fn validate_dxil(dxil: &[u8]) {
+        #[cfg(windows)]
+        {
+            if let Ok(mut v) =
+                crate::emit::validator::Validator::load(crate::emit::validator::Validator::default_path().as_deref())
+            {
+                v.validate(&mut dxil.to_vec())
+                    .expect("DXIL validation failed");
+            } else {
+                eprintln!("no dxil.dll; validation skipped");
+            }
+        }
+        #[cfg(not(windows))]
+        let _ = dxil;
+    }
+
+    #[test]
+    fn mixed_waterfall_over_offset_and_first_lane_descriptor_lowers() {
+        use crate::resource::tests::WATERFALL_MIXED_OFFSET_AND_SAMPLER_WAVE32;
+        let (layout, used) = texture_and_uav_tables();
+        let l = lower_wave(WATERFALL_MIXED_OFFSET_AND_SAMPLER_WAVE32, layout, used, false).unwrap();
+        assert_eq!(l.nonuniform_handles, 2);
+        assert!(!l.wave_ops);
+        validate_dxil(&l.dxil);
+    }
+
+    #[test]
+    fn select_wrapped_waterfall_offset_lowers_with_nonuniform_handle() {
+        use crate::resource::tests::WATERFALL_INDEXED_SELECT_WAVE32;
+        let (mut layout, used) = texture_and_uav_tables();
+        layout.push(root(RootType::Constants, 2, 2));
+        let l = lower_wave(WATERFALL_INDEXED_SELECT_WAVE32, layout, used, false).unwrap();
+        // Both the waterfall load's size/descriptor handle and the `Source::Select` image handle are non-uniform.
+        assert_eq!(l.nonuniform_handles, 2);
+        assert!(!l.wave_ops);
+        validate_dxil(&l.dxil);
+    }
+
+    #[test]
+    fn cross_block_uniform_offset_load_keeps_waterfall_texture_nonuniform() {
+        use crate::resource::tests::WATERFALL_INDEXED_WITH_PRELOOP_OFFSET_SAMPLER_WAVE32;
+        let (layout, used) = texture_and_uav_tables();
+        let l = lower_wave(
+            WATERFALL_INDEXED_WITH_PRELOOP_OFFSET_SAMPLER_WAVE32,
+            layout,
+            used,
+            false,
+        )
+        .unwrap();
+        assert_eq!(l.nonuniform_handles, 1);
+        validate_dxil(&l.dxil);
     }
 
     #[test]
