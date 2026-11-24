@@ -1582,16 +1582,28 @@ pub(crate) fn let_go_idle() {
         // Held from the look to the removal: `loose` hands a copy out
         // under the same lock, so none is handed out in between.
         let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+        // A window may stand under several keys: the table holds it once
+        // per key, so it is alone when only those keys hold it (it was never
+        // let go before). Port of fxceless #194's window part.
+        let mut keys: std::collections::HashMap<usize, usize> = std::collections::HashMap::with_capacity(map.len());
+        for s in map.values() {
+            *keys.entry(Arc::as_ptr(s) as usize).or_insert(0) += 1;
+        }
         let idle: Vec<(u64, u64)> = map
             .iter()
             .filter(|(_, s)| {
-                Arc::strong_count(s) == 1
+                Arc::strong_count(s) == keys[&(Arc::as_ptr(s) as usize)]
                     && crate::host::long_ago(s.used.load(Ordering::Relaxed), IDLE_MS, IDLE_FRAMES)
                     && crate::host::references(&s.buffer) == 1
+                    && !s.writes_pending()
             })
             .map(|(key, _)| *key)
             .collect();
-        idle.into_iter().filter_map(|key| map.remove(&key)).collect()
+        let mut seen = std::collections::HashSet::new();
+        idle.into_iter()
+            .filter_map(|key| map.remove(&key))
+            .filter(|s| seen.insert(Arc::as_ptr(s) as usize))
+            .collect()
     };
     if !gone.is_empty() {
         let (went, bytes) = (gone.len(), gone.iter().map(|s| s.len).sum::<u64>());

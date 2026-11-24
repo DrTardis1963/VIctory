@@ -1321,6 +1321,20 @@ fn hosted(this: This, make: bool) -> Option<Made> {
         return None;
     }
     let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
+    if made.is_none() && make && !fills(&r.desc) && !r.host.refused.load(Relaxed) {
+        // Looked for without this texture's lock: the sweep takes the table
+        // of textures before each texture's.
+        drop(made);
+        let shared = same_target(this);
+        made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
+        if made.is_none()
+            && let Some(shared) = shared
+        {
+            *made = Some(shared);
+            SHARED_TARGETS.fetch_add(1, Relaxed);
+            crate::descriptor::texture_made(this as usize);
+        }
+    }
     if made.is_none() {
         if !make || r.host.refused.load(Relaxed) {
             return None;
@@ -1367,6 +1381,44 @@ fn hosted(this: This, make: bool) -> Option<Made> {
     }
     r.host.used.store(crate::host::moment(), Relaxed);
     made.clone()
+}
+
+/// Host copies of targets, depth and unordered access textures taken from
+/// another title texture at the same address with the same description
+/// ([`same_target`]) since the start, for the memory line.
+#[cfg(windows)]
+pub(crate) static SHARED_TARGETS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The host side of another title texture the host renders to or writes
+/// that lies at the same address as `this` with the same description, if
+/// one has a host copy. On the console the two are the same bytes in the
+/// same layout, so they share one host copy (and twin): the host made one
+/// for each, which doubled the card's memory for them and kept what one
+/// drew from the other. `VICTORY_SHARE_TARGETS=0`: none is shared.
+#[cfg(windows)]
+fn same_target(this: This) -> Option<Made> {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_SHARE_TARGETS").is_none_or(|v| v != "0")) {
+        return None;
+    }
+    let r = resource(this);
+    if matches!(r.backing, Backing::Committed(_)) {
+        return None;
+    }
+    let words = |d: &ResourceDesc| {
+        // SAFETY: 56 bytes in the description's layout.
+        unsafe { std::ptr::from_ref(d).cast::<[u32; 14]>().read_unaligned() }
+    };
+    let (at, desc) = (r.data(), words(&r.desc));
+    let all = textures();
+    all.iter().filter(|&&o| o != this as usize).find_map(|&o| {
+        // SAFETY: as in `let_go_idle`, under the table's lock.
+        let o = unsafe { &*(o as *const Resource) };
+        if fills(&o.desc) || o.data() != at || words(&o.desc) != desc {
+            return None;
+        }
+        o.host.made.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    })
 }
 
 /// The host copy of title texture `this` if it is made, without making it
@@ -1538,12 +1590,15 @@ pub(crate) fn census() -> [u64; 10] {
     const EVERY: u64 = 16;
     let mut count = [0u64; 10];
     let mut placed_filled = 0u64;
+    let mut seen = std::collections::HashSet::new();
     let all = textures();
     for &at in all.iter() {
         // SAFETY: as in `let_go_idle`.
         let r = unsafe { &*(at as *const Resource) };
         let made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
         match made.as_ref() {
+            // A host copy shared by title textures ([`same_target`]) once.
+            Some((host, _)) if !seen.insert(std::sync::Arc::as_ptr(host) as usize) => {}
             Some((host, twin)) => {
                 let kind = if host.filled { 4 } else { 0 };
                 count[kind] += 1;
@@ -1587,6 +1642,7 @@ pub(crate) fn target_census() -> [u64; 6] {
     use std::sync::atomic::Ordering::Relaxed;
     // (title start, title end, host bytes, description words)
     let mut made: Vec<(u64, u64, u64, [u32; 14])> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
     for &at in textures().iter() {
         // SAFETY: as in `let_go_idle`.
         let r = unsafe { &*(at as *const Resource) };
@@ -1595,6 +1651,9 @@ pub(crate) fn target_census() -> [u64; 6] {
         }
         let lock = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
         let Some((host, twin)) = lock.as_ref() else { continue };
+        if !seen.insert(std::sync::Arc::as_ptr(host) as usize) {
+            continue;
+        }
         let start = r.data() as u64;
         let size = footprint(&r.desc).map_or(0, |f| f.size).max(1);
         // SAFETY: 56 bytes in the description's layout.
