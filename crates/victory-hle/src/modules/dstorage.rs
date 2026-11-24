@@ -508,7 +508,7 @@ impl Lanes {
         let lane = self.lanes.get_mut(&id)?;
         let &(seq, request) = lane.reads.front()?;
         let staging = staging_bytes(&request);
-        if self.staged > 0 && self.staged + staging > self.staging {
+        if staging > 0 && self.staged > 0 && self.staged + staging > self.staging {
             self.starved = true;
             self.refused += 1;
             return None;
@@ -922,6 +922,9 @@ fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
     let file = &unsafe { &*request.source.cast::<Instance<File>>() }
         .state
         .file;
+    if request.offset.checked_add(out.len() as u64).is_none() {
+        return Err(END_OF_FILE);
+    }
     let started = std::time::Instant::now();
     let mut done = 0;
     let result = loop {
@@ -1541,5 +1544,64 @@ mod tests {
         }
         assert_eq!(xmem::XMemFreePhysicalPages(3, a.as_ptr()), 1);
         assert_eq!(xmem::XMemFreePhysicalPages(1, b.as_ptr()), 1);
+    }
+
+    #[test]
+    fn zero_staging_requests_run_even_when_staging_is_full() {
+        let mut lane = Lane::new(0, 8);
+        let mut buf = [0u8; 512];
+        let src = buf.as_ptr().cast();
+        let dst = buf.as_mut_ptr().cast();
+        lane.reads.push_back((0, request(0, dst, 256, src, 0, 256)));
+        lane.reads
+            .push_back((1, request(ZLIB | MEMORY_SOURCE, dst, 512, src, 0, 256)));
+        lane.reads
+            .push_back((2, request(ZLIB, dst, 128, src, 0, 64)));
+        let mut lanes = Lanes {
+            lanes: HashMap::from([(0, lane)]),
+            next_id: 1,
+            next_seq: 3,
+            staged: 2048,
+            staging: 1024,
+            starved: false,
+            clock: [0; 3],
+            now: 0,
+            lane_now: [0; 3],
+            done: Default::default(),
+            refused: 0,
+            bcpack: Default::default(),
+            since: None,
+        };
+        let first = lanes.start().expect("raw read uses zero staging");
+        assert_eq!(first.seq, 0);
+        assert_eq!(first.staging, 0);
+        assert_eq!(lanes.staged, 2048);
+
+        let second = lanes
+            .start()
+            .expect("memory-source compressed read uses zero staging");
+        assert_eq!(second.seq, 1);
+        assert_eq!(second.staging, 0);
+        assert_eq!(lanes.staged, 2048);
+
+        assert!(
+            lanes.start().is_none(),
+            "buffered read must still wait when staging is full"
+        );
+        assert!(lanes.starved);
+    }
+
+    #[test]
+    fn file_read_overflowing_u64_offset_returns_eof() {
+        let (_dir, file) = file_with(b"hello world");
+        let (queue, array) = (new_queue(0), status_array(1));
+        let mut out = [0u8; 8];
+        enqueue(
+            queue,
+            &request(0, out.as_mut_ptr().cast(), out.len(), file, u64::MAX - 2, out.len()),
+        );
+        enqueue_status(queue, array, 0);
+        void(queue, 0x30);
+        assert_eq!(wait(array, 0), END_OF_FILE);
     }
 }
