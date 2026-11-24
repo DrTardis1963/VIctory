@@ -58,6 +58,8 @@ mod watch;
 
 #[cfg(windows)]
 pub use host::on_failure;
+#[cfg(all(windows, target_arch = "x86_64"))]
+pub use host::write_title_memory;
 #[cfg(windows)]
 pub use inplace::{title_memory_freeing, title_memory_section, title_memory_view};
 #[cfg(windows)]
