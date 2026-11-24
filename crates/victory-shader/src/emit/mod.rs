@@ -86,6 +86,8 @@ pub mod host;
 mod lower;
 mod sampler;
 mod shader;
+#[cfg(all(test, windows))]
+mod split_tests;
 #[cfg(windows)]
 pub mod validator;
 #[cfg(all(test, windows))]
@@ -313,7 +315,7 @@ pub fn emit(
         }
         _ => 0,
     };
-    let l = lower::lower(&lower::Parts {
+    let mut parts = lower::Parts {
         native,
         p,
         st,
@@ -324,7 +326,17 @@ pub fn emit(
         prims,
         mesh_stride,
         target,
-    })?;
+        console_cf: false,
+    };
+    let l = match lower::lower(&parts) {
+        Err(ShaderError::Unsupported { what, .. }) if what == lower::CONSOLE_FLOW => {
+            let console = structure::structure_console(p)?;
+            parts.st = &console;
+            parts.console_cf = true;
+            lower::lower(&parts)?
+        }
+        l => l?,
+    };
     Ok(HostShader {
         stage: native.stage,
         dxil: l.dxil,
@@ -645,7 +657,12 @@ mod tests {
     }
 
     /// A compute program of 64 threads in one group: `words` as GFX10 code.
-    fn compute(words: &[u32], wave64: bool) -> crate::NativeProgram {
+    pub(super) fn compute(words: &[u32], wave64: bool) -> crate::NativeProgram {
+        compute_of(words, wave64, 64)
+    }
+
+    /// [`compute`] with `threads` threads in the group.
+    pub(super) fn compute_of(words: &[u32], wave64: bool, threads: u32) -> crate::NativeProgram {
         crate::NativeProgram {
             stage: crate::HwStage::Cs,
             wave64,
@@ -654,13 +671,13 @@ mod tests {
             used: vec![],
             io: crate::native::StageIo::Cs(crate::native::ComputeIo {
                 rsrc2: 0,
-                threads: [64, 1, 1],
+                threads: [threads, 1, 1],
             }),
             code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
         }
     }
 
-    fn emit_for(
+    pub(super) fn emit_for(
         native: &crate::NativeProgram,
         target: Target,
     ) -> Result<super::HostShader, crate::ShaderError> {
@@ -693,11 +710,16 @@ mod tests {
             0x7E02_0200, // v_mov_b32 v1, s0
             0xBF81_0000, // s_endpgm
         ];
+        // One console wave per group: in the console flow on NVIDIA.
         let wave64 = compute(&words, true);
         assert!(emit_for(&wave64, Target::ANY).is_ok());
         assert!(emit_for(&wave64, RDNA).is_ok());
+        assert!(emit_for(&wave64, NVIDIA).is_ok());
+        // Two per group: the halves cannot meet at a group barrier yet.
+        let two = compute_of(&words, true, 128);
+        assert!(emit_for(&two, RDNA).is_ok());
         assert_eq!(
-            emit_for(&wave64, NVIDIA),
+            emit_for(&two, NVIDIA),
             Err(crate::ShaderError::Unsupported {
                 offset: 0,
                 what: "console wave64 lanes on a host without 64-lane waves",
@@ -720,7 +742,7 @@ mod tests {
         eprintln!("host waves {}-{}", target.lanes_min, target.lanes_max);
         let words = [0xD760_0000, 0x0001_0B00, 0x7E02_0200, 0xBF81_0000];
         for wave64 in [false, true] {
-            match emit_for(&compute(&words, wave64), target) {
+            match emit_for(&compute_of(&words, wave64, 128), target) {
                 Ok(cs) => {
                     if let Err(e) = host.compute_pipeline(&cs) {
                         panic!("wave64 {wave64}: translated for the host, refused by it: {e}");
@@ -730,9 +752,44 @@ mod tests {
                     assert!(wave64 && !target.runs(64), "{e}");
                     // What it replaces: the host refuses the console's
                     // wave size at pipeline creation.
-                    let any = emit_for(&compute(&words, true), Target::ANY).unwrap();
+                    let any = emit_for(&compute_of(&words, true, 128), Target::ANY).unwrap();
                     assert!(host.compute_pipeline(&any).is_err());
                 }
+            }
+        }
+    }
+
+    /// On every hardware adapter: a wave64 program that reads other lanes
+    /// translates in groups of one console wave (natively or in the console
+    /// flow) and the adapter takes it; in groups of two it translates
+    /// exactly when the adapter runs 64-lane waves. On a machine with an AMD
+    /// and an NVIDIA GPU this checks both answers.
+    #[test]
+    #[cfg(windows)]
+    fn each_adapter_gets_what_it_runs() {
+        let Ok(names) = super::host::adapters() else {
+            eprintln!("no DXGI; skipped");
+            return;
+        };
+        let words = [0xD760_0000, 0x0001_0B00, 0x7E02_0200, 0xBF81_0000];
+        for name in names {
+            let Ok(host) = super::host::Host::on(&name) else {
+                eprintln!("{name}: no SM 6.6 device; skipped");
+                continue;
+            };
+            let target = host.target();
+            eprintln!("{name}: waves {}-{}", target.lanes_min, target.lanes_max);
+            let one =
+                emit_for(&compute(&words, true), target).unwrap_or_else(|e| panic!("{name}: {e}"));
+            host.compute_pipeline(&one)
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
+            match emit_for(&compute_of(&words, true, 128), target) {
+                Ok(cs) => {
+                    assert!(target.runs(64), "{name}");
+                    host.compute_pipeline(&cs)
+                        .unwrap_or_else(|e| panic!("{name}: {e}"));
+                }
+                Err(_) => assert!(!target.runs(64), "{name}"),
             }
         }
     }
