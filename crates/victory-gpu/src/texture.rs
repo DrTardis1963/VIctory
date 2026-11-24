@@ -415,6 +415,48 @@ pub(crate) static UNLOCKED: [std::sync::atomic::AtomicU64; 2] = [const { std::sy
 /// These say for what.
 pub(crate) static REFRESH_WAITS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
+/// Of the frame's texture checks, the microseconds a frame they may take
+/// before the rest wait for the next frame (`VICTORY_TEXTURE_BUDGET_MS`,
+/// 10 by default; 0: no limit). When a burst of new textures arrives (the
+/// opening cutscene, 100-200 MB a frame) it is spread over several frames
+/// instead of one frame taking all of it; a texture left for later is drawn
+/// with what its host copy has (zeros for one never filled: the staging
+/// buffer starts zeroed), never with half-detiled bytes.
+fn budget_us() -> u64 {
+    static US: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    if cfg!(test) {
+        return 0;
+    }
+    *US.get_or_init(|| {
+        let ms = std::env::var("VICTORY_TEXTURE_BUDGET_MS")
+            .ok()
+            .and_then(|v| v.trim().parse::<f64>().ok())
+            .unwrap_or(10.0);
+        (ms.max(0.0) * 1000.0) as u64
+    })
+}
+
+/// The frame the texture checks' time in [`SPENT`] is of, and that time.
+static SPENT: Mutex<(u64, u64)> = Mutex::new((0, 0));
+
+/// Since the last frame-rate line: texture checks left for the next frame
+/// by [`budget_us`].
+pub(crate) static DEFERRED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Adds `us` to `spent`, the time of frame `spent.0`'s checks (begun anew
+/// when `frame` is another); false (and nothing added) if that time had
+/// reached `budget` (0: no limit).
+fn within_budget(spent: &mut (u64, u64), frame: u64, us: u64, budget: u64) -> bool {
+    if spent.0 != frame {
+        *spent = (frame, 0);
+    }
+    if budget != 0 && spent.1 >= budget {
+        return false;
+    }
+    spent.1 += us;
+    true
+}
+
 /// `f`'s result, its time added to [`REFRESH_WAITS`]' place `slot`.
 fn waited<T>(slot: usize, f: impl FnOnce() -> T) -> T {
     let started = std::time::Instant::now();
@@ -732,10 +774,19 @@ impl Staging {
     /// since the last time (and is mapped at all).
     pub(crate) fn refresh(&self) {
         use std::sync::atomic::Ordering::Relaxed;
+        let frame = crate::frame::current();
+        if !within_budget(&mut SPENT.lock().unwrap_or_else(|e| e.into_inner()), frame, 0, budget_us()) {
+            // Left as it is (nothing learnt about writes), so checked again
+            // next frame; its host copy shows what it showed.
+            DEFERRED.fetch_add(1, Relaxed);
+            return;
+        }
         let started = std::time::Instant::now();
         let read = self.refresh_now();
+        let us = started.elapsed().as_micros() as u64;
+        within_budget(&mut SPENT.lock().unwrap_or_else(|e| e.into_inner()), frame, us, u64::MAX);
         let preparing = &crate::host::PREPARING;
-        preparing[2].fetch_add(started.elapsed().as_micros() as u64, Relaxed);
+        preparing[2].fetch_add(us, Relaxed);
         preparing[3].fetch_add(read as u64, Relaxed);
     }
 
@@ -1417,6 +1468,25 @@ mod tests {
         if let Some(bytes) = query_adapter_vram_bytes() {
             assert!(bytes > 0);
         }
+    }
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::within_budget;
+
+    /// A frame's checks go on until their time reaches the budget, then
+    /// wait for the next frame; without a budget they all go on.
+    #[test]
+    fn checks_past_the_budget_wait_for_the_next_frame() {
+        let mut spent = (0, 0);
+        assert!(within_budget(&mut spent, 7, 6_000, 10_000));
+        assert!(within_budget(&mut spent, 7, 6_000, 10_000));
+        assert!(!within_budget(&mut spent, 7, 0, 10_000), "12 ms spent of 10");
+        assert!(within_budget(&mut spent, 8, 0, 10_000), "a new frame");
+        assert_eq!(spent, (8, 0));
+        assert!(within_budget(&mut spent, 8, 50_000, 0));
+        assert!(within_budget(&mut spent, 8, 0, 0), "no limit");
     }
 }
 
