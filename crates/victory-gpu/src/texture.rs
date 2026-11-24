@@ -601,7 +601,8 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
         if let Some(copy) = crate::resource::host_copy(resource) {
             list.defer_upload(staging.clone(), copy);
         }
-        list.defer_texture(staging);
+        // The list records no copy; a prelude upload marks its own read.
+        list.defer_texture(staging, false);
         return;
     }
     #[cfg(feature = "diagnostics")]
@@ -653,7 +654,7 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
         });
     }
     // Once per submission however many of its lists sample the texture.
-    list.defer_texture(staging);
+    list.defer_texture(staging, true);
 }
 
 impl Staging {

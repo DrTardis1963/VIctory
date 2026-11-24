@@ -1700,7 +1700,9 @@ enum Step {
     GpuWrite(std::sync::Arc<crate::shadow::Shadow>, usize, usize),
     /// Brings a texture's staging buffer up to date: once per submission,
     /// whichever lists sample it, until a `Copy` or `Run` intervenes.
-    Texture(std::sync::Arc<crate::texture::Staging>),
+    /// The flag: this list records a copy out of the staging buffer (only
+    /// then does its flight read it on the card).
+    Texture(std::sync::Arc<crate::texture::Staging>, bool),
 }
 
 /// What a list does on the CPU when it is submitted: copies between host
@@ -1736,6 +1738,9 @@ struct Deferred {
     /// host copies held what their staging buffers held): what the check
     /// at submission finds changed, the prelude uploads.
     late_uploads: Vec<(std::sync::Arc<crate::texture::Staging>, std::sync::Arc<crate::resource::HostTexture>)>,
+    /// Of those, the staging buffers the prelude did upload: read on the
+    /// card by the submission like a recorded copy.
+    late_read: Vec<std::sync::Arc<crate::texture::Staging>>,
 }
 
 impl Deferred {
@@ -2203,7 +2208,7 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                         return Some(WHY_READ);
                     }
                 }
-                Step::Texture(staging) => {
+                Step::Texture(staging, _) => {
                     let (at, len) = staging.memory();
                     if touches(written, at, at + len) {
                         if count {
@@ -2226,9 +2231,27 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
 fn staging_in_flight_at(runs: &[&HostList], finished: u64) -> bool {
     runs.iter().any(|list| {
         list.deferred().copies.iter().any(|step| {
-            matches!(step, Step::Texture(staging) if staging.in_flight() > finished)
+            matches!(step, Step::Texture(staging, _) if staging.in_flight() > finished)
         })
     })
+}
+
+/// Marks the staging buffers `runs` copy out of as read by `submission`
+/// on the card. A list that only checks an unchanged texture leaves its
+/// staging buffer unread there: marked too, every texture sampled in two
+/// submissions in a row settled the flights (12 settles, 264 ms a frame of
+/// waiting in the world on an RTX 4060 Ti).
+fn mark_staging_read(runs: &[&HostList], submission: u64) {
+    for list in runs {
+        for step in &list.deferred().copies {
+            if let Step::Texture(staging, true) = step {
+                staging.mark_in_flight(submission);
+            }
+        }
+        for staging in &list.deferred().late_read {
+            staging.mark_in_flight(submission);
+        }
+    }
 }
 
 fn staging_in_flight(runs: &[&HostList]) -> bool {
@@ -2771,13 +2794,30 @@ mod late_tests {
         crate::texture::upload(&list, resource, tex);
         assert!(!super::staging_in_flight_at(&[&list], 0));
         for step in &list.deferred().copies {
-            if let super::Step::Texture(staging) = step {
+            if let super::Step::Texture(staging, _) = step {
                 staging.mark_in_flight(10);
             }
         }
         assert!(super::staging_in_flight_at(&[&list], 9));
         assert!(!super::staging_in_flight_at(&[&list], 10));
         assert!(!super::staging_in_flight_at(&[&list], 11));
+        // Submitted: the upload is noted, and a later list that samples the
+        // unchanged texture records no copy, so its flight does not count
+        // as reading the staging buffer.
+        for step in &list.deferred().copies {
+            if let super::Step::Host(work) = step {
+                work();
+            }
+        }
+        let later = host.new_list().expect("host list");
+        crate::texture::upload(&later, resource, tex);
+        assert!(later.deferred().copies.iter().any(|s| matches!(s, super::Step::Texture(_, false))));
+        super::mark_staging_read(&[&later], 20);
+        assert!(!super::staging_in_flight_at(&[&later], 10));
+        super::mark_staging_read(&[&list], 20);
+        assert!(super::staging_in_flight_at(&[&later], 19));
+        later.close();
+        drop(later);
         list.close();
         drop(list);
         release(resource);
@@ -2800,7 +2840,7 @@ mod late_tests {
             .copies
             .iter()
             .find_map(|step| match step {
-                super::Step::Texture(staging) => Some(staging.clone()),
+                super::Step::Texture(staging, _) => Some(staging.clone()),
                 _ => None,
             })
             .expect("a texture step");
@@ -4247,13 +4287,7 @@ impl Host {
         }
         let prepared = std::time::Instant::now();
         if late {
-            for list in runs {
-                for step in &list.deferred().copies {
-                    if let Step::Texture(staging) = step {
-                        staging.mark_in_flight(this_submission);
-                    }
-                }
-            }
+            mark_staging_read(runs, this_submission);
             *submitted += 1;
             // SAFETY: closed lists; the fence is ours.
             let signalled = unsafe {
@@ -4971,6 +5005,9 @@ impl HostList {
             .filter(|(staging, _)| staging.take_change())
             .cloned()
             .collect();
+        self.deferred()
+            .late_read
+            .extend(uploads.iter().map(|(staging, _)| staging.clone()));
         let states = self.states.lock().unwrap_or_else(|e| e.into_inner());
         // The copies (depth texture, twin, whether into the twin); the
         // sides are then as this list leaves them.
@@ -5381,8 +5418,9 @@ impl HostList {
 
     /// Brings a texture's staging buffer up to date when the list is
     /// submitted, keeping it alive until the list is reset.
-    pub(crate) fn defer_texture(&self, staging: std::sync::Arc<crate::texture::Staging>) {
-        self.deferred().copies.push(Step::Texture(staging));
+    /// `copies`: the list records a copy out of the staging buffer.
+    pub(crate) fn defer_texture(&self, staging: std::sync::Arc<crate::texture::Staging>, copies: bool) {
+        self.deferred().copies.push(Step::Texture(staging, copies));
     }
 
     /// Runs the list's submission-time steps; refreshes go into `batch`
@@ -5458,7 +5496,7 @@ impl HostList {
                     }
                     continue;
                 }
-                Step::Texture(staging) => {
+                Step::Texture(staging, _) => {
                     if batch.texture_due(staging) {
                         staging.refresh();
                     }
