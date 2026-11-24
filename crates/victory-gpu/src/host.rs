@@ -6243,6 +6243,12 @@ impl Meter {
         {
             let [own, asking, still, all] =
                 [0, 1, 2, 3].map(|i| crate::texture::REFRESH_WAITS[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames);
+            let deferred = crate::texture::DEFERRED.swap(0, Ordering::Relaxed) as f64 / frames;
+            if deferred > 0.0 {
+                tracing::info!(
+                    "texture checks left for the next frame by the budget (VICTORY_TEXTURE_BUDGET_MS, 10 by default, 0 no limit):                      {deferred:.0} a frame"
+                );
+            }
             if all >= 1.0 {
                 tracing::info!(
                     "texture refreshes per frame, all threads: {all:.1} ms, of them {own:.1} ms waiting for a texture another thread \
