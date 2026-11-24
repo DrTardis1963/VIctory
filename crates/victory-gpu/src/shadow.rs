@@ -539,6 +539,36 @@ impl Flights {
         }
         free
     }
+
+    /// Whether a submission after `number` still holds a range over title
+    /// memory `[a, b)`. Submissions are copied back in order, so a range
+    /// whose last declarer is `number` or older is held by none after it.
+    fn after(&self, a: usize, b: usize, number: u64) -> bool {
+        self.0.iter().any(|&((from, to), _, last)| last > number && from < b && to > a)
+    }
+}
+
+#[cfg(test)]
+mod flights_tests {
+    use super::Flights;
+
+    /// A later declarer of an overlapping range counts; an earlier one, a
+    /// range beside, or one copied back does not.
+    #[test]
+    fn later_declarers_are_found_until_copied_back() {
+        let mut f = Flights::default();
+        f.declare((0x1000, 0x2000), 5);
+        f.declare((0x1000, 0x2000), 7);
+        f.declare((0x3000, 0x4000), 4);
+        assert!(f.after(0x1800, 0x1900, 5));
+        assert!(!f.after(0x1800, 0x1900, 7));
+        assert!(!f.after(0x2000, 0x3000, 0));
+        assert!(!f.after(0x3000, 0x4000, 4));
+        assert_eq!(f.done(&[(0x1000, 0x2000)]), vec![]);
+        assert!(f.after(0x1000, 0x1001, 5));
+        assert_eq!(f.done(&[(0x1000, 0x2000)]), vec![(0x1000, 0x2000)]);
+        assert!(!f.after(0x1000, 0x2000, 0));
+    }
 }
 
 /// The relay's merge of a stretch of a copy ([`relay`]). `now` is what the
@@ -2093,6 +2123,13 @@ impl Shadow {
                 })
                 .collect()
         })
+    }
+
+    /// With [`relay`]: whether a submission after `number` declared shader
+    /// writes over offsets `[lo, hi)` of the copy and is not copied back.
+    pub(crate) fn declared_after(&self, lo: usize, hi: usize, number: u64) -> bool {
+        let (a, b) = (self.start as usize + lo, self.start as usize + hi);
+        self.flights.lock().unwrap_or_else(|e| e.into_inner()).after(a, b, number)
     }
 
     /// After [`Shadow::copy_back`] of a submission's ranges: every submitted
