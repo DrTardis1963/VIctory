@@ -34,6 +34,7 @@ fn build(words: &[u32], buffers: bool) -> HostShader {
         target: super::Target::ANY,
         console_cf: false,
         per_lane_only: false,
+        options: Default::default(),
     })
     .expect("lower");
     // One access with each lane's own heap index, no wave operation.
@@ -314,6 +315,7 @@ fn joined_descriptors_keep_the_per_lane_form_when_the_console_flow_is_asked_for(
         target: super::Target::ANY,
         console_cf,
         per_lane_only: false,
+        options: Default::default(),
     };
     let why = |l: Result<lower::Lowered, ShaderError>| match l {
         Err(ShaderError::Unsupported { what, .. }) => what,

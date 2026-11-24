@@ -107,6 +107,8 @@ mod valu_tests;
 #[cfg(all(test, windows))]
 mod waterfall_tests;
 mod wave;
+#[cfg(test)]
+mod wave64_tests;
 
 use crate::dxbc::{Container, FourCC};
 use crate::native::{HwStage, NativeProgram, RootType};
@@ -293,6 +295,24 @@ pub struct TableView {
     pub props: (u32, u32),
 }
 
+/// How a Wave64 compute shader is mapped onto the host device.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Wave64Mode {
+    /// Emit native `WaveSize(64)` when compute lane semantics require it.
+    #[default]
+    Native,
+    /// Map virtual 64-lane waves onto 32-lane host waves (`WaveSize(32)`).
+    Wave32,
+    /// Emulate 64-lane waves in group-shared memory without `WaveSize`.
+    Emulate,
+}
+
+/// Options controlling DXIL emission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TranslateOptions {
+    pub wave64: Wave64Mode,
+}
+
 /// Translates the vertex, geometry, pixel, compute or mesh program of a console
 /// shader container, for any host ([`Target::ANY`]).
 pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
@@ -301,6 +321,24 @@ pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
 
 /// [`translate`] for a host that runs the wave sizes of `target`.
 pub fn translate_for(container: &[u8], target: Target) -> Result<HostShader, ShaderError> {
+    translate_options(container, target, TranslateOptions::default())
+}
+
+/// [`translate`] using `options`.
+pub fn translate_with(
+    container: &[u8],
+    options: TranslateOptions,
+) -> Result<HostShader, ShaderError> {
+    translate_options(container, Target::ANY, options)
+}
+
+/// [`translate`] for a host that runs the wave sizes of `target`, using
+/// `options`.
+pub fn translate_options(
+    container: &[u8],
+    target: Target,
+    options: TranslateOptions,
+) -> Result<HostShader, ShaderError> {
     let c = Container::parse(container)?;
     let dxil = c
         .part(FourCC::DXIL)
@@ -336,7 +374,7 @@ pub fn translate_for(container: &[u8], target: Target) -> Result<HostShader, Sha
     }?;
     let io = io?;
     let st = st?;
-    emit(&c, &native, &p, &st, &io, &res, target)
+    emit_options(&c, &native, &p, &st, &io, &res, target, options)
 }
 
 /// Emits a program whose earlier stages already ran, for `target`.
@@ -349,8 +387,37 @@ pub fn emit(
     res: &resource::Resources,
     target: Target,
 ) -> Result<HostShader, ShaderError> {
+    emit_options(c, native, p, st, io, res, target, TranslateOptions::default())
+}
+
+/// Emits a program whose earlier stages already ran using `options`.
+pub fn emit_with(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    st: &structure::Structured,
+    io: &io::Io,
+    res: &resource::Resources,
+    options: TranslateOptions,
+) -> Result<HostShader, ShaderError> {
+    emit_options(c, native, p, st, io, res, Target::ANY, options)
+}
+
+/// Emits a program whose earlier stages already ran, for `target`, using
+/// `options`.
+#[allow(clippy::too_many_arguments)]
+pub fn emit_options(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    st: &structure::Structured,
+    io: &io::Io,
+    res: &resource::Resources,
+    target: Target,
+    options: TranslateOptions,
+) -> Result<HostShader, ShaderError> {
     lds_fits(native, p)?;
-    let original = emit_program(c, native, p, st, io, res, target);
+    let original = emit_program(c, native, p, st, io, res, target, options);
     // Retry unsupported programs only. Threading can separate an unknown
     // register value from its apparent use on a mutually exclusive path.
     if !matches!(original, Err(ShaderError::Unsupported { .. })) {
@@ -364,7 +431,7 @@ pub fn emit(
     let st = structure::structure(&p)?;
     let io = io::raise(&p, native)?;
     let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
-    emit_program(c, native, &p, &st, &io, &res, target)
+    emit_program(c, native, &p, &st, &io, &res, target, options)
 }
 
 /// Tests: the first lowering of a compute program alone, without the
@@ -392,6 +459,7 @@ pub(crate) fn lower_compute(
         target: Target::ANY,
         console_cf: false,
         per_lane_only,
+        options: Default::default(),
     })
     .map(|_| ())
 }
@@ -407,6 +475,7 @@ fn emit_program(
     io: &io::Io,
     res: &resource::Resources,
     target: Target,
+    options: TranslateOptions,
 ) -> Result<HostShader, ShaderError> {
     let sig = |fourcc| -> Result<Vec<container::SigElement>, ShaderError> {
         match c.part(fourcc) {
@@ -535,6 +604,7 @@ fn emit_program(
         prims,
         mesh_stride,
         target,
+        options,
         console_cf: false,
         per_lane_only: false,
     };
@@ -1974,7 +2044,7 @@ mod tests {
         let st = crate::structure::structure(&p).unwrap();
         let res = crate::resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
         let io = crate::io::raise(&p, &native).unwrap();
-        let l = super::lower::lower(&super::lower::Parts { target: crate::emit::Target::ANY, console_cf: false, per_lane_only: false,
+        let l = super::lower::lower(&super::lower::Parts { target: crate::emit::Target::ANY, console_cf: false, per_lane_only: false, options: Default::default(),
             native: &native,
             p: &p,
             st: &st,
@@ -2112,7 +2182,7 @@ mod tests {
         let st = crate::structure::structure(&p).unwrap();
         let res = crate::resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
         let io = crate::io::raise(&p, &native).unwrap();
-        let l = super::lower::lower(&super::lower::Parts { target: crate::emit::Target::ANY, console_cf: false, per_lane_only: false,
+        let l = super::lower::lower(&super::lower::Parts { target: crate::emit::Target::ANY, console_cf: false, per_lane_only: false, options: Default::default(),
             native: &native,
             p: &p,
             st: &st,
@@ -2258,7 +2328,7 @@ mod tests {
         let st = crate::structure::structure(&p).unwrap();
         let res = crate::resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
         let io = crate::io::raise(&p, &native).unwrap();
-        let l = super::lower::lower(&super::lower::Parts { target: crate::emit::Target::ANY, console_cf: false, per_lane_only: false,
+        let l = super::lower::lower(&super::lower::Parts { target: crate::emit::Target::ANY, console_cf: false, per_lane_only: false, options: Default::default(),
             native: &native,
             p: &p,
             st: &st,
@@ -2403,7 +2473,7 @@ mod tests {
         let st = crate::structure::structure(&p).unwrap();
         let res = crate::resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
         let io = crate::io::raise(&p, &native).unwrap();
-        let l = super::lower::lower(&super::lower::Parts { target: crate::emit::Target::ANY, console_cf: false, per_lane_only: false,
+        let l = super::lower::lower(&super::lower::Parts { target: crate::emit::Target::ANY, console_cf: false, per_lane_only: false, options: Default::default(),
             native: &native,
             p: &p,
             st: &st,
@@ -3327,6 +3397,7 @@ mod mesh_tests {
             target: super::Target::ANY,
             console_cf: false,
             per_lane_only: false,
+            options: Default::default(),
         })
         .unwrap();
         assert!(l.stride_table);

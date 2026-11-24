@@ -323,6 +323,10 @@ fn create() -> windows::core::Result<Host> {
             })?;
         let dsv_size = device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
         tracing::info!("host D3D12 device ready");
+        // The effective mode and its source: a log line reporting another
+        // mode than the one in use sends readers after the wrong cause.
+        let (wave64_mode, wave64_source) = crate::shader_cache::wave64_mode_with_source();
+        tracing::info!(?wave64_mode, wave64_source, "Wave64 compute lowering mode");
         Ok(Host {
             device,
             depth_bounds_supported,

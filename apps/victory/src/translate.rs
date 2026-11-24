@@ -597,7 +597,10 @@ fn translate(
                 if let (Some(r), Some(i), Some(s)) = (res, raised, structured) {
                     let label = || format!("{} {:?}", example(), p.stage);
                     *counter(t, p.stage, 0) += 1;
-                    match emit::emit(&container, &p, &program, &s, &i, &r, checks.target) {
+                    let options = emit::TranslateOptions {
+                        wave64: shader_cache::wave64_mode(),
+                    };
+                    match emit::emit_options(&container, &p, &program, &s, &i, &r, checks.target, options) {
                         Ok(shader) => {
                             *counter(t, p.stage, 1) += 1;
                             if Some(program_index) == cache_target

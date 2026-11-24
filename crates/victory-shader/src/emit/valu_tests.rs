@@ -157,6 +157,7 @@ fn lower_compute(native: &NativeProgram) -> HostShader {
         target: super::Target::ANY,
         console_cf: false,
         per_lane_only: false,
+        options: Default::default(),
     })
     .expect("lower");
 
@@ -1451,6 +1452,7 @@ fn build_lanes(body: &[u32], wave64: bool) -> Result<HostShader, String> {
         target: super::Target::ANY,
         console_cf: false,
         per_lane_only: false,
+        options: Default::default(),
     })
     .map_err(|e| format!("{e:?}"))?;
     Ok(HostShader {

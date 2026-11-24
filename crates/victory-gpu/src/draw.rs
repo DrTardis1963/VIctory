@@ -1236,7 +1236,9 @@ impl State {
             return;
         }
         let listed = crate::capture::listed(crate::queue::presented() + 1);
-        let logged = listed || TRACED.fetch_add(1, Ordering::Relaxed) < 64;
+        // Mesh draws are few and decisive for the world picture: trace every
+        // one, not just the first 64 draws of the run.
+        let logged = listed || kind == "mesh" || TRACED.fetch_add(1, Ordering::Relaxed) < 64;
         let targets: Vec<String> = self
             .targets
             .iter()

@@ -96,8 +96,9 @@ pub(crate) fn texture_mip_drop() -> u32 {
 }
 
 /// The minimum texture dimension (both width and height) eligible for mip-dropping.
-/// Defaults to 1024. Textures smaller than this on either axis (or under 2048 if configured)
-/// are preserved at full resolution. Configurable via `VICTORY_TEXTURE_MIP_DROP_MIN_SIZE`.
+/// Defaults to 2048 (the title's sampled 1920x1080 loading artwork turned flat
+/// colour below that). Textures smaller than this on either axis are preserved
+/// at full resolution. Configurable via `VICTORY_TEXTURE_MIP_DROP_MIN_SIZE`.
 pub(crate) fn texture_mip_drop_min_size() -> u64 {
     static MIN_SIZE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *MIN_SIZE.get_or_init(|| {
@@ -105,7 +106,7 @@ pub(crate) fn texture_mip_drop_min_size() -> u64 {
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
             .filter(|&v| v > 0)
-            .unwrap_or(1024)
+            .unwrap_or(2048)
     })
 }
 

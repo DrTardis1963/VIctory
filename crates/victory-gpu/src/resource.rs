@@ -1166,9 +1166,9 @@ pub(crate) fn compute_mip_drop_explicit(desc: &ResourceDesc, drop: u32, min_size
         return 0;
     }
     // Size floor: drop only textures where both dimensions are at least `min_size`
-    // (default 1024). Small utility textures account for < 2.5% of VRAM but cause
+    // (default 2048). Small utility textures account for < 2.5% of VRAM but cause
     // copy coordinate underflow and 1x1 degenerate collapses. Testers can configure
-    // this via VICTORY_TEXTURE_MIP_DROP_MIN_SIZE (e.g. 2048 for conservative mode).
+    // this via VICTORY_TEXTURE_MIP_DROP_MIN_SIZE (e.g. 1024 to drop more).
     if desc.width < min_size || u64::from(desc.height) < min_size {
         return 0;
     }
