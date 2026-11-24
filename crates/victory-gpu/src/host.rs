@@ -6894,6 +6894,14 @@ impl Meter {
                 "  heap pass breakdown per frame: textures {heap_textures_ms:.1} ms, {heap_buf_slots:.0} buffer slots inspected"
             );
         }
+        let [reused, made, made_us] =
+            [0, 1, 2].map(|i| crate::texture::POOL_STATS[i].swap(0, Ordering::Relaxed) as f64 / frames);
+        if reused + made > 0.0 {
+            tracing::info!(
+                "texture staging buffers per frame: {reused:.1} reused, {made:.1} made in {:.1} ms",
+                made_us / 1e3
+            );
+        }
         // Copies between depth textures and their colour twins, each way.
         let [twin_to_depth, twin_to_colour] =
             [2, 3].map(|i| crate::resource::TWINS[i].swap(0, Ordering::Relaxed) as f64 / frames);

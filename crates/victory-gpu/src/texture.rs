@@ -119,6 +119,9 @@ pub(crate) struct Staging {
     size: usize,
     /// The staging buffer's bytes (counted in `STAGED` while it lives).
     bytes: u64,
+    /// The buffer's own size ([`take_buffer`] rounds up): what it goes
+    /// back to the pool as.
+    capacity: u64,
     /// Dropped mips count (offset into console mips for detiling).
     pub(crate) mip_drop: u32,
     memory: *const u8,
@@ -257,6 +260,64 @@ unsafe impl Send for Staging {}
 unsafe impl Sync for Staging {}
 
 static STAGING: Mutex<Option<HashMap<usize, Arc<Staging>>>> = Mutex::new(None);
+
+/// Staging buffers let go, by size, for the next textures. Each streamed
+/// texture made and let go of an upload buffer of its own: up to 192 MB of
+/// fresh upload memory a frame, which the driver allocates and zeroes, in
+/// the pass for textures picked by index that held frames for 250 ms.
+static POOL: Mutex<Option<HashMap<u64, Vec<Pooled>>>> = Mutex::new(None);
+
+/// Bytes in [`POOL`].
+static POOLED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The most bytes [`POOL`] keeps.
+const POOL_BYTES: u64 = 512 << 20;
+
+/// Since the last frame-rate line: staging buffers taken from the pool,
+/// made anew, and the microseconds making them took.
+pub(crate) static POOL_STATS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+struct Pooled {
+    buffer: ID3D12Resource,
+    data: *mut u8,
+}
+
+// SAFETY: a mapped upload buffer, used by one owner at a time.
+unsafe impl Send for Pooled {}
+
+/// A staging buffer's size for `size` bytes: rounded up to an eighth of
+/// its power of two (64 KiB at least), so that buffers come back for
+/// textures of about their size, at most an eighth too big.
+fn capacity(size: u64) -> u64 {
+    let step = (size.max(1).next_power_of_two() / 8).max(64 << 10);
+    size.div_ceil(step) * step
+}
+
+/// An upload buffer of at least `size` bytes, mapped: from the pool, or
+/// made. Returns it with its size.
+/// shortcut: a buffer from the pool still holds another texture's bytes
+/// where nothing is detiled into it before its upload (a read that fails
+/// while the runtime remaps the memory): such a texture shows those for a
+/// frame instead of zeros.
+fn take_buffer(host: &crate::host::Host, size: u64) -> Option<(ID3D12Resource, *mut u8, u64)> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let capacity = capacity(size);
+    let pooled = POOL
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_mut()
+        .and_then(|pool| pool.get_mut(&capacity)?.pop());
+    if let Some(p) = pooled {
+        POOLED.fetch_sub(capacity, Relaxed);
+        POOL_STATS[0].fetch_add(1, Relaxed);
+        return Some((p.buffer, p.data, capacity));
+    }
+    let started = std::time::Instant::now();
+    let (buffer, data) = host.upload_buffer(capacity)?;
+    POOL_STATS[1].fetch_add(1, Relaxed);
+    POOL_STATS[2].fetch_add(started.elapsed().as_micros() as u64, Relaxed);
+    Some((buffer, data, capacity))
+}
 
 /// The buffer a texture the host writes is copied through into the texture
 /// of a view the title placed in its memory in another format
@@ -618,6 +679,17 @@ impl Drop for Staging {
         use std::sync::atomic::Ordering::Relaxed;
         STAGED[0].fetch_sub(1, Relaxed);
         STAGED[1].fetch_sub(self.bytes, Relaxed);
+        // Lists that uploaded from it have run (they held it until then):
+        // the buffer is free for another texture.
+        if POOLED.fetch_add(self.capacity, Relaxed) + self.capacity <= POOL_BYTES {
+            let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
+            pool.get_or_insert_with(HashMap::new).entry(self.capacity).or_default().push(Pooled {
+                buffer: self.buffer.clone(),
+                data: self.data,
+            });
+        } else {
+            POOLED.fetch_sub(self.capacity, Relaxed);
+        }
     }
 }
 
@@ -1562,7 +1634,7 @@ fn staging(resource: This, texture: &ID3D12Resource, first: u32) -> Option<Arc<S
             Some(&mut total),
         );
     }
-    let (buffer, data) = host.upload_buffer(total)?;
+    let (buffer, data, capacity) = take_buffer(host, total)?;
     crate::host::name(&buffer, || {
         format!(
             "staging of {resource:?} {}x{}x{} f{}",
@@ -1584,6 +1656,7 @@ fn staging(resource: This, texture: &ID3D12Resource, first: u32) -> Option<Arc<S
         first,
         size,
         bytes: total,
+        capacity,
         mip_drop,
         memory,
         guard_view,
