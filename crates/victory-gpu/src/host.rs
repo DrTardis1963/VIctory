@@ -5884,6 +5884,17 @@ mod direct_copy {
     }
 }
 
+/// Copies `src` into title memory at `dst` in user mode: a write into a
+/// guarded block faults into the guard, which opens it and notes it written
+/// as it does the title's own writes (the kernel's writes, a file read's,
+/// fail there instead). False if a page of `dst` is not writable for any
+/// other reason; the bytes before it may have landed.
+#[cfg(target_arch = "x86_64")]
+pub fn write_title_memory(dst: *mut u8, src: &[u8]) -> bool {
+    // SAFETY: `src` is the caller's; faults at `dst` are caught by `try_copy`.
+    unsafe { direct_copy::try_copy(dst, src.as_ptr(), src.len()) }
+}
+
 /// Copies `len` bytes from `src` to `dst` unless a source page is not
 /// readable.
 fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {

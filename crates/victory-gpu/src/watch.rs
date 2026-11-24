@@ -901,6 +901,54 @@ mod tests {
         title_memory_remapped(view, 2 * BLOCK);
     }
 
+    /// A guard armed again after `writing` (a check on another thread)
+    /// fails the kernel's read; the bytes read into our memory and copied
+    /// in with `write_title_memory` land, and the block counts as written.
+    #[test]
+    fn title_memory_writes_open_guarded_blocks() {
+        use std::io::{Read, Seek, Write};
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
+            UnmapViewOfFile,
+        };
+        // SAFETY: a pagefile section of two blocks, mapped read-write.
+        let view = unsafe {
+            let section = CreateFileMappingW(
+                -1isize as _,
+                std::ptr::null(),
+                PAGE_READWRITE,
+                0,
+                (2 * BLOCK) as u32,
+                std::ptr::null(),
+            );
+            assert!(!section.is_null());
+            MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, 2 * BLOCK).Value as usize
+        };
+        assert_ne!(view, 0);
+        let at = view + BLOCK - 4; // across both blocks
+        assert!(guard(view, view + 2 * BLOCK).is_some());
+        writing(at, 13);
+        assert!(guard(view, view + 2 * BLOCK).is_some()); // guarded again
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(b"from the disk").unwrap();
+        file.rewind().unwrap();
+        // SAFETY: 13 bytes of our view, nothing else refers to them.
+        let into = unsafe { std::slice::from_raw_parts_mut(at as *mut u8, 13) };
+        let error = file.read(into).unwrap_err().raw_os_error();
+        assert!(matches!(error, Some(998 | 1784)), "{error:?}");
+        assert!(crate::write_title_memory(at as *mut u8, b"from the disk"));
+        // SAFETY: the bytes just written.
+        let landed = unsafe { std::slice::from_raw_parts(at as *const u8, 13) };
+        assert_eq!(landed, b"from the disk");
+        assert_eq!(
+            guard(view, view + 2 * BLOCK),
+            Some((view / PAGE..(view + 2 * BLOCK) / PAGE).collect())
+        );
+        // SAFETY: our view.
+        unsafe { UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: view as *mut _ }) };
+        title_memory_remapped(view, 2 * BLOCK);
+    }
+
     #[test]
     fn writes_in_partly_committed_view_blocks_are_reported() {
         use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
