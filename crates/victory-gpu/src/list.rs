@@ -163,6 +163,12 @@ pub(crate) fn lend_slots(this: This) {
     with_closed_state(this, |state| state.lend());
 }
 
+/// Whether a title list waits for title memory.
+#[cfg(windows)]
+pub(crate) fn has_waits(this: This) -> bool {
+    host_list(this).is_some_and(|l| l.has_waits())
+}
+
 /// The host list behind a title list, if there is a host GPU.
 #[cfg(windows)]
 pub(crate) fn host_list<'a>(this: This) -> Option<&'a crate::host::HostList> {
@@ -312,7 +318,7 @@ extern "system" fn allocator_reset(_: This) -> HRESULT {
 extern "system" fn list_query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
     object::answer(LIST, iid, object::is(iid, &LIST_IIDS).then_some(this), out)
 }
-extern "system" fn list_release(this: This) -> u32 {
+pub(crate) extern "system" fn list_release(this: This) -> u32 {
     object::release_boxed::<List>(this)
 }
 extern "system" fn list_type(this: This) -> u32 {
@@ -330,7 +336,9 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
     if allocator.is_null() {
         return E_INVALIDARG;
     }
-    // Every submission of the list has run (submissions are waited for).
+    // Every submission of the list has run (submissions are waited for,
+    // those on a queue's thread here).
+    crate::queue::settle(this);
     // SAFETY: the title passes one of our lists.
     let uploads = unsafe { &(*this.cast::<List>()).uploads };
     uploads.lock().unwrap_or_else(|e| e.into_inner()).clear();

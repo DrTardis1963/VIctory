@@ -1070,14 +1070,21 @@ impl MemoryWait {
 
     /// Waits until it holds, up to [`WAIT_TIMEOUT`], or [`SHORT_WAIT`]
     /// while no other submission runs and the memory does not change; else
-    /// how long it waited.
-    fn wait(&self) -> Result<(), std::time::Duration> {
+    /// how long it waited. `patient` (on a queue's thread, the title going
+    /// on): the short wait counts from the title's last submission.
+    fn wait(&self, patient: bool) -> Result<(), std::time::Duration> {
         let started = std::time::Instant::now();
         let first = self.read();
+        let (mut seen, mut quiet) = (crate::queue::submissions(), started);
         while !self.holds() {
             let waited = started.elapsed();
+            if patient && crate::queue::submissions() != seen {
+                seen = crate::queue::submissions();
+                quiet = std::time::Instant::now();
+            }
             let others = SUBMITTING.load(Ordering::Relaxed) > 1;
-            if waited >= WAIT_TIMEOUT || (waited >= SHORT_WAIT && !others && self.read() == first)
+            if waited >= WAIT_TIMEOUT
+                || (quiet.elapsed() >= SHORT_WAIT && !others && self.read() == first)
             {
                 return Err(waited);
             }
@@ -1557,7 +1564,10 @@ impl Host {
                         drop(submitted);
                         #[cfg(feature = "diagnostics")]
                         let waiting = std::time::Instant::now();
-                        let waited = wait.wait();
+                        // On a queue's thread the title goes on meanwhile.
+                        let patient = crate::queue::park(true);
+                        let waited = wait.wait(patient);
+                        crate::queue::park(false);
                         #[cfg(feature = "diagnostics")]
                         crate::copystat::add(
                             crate::copystat::C::TitleWaitUs,
@@ -1925,6 +1935,12 @@ impl Host {
 impl HostList {
     fn continuations(&self) -> std::sync::MutexGuard<'_, Vec<Continuation>> {
         self.continuations.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Whether the list waits for title memory.
+    pub(crate) fn has_waits(&self) -> bool {
+        self.has_buffer_copies.load(Ordering::Relaxed)
+            && self.continuations().iter().any(|p| matches!(p, Continuation::Wait(_)))
     }
 
     pub(crate) fn recording(&self) -> Option<(Arc<HostList>, bool)> {

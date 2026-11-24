@@ -1,8 +1,13 @@
 //! Command queues. Submitted lists run on the host GPU and are waited for,
-//! so fence signals complete at once.
+//! so fence signals complete at once. A submission whose lists wait for
+//! title memory runs on the queue's own thread instead (#700), with what
+//! the title queues after it: the title goes on once it ran or waits, and
+//! may submit what releases the wait.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 
 use crate::object::{self, E_INVALIDARG, HRESULT, Iid, Object, QUEUE, S_OK, Table, This, guid};
 use crate::resource::PAGEABLE_IIDS;
@@ -34,7 +39,195 @@ struct Queue {
     object: Object,
     kind: u32,
     desc: QueueDesc,
+    state: Arc<QueueState>,
 }
+
+/// What a queue's thread has still to do, in submission order.
+#[derive(Default)]
+struct QueueState {
+    pending: Mutex<Pending>,
+    /// A job was queued, done, or its submission waits or goes on.
+    changed: Condvar,
+}
+
+#[derive(Default)]
+struct Pending {
+    /// Numbered in order.
+    jobs: VecDeque<(u64, Job)>,
+    /// The last number given out, and the last job done.
+    queued: u64,
+    done: u64,
+    /// The job running waits for title memory.
+    parked: bool,
+    worker: bool,
+}
+
+enum Job {
+    /// Title lists.
+    Lists(Vec<usize>),
+    /// A fence (referenced while queued) and the value to signal.
+    Signal(usize, u64),
+    /// A fence (referenced while queued) and the value to wait for.
+    Wait(usize, u64),
+}
+
+/// Fence signals queued behind waiting submissions.
+static SIGNALS: AtomicU64 = AtomicU64::new(0);
+
+thread_local! {
+    /// The queue whose thread this is.
+    static WORKER: std::cell::RefCell<Option<Arc<QueueState>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Title lists in queued submissions (once per submission): reset only
+/// once these ran.
+static QUEUED: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+static RAN: Condvar = Condvar::new();
+
+/// Submissions so far: a wait on a queue's thread goes on waiting while
+/// the title still submits.
+static SUBMISSIONS: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn submissions() -> u64 {
+    SUBMISSIONS.load(Ordering::Relaxed)
+}
+
+/// The submission running on this queue's thread waits for title memory
+/// (`true`) or goes on: whoever submitted it goes on too. Whether this is
+/// a queue's thread.
+pub(crate) fn park(parked: bool) -> bool {
+    WORKER.with_borrow(|worker| {
+        let Some(state) = worker else {
+            return false;
+        };
+        state.pending.lock().unwrap_or_else(|e| e.into_inner()).parked = parked;
+        state.changed.notify_all();
+        true
+    })
+}
+
+/// Before the title resets `list`: waits until its queued submissions ran
+/// (released, it is held until then).
+pub(crate) fn settle(list: This) {
+    let mut queued = QUEUED.lock().unwrap_or_else(|e| e.into_inner());
+    while queued.contains(&(list as usize)) {
+        queued = RAN.wait(queued).unwrap_or_else(|e| e.into_inner());
+    }
+}
+
+impl QueueState {
+    /// Starts the queue's thread if it has none; false if it cannot.
+    fn start(self: &Arc<Self>, p: &mut Pending) -> bool {
+        if p.worker {
+            return true;
+        }
+        let state = self.clone();
+        let spawned = std::thread::Builder::new()
+            .name("victory-gpu-queue".into())
+            .spawn(move || work(state));
+        if let Err(e) = spawned {
+            tracing::warn!(error = %e, "no queue thread: title waits block the submission");
+            return false;
+        }
+        p.worker = true;
+        true
+    }
+
+    /// Waits until everything queued ran.
+    fn drain(&self) {
+        let mut p = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        while p.done < p.queued {
+            p = self.changed.wait(p).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+}
+
+/// A queue's thread: runs its jobs in order.
+fn work(state: Arc<QueueState>) {
+    WORKER.set(Some(state.clone()));
+    loop {
+        let (n, job) = {
+            let mut p = state.pending.lock().unwrap_or_else(|e| e.into_inner());
+            loop {
+                if let Some(job) = p.jobs.pop_front() {
+                    break job;
+                }
+                p = state.changed.wait(p).unwrap_or_else(|e| e.into_inner());
+            }
+        };
+        match job {
+            Job::Lists(lists) => {
+                let lists: Vec<This> = lists.iter().map(|&l| l as This).collect();
+                run(&lists);
+                let mut queued = QUEUED.lock().unwrap_or_else(|e| e.into_inner());
+                for &l in &lists {
+                    if let Some(i) = queued.iter().position(|&q| q == l as usize) {
+                        queued.swap_remove(i);
+                    }
+                }
+                drop(queued);
+                RAN.notify_all();
+                for l in lists {
+                    crate::list::list_release(l);
+                }
+            }
+            Job::Signal(fence, value) => {
+                crate::fence::signal(fence as This, value);
+                crate::fence::release(fence as This);
+                SIGNALS.fetch_sub(1, Ordering::Relaxed);
+            }
+            Job::Wait(fence, value) => {
+                park(true);
+                let started = std::time::Instant::now();
+                while crate::fence::completed(fence as This) < value {
+                    if started.elapsed() >= std::time::Duration::from_secs(2) {
+                        tracing::warn!(value, "a queue's fence wait timed out; the queue goes on");
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_micros(200));
+                }
+                crate::fence::release(fence as This);
+            }
+        }
+        let mut p = state.pending.lock().unwrap_or_else(|e| e.into_inner());
+        p.done = n;
+        p.parked = false;
+        state.changed.notify_all();
+    }
+}
+
+/// Runs title lists on the host GPU and waits for them.
+#[cfg(windows)]
+fn run(lists: &[This]) {
+    let Some(host) = crate::host::host() else {
+        return;
+    };
+    let runs: Vec<This> = lists
+        .iter()
+        .copied()
+        .filter(|&l| crate::list::take_back_slots(l))
+        .collect();
+    if runs.len() < lists.len() {
+        static REFUSED: std::sync::Once = std::sync::Once::new();
+        REFUSED.call_once(|| {
+            tracing::warn!(
+                "a list submitted again after its descriptor slots were taken back is not run"
+            )
+        });
+    }
+    let host_lists: Vec<_> = runs
+        .iter()
+        .filter_map(|&l| crate::list::host_list(l))
+        .collect();
+    host.execute(&host_lists);
+    for &l in &runs {
+        crate::list::lend_slots(l);
+    }
+}
+
+#[cfg(not(windows))]
+fn run(_: &[This]) {}
 const _: () = assert!(std::mem::offset_of!(Queue, kind) == 0x10);
 
 fn queue<'a>(this: This) -> &'a Queue {
@@ -61,6 +254,7 @@ pub(crate) extern "system" fn create(
         },
         kind: desc.kind,
         desc,
+        state: Arc::default(),
     });
     object::hand_out(QUEUE, queue, iid, &QUEUE_IIDS, out)
 }
@@ -110,35 +304,45 @@ extern "system" fn release(this: This) -> u32 {
     object::release_boxed::<Queue>(this)
 }
 
-/// Runs the lists' host lists and waits for them (decision 0007).
-extern "system" fn execute(_: This, count: u32, lists: *const This) {
+/// Runs the lists' host lists and waits for them (decision 0007); on the
+/// queue's thread if one waits for title memory or the queue still has
+/// work, returning once they ran or wait.
+extern "system" fn execute(this: This, count: u32, lists: *const This) {
     if lists.is_null() {
         return;
     }
     #[cfg(windows)]
-    if let Some(host) = crate::host::host() {
+    if crate::host::host().is_some() {
+        SUBMISSIONS.fetch_add(1, Ordering::Relaxed);
         // SAFETY: the title passes `count` lists.
         let lists = unsafe { std::slice::from_raw_parts(lists, count as usize) };
-        let runs: Vec<This> = lists
-            .iter()
-            .copied()
-            .filter(|&l| crate::list::take_back_slots(l))
-            .collect();
-        if runs.len() < lists.len() {
-            static REFUSED: std::sync::Once = std::sync::Once::new();
-            REFUSED.call_once(|| {
-                tracing::warn!(
-                    "a list submitted again after its descriptor slots were taken back is not run"
-                )
-            });
+        let state = &queue(this).state;
+        let mut p = state.pending.lock().unwrap_or_else(|e| e.into_inner());
+        if p.done == p.queued && !lists.iter().any(|&l| crate::list::has_waits(l)) {
+            drop(p);
+            run(lists);
+            return;
         }
-        let host_lists: Vec<_> = runs
-            .iter()
-            .filter_map(|&l| crate::list::host_list(l))
-            .collect();
-        host.execute(&host_lists);
-        for &l in &runs {
-            crate::list::lend_slots(l);
+        if !state.start(&mut p) {
+            drop(p);
+            run(lists);
+            return;
+        }
+        // Held until they ran, as the console's queue holds them.
+        for &l in lists {
+            object::add_ref(l);
+        }
+        QUEUED
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .extend(lists.iter().map(|&l| l as usize));
+        p.queued += 1;
+        let n = p.queued;
+        p.jobs.push_back((n, Job::Lists(lists.iter().map(|&l| l as usize).collect())));
+        state.changed.notify_all();
+        // As on the console, the lists' commands before a wait run now.
+        while p.done < n && !p.parked {
+            p = state.changed.wait(p).unwrap_or_else(|e| e.into_inner());
         }
         return;
     }
@@ -177,15 +381,44 @@ extern "system" fn signal2_x(
 }
 /// Markers and events only matter to profilers.
 extern "system" fn marker(_: This) {}
-extern "system" fn signal(_: This, fence: This, value: u64) -> HRESULT {
+extern "system" fn signal(this: This, fence: This, value: u64) -> HRESULT {
     if fence.is_null() {
         return E_INVALIDARG;
     }
+    let state = &queue(this).state;
+    let mut p = state.pending.lock().unwrap_or_else(|e| e.into_inner());
+    if p.done < p.queued {
+        // After the queue's submissions still to run.
+        object::add_ref(fence);
+        SIGNALS.fetch_add(1, Ordering::Relaxed);
+        p.queued += 1;
+        let n = p.queued;
+        p.jobs.push_back((n, Job::Signal(fence as usize, value)));
+        state.changed.notify_all();
+        return S_OK;
+    }
+    drop(p);
     crate::fence::signal(fence, value)
 }
-/// Nothing runs on the queue, so waiting for a fence never blocks it.
-extern "system" fn wait(_: This, fence: This, _value: u64) -> HRESULT {
-    if fence.is_null() { E_INVALIDARG } else { S_OK }
+/// Nothing runs on the queue, so waiting for a fence never blocks it;
+/// unless a signal is queued behind a waiting submission: then what the
+/// title queues here after it runs once the fence reaches the value.
+extern "system" fn wait(this: This, fence: This, value: u64) -> HRESULT {
+    if fence.is_null() {
+        return E_INVALIDARG;
+    }
+    if SIGNALS.load(Ordering::Relaxed) > 0 && crate::fence::completed(fence) < value {
+        let state = &queue(this).state;
+        let mut p = state.pending.lock().unwrap_or_else(|e| e.into_inner());
+        if state.start(&mut p) {
+            object::add_ref(fence);
+            p.queued += 1;
+            let n = p.queued;
+            p.jobs.push_back((n, Job::Wait(fence as usize, value)));
+            state.changed.notify_all();
+        }
+    }
+    S_OK
 }
 /// Ticks per second of GPU timestamps (see [`Written::GpuTimestamp`]).
 extern "system" fn timestamp_frequency(_: This, out: *mut u64) -> HRESULT {
@@ -256,11 +489,15 @@ pub(crate) fn presented() -> u64 {
 /// shortcut: one plane, no scaling or placement, the source expected in
 /// the common state.
 extern "system" fn present(
-    _: This,
+    this: This,
     planes: u32,
     plane_parameters: *const Plane,
     _parameters: *const u8,
 ) -> HRESULT {
+    // The frame's submissions still waiting run first.
+    if !this.is_null() {
+        queue(this).state.drain();
+    }
     let frame = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
     if frame.is_power_of_two() {
         let (draws, dispatches) = crate::list::take_counts();
@@ -418,13 +655,17 @@ const PAGE: u64 = 64 << 10;
 /// one constant page or of unmapped pages). Done at once: every earlier
 /// submission has run.
 extern "system" fn copy_page_mappings(
-    _: This,
+    this: This,
     count: u32,
     batches: *const PageBatch,
     pool: u64,
     pool_pages: u32,
     _flags: u32,
 ) -> HRESULT {
+    // Queued submissions use the mappings they were submitted with.
+    if !this.is_null() {
+        queue(this).state.drain();
+    }
     let Some(map) = crate::resource::page_mapper() else {
         return E_INVALIDARG;
     };
@@ -599,5 +840,284 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(2));
         Written::GpuTimestamp.write(at[1..].as_mut_ptr().cast(), 8);
         assert!(at[1] > first);
+    }
+
+    #[cfg(windows)]
+    fn make_queue_and_list() -> (This, This, This) {
+        let null = std::ptr::null();
+        let desc = QueueDesc {
+            kind: 0,
+            priority: 0,
+            flags: 0,
+            nodes: 0,
+        };
+        let mut q = null;
+        assert_eq!(create(null, &desc, &QUEUE_IIDS[0], &mut q), S_OK);
+        let mut alloc = null;
+        let alloc_iid = guid(
+            0x6102dee4,
+            0xaf59,
+            0x4b09,
+            [0xb9, 0x99, 0xb4, 0x4d, 0x73, 0xf0, 0x9b, 0x24],
+        );
+        assert_eq!(
+            crate::list::create_allocator(null, 0, &alloc_iid, &mut alloc),
+            S_OK
+        );
+        let mut list = null;
+        let list_iid = guid(
+            0x5b160d0f,
+            0xac1b,
+            0x4185,
+            [0x8b, 0xa8, 0xb3, 0xae, 0x42, 0xa5, 0xa4, 0x55],
+        );
+        assert_eq!(
+            crate::list::create_list(null, 0, 0, alloc, null, &list_iid, &mut list),
+            S_OK
+        );
+        (q, alloc, list)
+    }
+
+    #[cfg(windows)]
+    fn list_slot_offset(list: This, old_offset: usize) -> usize {
+        if crate::list::has_newer_table(list) && old_offset >= 59 * 8 {
+            old_offset + 16
+        } else {
+            old_offset
+        }
+    }
+
+    #[cfg(windows)]
+    fn wait_fence_value(fence: This, want: u64) {
+        let completed = slot::<extern "system" fn(This) -> u64>(fence, 0x40);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while completed(fence) < want {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for fence value {want} (got {})",
+                completed(fence)
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn command_list_memory_wait_orders_producer_and_consumer_both_ways() {
+        for consumer_first in [false, true] {
+            let (prod_q, prod_alloc, prod_list) = make_queue_and_list();
+            let (cons_q, cons_alloc, cons_list) = make_queue_and_list();
+            let mut fence = std::ptr::null();
+            assert_eq!(
+                crate::fence::create(
+                    std::ptr::null(),
+                    0,
+                    0,
+                    &crate::fence::FENCE_IIDS[0],
+                    &mut fence
+                ),
+                S_OK
+            );
+
+            let payload = Box::new(AtomicU64::new(0));
+            let counter = Box::new(AtomicU64::new(0));
+            let result = Box::new(AtomicU64::new(0));
+
+            let write64 = slot::<extern "system" fn(This, u64, u64, u32, u32)>(
+                prod_list,
+                list_slot_offset(prod_list, 0x230),
+            );
+            let close_p = slot::<extern "system" fn(This) -> HRESULT>(prod_list, 0x48);
+            write64(prod_list, (&raw const *payload) as u64, 0x5a55a11c, 0, 0);
+            write64(prod_list, (&raw const *counter) as u64, 2, 0, 0);
+            assert_eq!(close_p(prod_list), S_OK);
+
+            let wait64 = slot::<extern "system" fn(This, u64, u32, u64, u32)>(
+                cons_list,
+                list_slot_offset(cons_list, 0x240),
+            );
+            let copy_mem = slot::<extern "system" fn(This, u64, u64, u64, u32)>(
+                cons_list,
+                list_slot_offset(cons_list, 0x1e0),
+            );
+            let close_c = slot::<extern "system" fn(This) -> HRESULT>(cons_list, 0x48);
+            wait64(cons_list, (&raw const *counter) as u64, 7, 1, 0);
+            copy_mem(
+                cons_list,
+                (&raw const *result) as u64,
+                (&raw const *payload) as u64,
+                8,
+                0,
+            );
+            assert_eq!(close_c(cons_list), S_OK);
+
+            let exec_p = slot::<extern "system" fn(This, u32, *const This)>(prod_q, 0x50);
+            let exec_c = slot::<extern "system" fn(This, u32, *const This)>(cons_q, 0x50);
+            let sig_c =
+                slot::<extern "system" fn(This, This, u64) -> HRESULT>(cons_q, signal_slot(cons_q));
+            let completed = slot::<extern "system" fn(This) -> u64>(fence, 0x40);
+
+            if consumer_first {
+                exec_c(cons_q, 1, &cons_list);
+                assert_eq!(sig_c(cons_q, fence, 1), S_OK);
+                assert_eq!(completed(fence), 0);
+                assert_eq!(result.load(Ordering::Acquire), 0);
+                exec_p(prod_q, 1, &prod_list);
+                wait_fence_value(fence, 1);
+            } else {
+                exec_p(prod_q, 1, &prod_list);
+                exec_c(cons_q, 1, &cons_list);
+                assert_eq!(sig_c(cons_q, fence, 1), S_OK);
+                assert_eq!(completed(fence), 1);
+            }
+
+            assert_eq!(counter.load(Ordering::Acquire), 2);
+            assert_eq!(payload.load(Ordering::Acquire), 0x5a55a11c);
+            assert_eq!(
+                result.load(Ordering::Acquire),
+                0x5a55a11c,
+                "consumer_first={consumer_first}"
+            );
+
+            for o in [
+                prod_list, prod_alloc, prod_q, cons_list, cons_alloc, cons_q, fence,
+            ] {
+                slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn mid_list_memory_wait_preserves_pre_wait_work_and_releases_post_wait_tail() {
+        let (prod_q, prod_alloc, prod_list) = make_queue_and_list();
+        let (cons_q, cons_alloc, cons_list) = make_queue_and_list();
+        let mut fence = std::ptr::null();
+        assert_eq!(
+            crate::fence::create(
+                std::ptr::null(),
+                0,
+                0,
+                &crate::fence::FENCE_IIDS[0],
+                &mut fence
+            ),
+            S_OK
+        );
+
+        let pre_src = Box::new(AtomicU64::new(0xfeed_face_cafe_babe));
+        let pre_dst = Box::new(AtomicU64::new(0));
+        let pre_marker = Box::new(AtomicU64::new(0));
+        let gate = Box::new(AtomicU64::new(0));
+        let post_src = Box::new(AtomicU64::new(0));
+        let post_dst = Box::new(AtomicU64::new(0));
+        let post_marker = Box::new(AtomicU64::new(0));
+
+        let write64_c = slot::<extern "system" fn(This, u64, u64, u32, u32)>(
+            cons_list,
+            list_slot_offset(cons_list, 0x230),
+        );
+        let wait64_c = slot::<extern "system" fn(This, u64, u32, u64, u32)>(
+            cons_list,
+            list_slot_offset(cons_list, 0x240),
+        );
+        let copy_c = slot::<extern "system" fn(This, u64, u64, u64, u32)>(
+            cons_list,
+            list_slot_offset(cons_list, 0x1e0),
+        );
+        let close_c = slot::<extern "system" fn(This) -> HRESULT>(cons_list, 0x48);
+
+        // Pre-wait work.
+        copy_c(
+            cons_list,
+            (&raw const *pre_dst) as u64,
+            (&raw const *pre_src) as u64,
+            8,
+            0,
+        );
+        write64_c(
+            cons_list,
+            (&raw const *pre_marker) as u64,
+            0x1111_2222_3333_4444,
+            0,
+            0,
+        );
+        // Full 64-bit threshold: low 32 bits alone must not satisfy it.
+        wait64_c(
+            cons_list,
+            (&raw const *gate) as u64,
+            7,
+            0x0000_0001_0000_0001,
+            1,
+        );
+        // Post-wait work.
+        copy_c(
+            cons_list,
+            (&raw const *post_dst) as u64,
+            (&raw const *post_src) as u64,
+            8,
+            0,
+        );
+        write64_c(
+            cons_list,
+            (&raw const *post_marker) as u64,
+            0xaaaa_bbbb_cccc_dddd,
+            0,
+            0,
+        );
+        assert_eq!(close_c(cons_list), S_OK);
+
+        let write64_p = slot::<extern "system" fn(This, u64, u64, u32, u32)>(
+            prod_list,
+            list_slot_offset(prod_list, 0x230),
+        );
+        let close_p = slot::<extern "system" fn(This) -> HRESULT>(prod_list, 0x48);
+        write64_p(
+            prod_list,
+            (&raw const *post_src) as u64,
+            0x5a55_a11c_dead_beef,
+            0,
+            0,
+        );
+        write64_p(
+            prod_list,
+            (&raw const *gate) as u64,
+            0x0000_0001_0000_0001,
+            0,
+            0,
+        );
+        assert_eq!(close_p(prod_list), S_OK);
+
+        let exec_c = slot::<extern "system" fn(This, u32, *const This)>(cons_q, 0x50);
+        let exec_p = slot::<extern "system" fn(This, u32, *const This)>(prod_q, 0x50);
+        let sig_c =
+            slot::<extern "system" fn(This, This, u64) -> HRESULT>(cons_q, signal_slot(cons_q));
+        let completed = slot::<extern "system" fn(This) -> u64>(fence, 0x40);
+
+        // Submit consumer first: pre-wait work completes immediately; post-wait stays pending.
+        exec_c(cons_q, 1, &cons_list);
+        assert_eq!(sig_c(cons_q, fence, 1), S_OK);
+        assert_eq!(pre_dst.load(Ordering::Acquire), 0xfeed_face_cafe_babe);
+        assert_eq!(pre_marker.load(Ordering::Acquire), 0x1111_2222_3333_4444);
+        assert_eq!(post_dst.load(Ordering::Acquire), 0);
+        assert_eq!(post_marker.load(Ordering::Acquire), 0);
+        assert_eq!(completed(fence), 0);
+
+        // Low-32-bit write only must not release a 64-bit wait.
+        gate.store(1, Ordering::Release);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        assert_eq!(post_dst.load(Ordering::Acquire), 0);
+        assert_eq!(completed(fence), 0);
+
+        // Producer writes full 64-bit payload and gate, releasing post-wait work and fence.
+        exec_p(prod_q, 1, &prod_list);
+        wait_fence_value(fence, 1);
+        assert_eq!(post_dst.load(Ordering::Acquire), 0x5a55_a11c_dead_beef);
+        assert_eq!(post_marker.load(Ordering::Acquire), 0xaaaa_bbbb_cccc_dddd);
+
+        for o in [
+            prod_list, prod_alloc, prod_q, cons_list, cons_alloc, cons_q, fence,
+        ] {
+            slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        }
     }
 }
