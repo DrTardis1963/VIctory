@@ -48,7 +48,7 @@ pub(crate) fn near_heaps(va: u64) -> String {
         let kind = if sampler { "sampler" } else { "view" };
         let place = if va < start {
             format!("{:#x} below", start - va)
-        } else if va < start + bytes {
+        } else if va - start < bytes {
             format!("inside, slot {}", (va - start) / step)
         } else {
             format!("{:#x} past its end (slot {})", va - start - bytes, (va - start) / step)
@@ -311,9 +311,12 @@ impl HostHeap {
     pub(crate) fn constant_at(&self, index: u32, gpu: u64, size: u32) {
         self.keep(index, None);
         let Some(host) = host() else { return };
-        let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
-            BufferLocation: gpu,
-            SizeInBytes: size.next_multiple_of(256),
+        let desc = match size.checked_next_multiple_of(256) {
+            Some(aligned) => D3D12_CONSTANT_BUFFER_VIEW_DESC {
+                BufferLocation: gpu,
+                SizeInBytes: aligned,
+            },
+            None => D3D12_CONSTANT_BUFFER_VIEW_DESC::default(),
         };
         // SAFETY: a slot of our heap; the memory is the caller's.
         unsafe {
@@ -443,6 +446,14 @@ fn element_size(desc: &D3D12_SHADER_RESOURCE_VIEW_DESC) -> u64 {
     }
 }
 
+fn checked_buffer_range(base: u64, first: u64, count: u32, element: u64) -> Option<(u64, u64)> {
+    let offset = first.checked_mul(element)?;
+    let start = base.checked_add(offset)?;
+    let len = u64::from(count).checked_mul(element)?;
+    start.checked_add(len)?;
+    Some((start, len))
+}
+
 /// The title memory a buffer shader or unordered access view reads: its
 /// address and length.
 pub(crate) fn buffer_range(view: &View) -> Option<(u64, u64)> {
@@ -469,10 +480,7 @@ pub(crate) fn buffer_range(view: &View) -> Option<(u64, u64)> {
     let element = element_size(&desc);
     // SAFETY: a buffer view's union member.
     let buffer = unsafe { desc.Anonymous.Buffer };
-    Some((
-        base + buffer.FirstElement * element,
-        u64::from(buffer.NumElements) * element,
-    ))
+    checked_buffer_range(base, buffer.FirstElement, buffer.NumElements, element)
 }
 
 /// [`buffer_range`] of an unordered access view of memory at `base`.
@@ -487,10 +495,7 @@ fn unordered_range(base: u64, words: &[u32; 10]) -> Option<(u64, u64)> {
     } else {
         crate::resource::element(desc.Format.0 as u32)?.0
     };
-    Some((
-        base + buffer.FirstElement * element,
-        u64::from(buffer.NumElements) * element,
-    ))
+    checked_buffer_range(base, buffer.FirstElement, buffer.NumElements, element)
 }
 
 /// The host resource a slot made by [`make`] views, if any.
@@ -628,6 +633,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
     let device = &host.device;
     match view {
         &View::Constant(address, size) => {
+            let aligned = size.checked_next_multiple_of(256)?;
             let shadow = crate::shadow::find(address, u64::from(size))?;
             let gpu = shadow.gpu(address);
             if gpu % 256 != 0 {
@@ -639,7 +645,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             }
             let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
                 BufferLocation: gpu,
-                SizeInBytes: size.next_multiple_of(256),
+                SizeInBytes: aligned,
             };
             // SAFETY: a slot of our heap; the range lies in the host copy.
             unsafe { device.CreateConstantBufferView(Some(&desc), at) };
@@ -972,5 +978,84 @@ mod tests {
         heap.release(a, 50);
         assert_eq!(heap.dynamic(50), Some(4));
         assert_eq!(heap.dynamic(40), Some(4 + heap.dynamic - 40));
+    }
+
+    #[test]
+    fn buffer_range_and_constant_size_overflows_are_rejected() {
+        let srv_words = |first: u64, count: u32, stride: u32| {
+            let d = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                Format: DXGI_FORMAT_UNKNOWN,
+                ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+                Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                    Buffer: D3D12_BUFFER_SRV {
+                        FirstElement: first,
+                        NumElements: count,
+                        StructureByteStride: stride,
+                        Flags: D3D12_BUFFER_SRV_FLAG_NONE,
+                    },
+                },
+            };
+            // SAFETY: first 40 bytes hold the variant layout `srv_desc` reads.
+            unsafe { std::ptr::from_ref(&d).cast::<[u32; 10]>().read_unaligned() }
+        };
+        let uav_words = |first: u64, count: u32, stride: u32| {
+            let d = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                Format: DXGI_FORMAT_UNKNOWN,
+                ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+                Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                    Buffer: D3D12_BUFFER_UAV {
+                        FirstElement: first,
+                        NumElements: count,
+                        StructureByteStride: stride,
+                        CounterOffsetInBytes: 0,
+                        Flags: D3D12_BUFFER_UAV_FLAG_NONE,
+                    },
+                },
+            };
+            // SAFETY: first 40 bytes hold the variant layout `uav_desc` reads.
+            unsafe { std::ptr::from_ref(&d).cast::<[u32; 10]>().read_unaligned() }
+        };
+        let mut resource = [0u32; 14];
+        resource[0] = 1; // BUFFER
+        let placed = |unordered: bool, base: u64, words: [u32; 10]| {
+            let mut desc = [0u32; 16];
+            desc[..10].copy_from_slice(&words);
+            desc[10] = base as u32;
+            desc[11] = (base >> 32) as u32;
+            View::Placed(unordered, resource, desc)
+        };
+
+        // Valid baseline, plus FirstElement*element, base+offset, NumElements*element, and start+len overflows.
+        assert_eq!(
+            buffer_range(&placed(false, 0x1_0000, srv_words(2, 3, 4))),
+            Some((0x1_0008, 12))
+        );
+        assert_eq!(
+            buffer_range(&placed(true, 0x1_0000, uav_words(2, 3, 4))),
+            Some((0x1_0008, 12))
+        );
+        for (first, base, count, stride) in [
+            (u64::MAX, 0x1_0000, 1, 4u32),
+            (2, u64::MAX - 4, 1, 4),
+            (0, u64::MAX - 0x1000, 2, 0x8000_0000),
+            (0, u64::MAX - 4, 2, 4),
+        ] {
+            assert_eq!(
+                buffer_range(&placed(false, base, srv_words(first, count, stride))),
+                None
+            );
+            assert_eq!(
+                buffer_range(&placed(true, base, uav_words(first, count, stride))),
+                None
+            );
+        }
+
+        if let (Some(host), Some(heap)) = (host(), HostHeap::new(false, 4)) {
+            heap.constant_at(0, 0x1_0000, u32::MAX);
+            assert!(make(&View::Constant(0x1_0000, u32::MAX), heap.cpu(0)).is_none());
+            // SAFETY: plain device query.
+            assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+        }
     }
 }
