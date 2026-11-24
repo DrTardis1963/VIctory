@@ -348,8 +348,9 @@ fn serialize_library(library: &Mutex<Library>, buf: &mut Vec<u8>) -> Option<(usi
 /// Performs the actual snapshot + unlocked disk I/O for `host-pipelines.bin`
 /// and `early-pipelines.txt`.
 fn perform_save(dir: &Path, buf: &mut Vec<u8>) {
-    let Some(library) = library() else { return };
-    let serialized = serialize_library(library, buf);
+    // The early list is kept even when the host has no pipeline library (#1429).
+    let library = library();
+    let serialized = library.and_then(|l| serialize_library(l, buf));
     let used_snapshot = if USED_CHANGED.swap(false, Ordering::AcqRel) {
         let keys: Vec<String> = USED
             .lock()
@@ -367,7 +368,7 @@ fn perform_save(dir: &Path, buf: &mut Vec<u8>) {
     }
 
     if let Err(e) = std::fs::create_dir_all(dir) {
-        if let Some((_, added)) = serialized {
+        if let (Some(library), Some((_, added))) = (library, serialized) {
             library.lock().unwrap_or_else(|e| e.into_inner()).added += added;
             LIBRARY_DIRTY.store(true, Ordering::Relaxed);
         }
@@ -380,7 +381,7 @@ fn perform_save(dir: &Path, buf: &mut Vec<u8>) {
 
     let mut lib_bytes = 0usize;
     let mut ok = true;
-    if let Some((len, added)) = serialized {
+    if let (Some(library), Some((len, added))) = (library, serialized) {
         if let Err(e) = write_atomically(&dir.join(LIBRARY_FILE), &buf[..len]) {
             library.lock().unwrap_or_else(|e| e.into_inner()).added += added;
             LIBRARY_DIRTY.store(true, Ordering::Relaxed);
