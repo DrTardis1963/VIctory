@@ -4033,25 +4033,20 @@ impl<'a> Lower<'a> {
             }
             return Ok(());
         }
-        if let Some(u) = kind
-            && matches!(u.kind, ResourceType::Srv | ResourceType::Uav)
-        {
-            let u_bit = if u.kind == ResourceType::Uav { 0x1000 } else { 0 };
-            // Scalar buffer loads address bytes, even when the descriptor carries a stride.
-            let h = self.handle(site, src, false, (11 | u_bit, 0))?;
-            let elem_off = self.s.m.undef(self.s.t.i32);
+        if matches!(kind, Some(u) if u.kind == ResourceType::Srv) {
+            let h = self.handle(site, src, false, (11, 0))?;
             for k in 0..count {
                 let off = self.s.m.i32(4 * k);
                 let a = self.s.m.bin(c, Bin::Add, addr, off);
                 let mask = self.s.m.i8(1);
-                let al = self.s.m.i32(4);
+                let (u, al) = (self.s.m.undef(self.s.t.i32), self.s.m.i32(4));
                 let r = self.s.op(
                     c,
                     "rawBufferLoad.f32",
                     Attr::ReadOnly,
                     self.s.t.res_ret,
                     139,
-                    &[h, a, elem_off, mask, al],
+                    &[h, a, u, mask, al],
                 );
                 let x = self.s.m.extract(c, r, 0);
                 let x = self.as_int(x);
@@ -4201,24 +4196,18 @@ impl<'a> Lower<'a> {
         // own uses, else those of a twin load of the same dwords (a
         // non-uniform index reloads the descriptor in each waterfall loop,
         // one for the size bits, another for the access).
-        // An image or vector buffer use is preferred to a scalar one when a
-        // descriptor has both: those carry format and indexing cues.
         let uses = |twin: &dyn Fn(Site) -> bool| {
-            let mut found: Option<(Site, u8)> = None;
-            for d in self.x.res.descriptors.iter().filter(|d| d.role == Role::Resource) {
-                for l in d.source.leaves() {
-                    if let Source::Loaded { load, first } = *l
-                        && twin(load)
-                    {
-                        let ui = &self.x.p.blocks[d.site.0].insts[d.site.1];
-                        if matches!(ui.fields, Fields::Image { .. } | Fields::Buffer { .. }) {
-                            return Some((d.site, first));
-                        }
-                        found.get_or_insert((d.site, first));
-                    }
-                }
-            }
-            found
+            self.x
+                .res
+                .descriptors
+                .iter()
+                .filter(|d| d.role == Role::Resource)
+                .find_map(|d| {
+                    d.source.leaves().into_iter().find_map(|l| match *l {
+                        Source::Loaded { load, first } if twin(load) => Some((d.site, first)),
+                        _ => None,
+                    })
+                })
         };
         let use_at =
             uses(&|load| load == site).or_else(|| uses(&|load| self.twin_loads(site, load)));
@@ -4259,12 +4248,6 @@ impl<'a> Lower<'a> {
                         return Err("a constant buffer's descriptor read as data");
                     }
                     (props, None)
-                }
-                Fields::Smem { .. } if un.starts_with("s_buffer_") => {
-                    if used.is_some_and(|u| u.kind == ResourceType::Cbv) {
-                        return Err("a constant buffer's descriptor read as data");
-                    }
-                    ((11 | u, 0), None)
                 }
                 _ => return Err("a scalar memory read as data"),
             };
@@ -7918,14 +7901,7 @@ impl<'a> Lower<'a> {
                         Attr::ReadOnly,
                         f32t,
                         81,
-                        &[
-                            h,
-                            sh,
-                            cs[0],
-                            if spatial > 1 { cs[1] } else { fu },
-                            if spatial > 2 { cs[2] } else { fu },
-                            clamped,
-                        ],
+                        &[h, sh, cs[0], cs[1], cs[2], clamped],
                     );
                     let x = self.as_int(lod);
                     self.write(inst, Reg::V(reg + k as u8), x, guard);
@@ -9394,18 +9370,6 @@ impl<'a> Lower<'a> {
         for (v, b, i) in std::mem::take(&mut self.data_phis) {
             let phi = &p.blocks[b].phis[i];
             let bit = phi.reg == Reg::Scc;
-            // A register initialized only on one branch may carry a dead
-            // descriptor dword left over from earlier register reuse on the
-            // other branch (guarded by a separate predicate). Only treat a
-            // descriptor-dword `Missing` as fatal when no incoming edge carries
-            // a real data value.
-            let has_data = !bit
-                && p.blocks[b]
-                    .preds
-                    .iter()
-                    .enumerate()
-                    .filter(|&(_, &q)| self.tail[q].is_some())
-                    .any(|(n, _)| matches!(self.vals.get(&phi.args[n]), Some(Val::I32(_))));
             let mut incoming = Vec::new();
             for (n, &q) in p.blocks[b].preds.iter().enumerate() {
                 let Some(qb) = self.tail[q] else { continue };
@@ -9416,16 +9380,6 @@ impl<'a> Lower<'a> {
                 }
                 let x = match (self.vals.get(&arg).copied(), bit) {
                     (Some(Val::I32(x)), false) | (Some(Val::Bit(x)), true) => x,
-                    (Some(Val::Missing(why)), false)
-                        if has_data
-                            && matches!(
-                                why,
-                                "a descriptor's address or format read as data"
-                                    | "a descriptor read only as data"
-                            ) =>
-                    {
-                        self.s.m.i32(0)
-                    }
                     (Some(Val::Bit(_)), false) if self.read_phis.contains(&phi.value) => {
                         return Err(Stop::Retry(phi.value, "an SCC joined with SGPR values"));
                     }
