@@ -386,12 +386,11 @@ fn workers() -> bool {
                 // on a world compute program and refused it as out of memory.
                 .stack_size(PIPELINE_STACK)
                 .spawn(|| {
-                    // Below the title's own threads (loading, recording).
-                    // SAFETY: a plain call on our own thread.
-                    unsafe {
-                        use windows::Win32::System::Threading::*;
-                        let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
-                    }
+                    // At the title's own priority: below it, the world's
+                    // busy threads starved the workers (236 pipelines a
+                    // minute at the start screen, 7 a minute in the world on
+                    // a 16-thread laptop, PR #1505), and draws stay dropped
+                    // until their pipelines exist.
                     loop {
                         next().make();
                         if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
