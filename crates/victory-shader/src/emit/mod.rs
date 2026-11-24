@@ -1814,12 +1814,13 @@ mod mesh_tests {
     use super::*;
     use crate::native::StageIo;
 
-    /// A mesh program of `threads` lanes declaring `max` vertices and
-    /// primitives that runs `code`, then exports its vertex (the position,
+    /// A mesh program of `threads` lanes (in wave64 or wave32 waves)
+    /// declaring `max` vertices and primitives that runs `code`, then exports its vertex (the position,
     /// then `vertex_rows` four-component rows) and its primitive
     /// (`prim_rows` rows), translated.
     fn mesh_after(
         code: &[u32],
+        wave64: bool,
         threads: u32,
         max: u32,
         vertex_rows: u8,
@@ -1869,7 +1870,7 @@ mod mesh_tests {
         ]);
         let native = NativeProgram {
             stage: HwStage::Ms,
-            wave64: true,
+            wave64,
             vgprs: 256,
             layout: vec![],
             used: vec![],
@@ -1907,13 +1908,62 @@ mod mesh_tests {
             0xBF85_0001, // s_cbranch_scc1 -> past the next
             0x7E04_0280, // v_mov_b32 v2, 0
         ];
-        assert!(mesh_after(&all_equal, 64, 64, 1, 0).is_ok());
+        assert!(mesh_after(&all_equal, true, 64, 64, 1, 0).is_ok());
         // The count itself is the console wave's, not the host's.
         all_equal[5] = 0x7E04_0204; // v_mov_b32 v2, s4
-        let err = mesh_after(&all_equal, 64, 64, 1, 0).unwrap_err();
+        let err = mesh_after(&all_equal, true, 64, 64, 1, 0).unwrap_err();
         assert!(
             err.to_string().contains("a lane mask read as data"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn mesh_sums_over_the_hosts_wave() {
+        // WaveActiveSum(v0) as the console compiler expands it for wave32
+        // (see `wave::tests`), its total tested by a uniform branch.
+        // (Wave64 totals add the halves' lane reads with scalar code, which
+        // the section simulation here does not follow.)
+        let sum = [
+            0xBE80_3DC1, // s_or_saveexec_b32 s0, -1
+            0xD501_0001,
+            0x0002_0080, // v_cndmask_b32_e64 v1, 0, v0, s0
+            0x4A02_02FA,
+            0xFF01_6101, // v_add_nc_u32_dpp v1, v1, v1 row_xmask:1
+            0x4A02_02FA,
+            0xFF01_6201, // v_add_nc_u32_dpp v1, v1, v1 row_xmask:2
+            0x4A02_02FA,
+            0xFF01_6401, // v_add_nc_u32_dpp v1, v1, v1 row_xmask:4
+            0x4A02_02FA,
+            0xFF01_6801, // v_add_nc_u32_dpp v1, v1, v1 row_xmask:8
+            0xD777_0002,
+            0x0305_8301, // v_permlane16_b32 v2, v1, -1, -1
+            0xD778_0003,
+            0x0305_8302, // v_permlanex16_b32 v3, v2, -1, -1
+            0x4A08_0702, // v_add_nc_u32_e32 v4, v2, v3
+            0xD760_0002,
+            0x0001_0104, // v_readlane_b32 s2, v4, 0
+            0xBEFE_0300, // s_mov_b32 exec_lo, s0
+            0xBF06_8002, // s_cmp_eq_u32 s2, 0
+            0xBF85_0001, // s_cbranch_scc1 -> past the next
+            0x7E0C_0280, // v_mov_b32 v6, 0
+        ];
+        let s = mesh_after(&sum, false, 32, 32, 1, 0).unwrap();
+        if let Some(r) = validated(&s.dxil) {
+            assert_eq!(r, Ok(()));
+        }
+    }
+
+    /// What `dxil.dll` says of a container; `None` without it.
+    #[cfg(windows)]
+    fn validated(dxil: &[u8]) -> Option<Result<(), String>> {
+        let path = super::validator::Validator::default_path();
+        let mut v = super::validator::Validator::load(path.as_deref()).ok()?;
+        Some(v.validate(&mut dxil.to_vec()))
+    }
+
+    #[cfg(not(windows))]
+    fn validated(_: &[u8]) -> Option<Result<(), String>> {
+        None
     }
 }

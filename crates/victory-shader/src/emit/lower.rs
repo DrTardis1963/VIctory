@@ -1015,8 +1015,11 @@ impl<'a> Lower<'a> {
                 (op, src, mask, ident, Some(inclusive))
             }
         };
-        if self.mask_data == MaskData::None {
-            return Err("a wave reduction in a mesh shader");
+        // Mesh: a reduction over the host's wave is what the HLSL operation
+        // gives there; a prefix also orders lanes, which are the console's
+        // in mesh programs.
+        if self.mask_data == MaskData::None && prefix.is_some() {
+            return Err("a wave prefix in a mesh shader");
         }
         if self.split {
             return Err("a wave reduction in a wave64 program split in halves");
