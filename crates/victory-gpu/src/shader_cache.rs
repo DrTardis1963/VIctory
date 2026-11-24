@@ -9,9 +9,10 @@
 //! must be added to `encode` and `decode` too (entries of older builds
 //! are ignored anyway).
 
+use std::collections::HashSet;
 use std::path::PathBuf;
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
 
 pub use victory_pipeline::Cache;
 use victory_pipeline::{CacheKey, Converter};
@@ -25,12 +26,64 @@ static MISSES: AtomicU64 = AtomicU64::new(0);
 
 /// Keeps translated shaders in `dir` from now on.
 pub fn use_shader_cache(dir: PathBuf) {
-    match Cache::open(dir) {
+    match Cache::open(&dir) {
         Ok(cache) => {
             let _ = CACHE.set(cache);
+            let _ = USED_DIR.set(dir);
         }
         Err(e) => tracing::warn!(error = %e, "no shader cache"),
     }
+}
+
+/// The containers runs translated, one per line by the hash the log names
+/// them by (`hash=`), in the cache folder: `victory translate --used-only`
+/// warms just those.
+pub const USED_FILE: &str = "used-shaders.txt";
+static USED_DIR: OnceLock<PathBuf> = OnceLock::new();
+
+/// Adds `container` to the used list if no run listed it yet.
+fn note_used(container: &[u8]) {
+    use std::io::Write;
+    static USED: Mutex<Option<(HashSet<String>, Option<std::fs::File>)>> = Mutex::new(None);
+    let Some(dir) = USED_DIR.get() else {
+        return;
+    };
+    let mut used = USED.lock().unwrap_or_else(|e| e.into_inner());
+    let (listed, file) = used.get_or_insert_with(|| {
+        let path = dir.join(USED_FILE);
+        let listed = std::fs::read_to_string(&path)
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .ok();
+        (listed, file)
+    });
+    let hex = short_hash(container);
+    if let Some(f) = file
+        && !listed.contains(&hex)
+    {
+        // shortcut: a failed append only leaves the shader to the full warm-up.
+        let _ = writeln!(f, "{hex}");
+        listed.insert(hex);
+    }
+}
+
+/// A container's hash as the log names it: the first 16 hex digits of its
+/// BLAKE3.
+pub fn short_hash(container: &[u8]) -> String {
+    blake3::hash(container).to_hex()[..16].to_owned()
+}
+
+/// The containers in the used list in `dir`, `None` if there is none yet.
+pub fn used(dir: &std::path::Path) -> Option<HashSet<String>> {
+    let text = std::fs::read_to_string(dir.join(USED_FILE)).ok()?;
+    let hash = |l: &str| l.len() == 16 && l.bytes().all(|b| b.is_ascii_hexdigit());
+    Some(text.lines().map(str::trim).filter(|l| hash(l)).map(str::to_owned).collect())
 }
 
 /// Translates `container` into `cache` as a run of this executable would,
@@ -124,6 +177,7 @@ fn last() -> &'static [u8; 32] {
 /// there is one.
 pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
     let translate = |c: &[u8]| victory_shader::emit::translate(c).map_err(|e| e.to_string());
+    note_used(container);
     match CACHE.get() {
         Some(cache) => {
             let result = cached(cache, build(), last(), container, translate);
@@ -429,6 +483,15 @@ mod tests {
     use super::*;
 
     const LAST: [u8; 32] = [9; 32];
+
+    #[test]
+    fn the_used_list_reads_digests_and_skips_damage() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(used(dir.path()), None);
+        let a = short_hash(b"a container");
+        std::fs::write(dir.path().join(USED_FILE), format!("{a}\nhalf a li\n")).unwrap();
+        assert_eq!(used(dir.path()), Some(HashSet::from([a])));
+    }
 
     #[test]
     fn a_failing_translation_falls_back_to_the_last_that_worked() {

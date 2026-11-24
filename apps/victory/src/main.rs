@@ -86,6 +86,10 @@ enum Command {
         /// executable reads them); shaders already there are skipped.
         #[arg(long)]
         write_cache: bool,
+        /// Only the shaders earlier runs used (`used-shaders.txt` in the
+        /// shader cache; every shader while there is no list yet).
+        #[arg(long, requires = "write_cache")]
+        used_only: bool,
         /// Translate as for a host whose waves are MIN-MAX lanes (32-32 for
         /// NVIDIA): sets the widest host wave, MAX, as a run on that GPU
         /// does (this translator does not use MIN). Default: with
@@ -163,6 +167,7 @@ fn main() -> Result<()> {
             pipelines,
             list,
             write_cache,
+            used_only,
             host_lanes,
             jobs,
         } => {
@@ -174,7 +179,7 @@ fn main() -> Result<()> {
             if let Some(n) = std::env::var("VICTORY_HOST_WAVE").ok().and_then(|v| v.parse().ok()) {
                 victory_shader::emit::set_host_max_wave(n);
             }
-            translate::run(paths, validate, pipelines, list, write_cache, host_lanes, jobs)
+            translate::run(paths, validate, pipelines, list, write_cache, used_only, host_lanes, jobs)
         }
         Command::Run {
             exe,

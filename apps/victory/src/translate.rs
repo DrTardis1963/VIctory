@@ -162,6 +162,8 @@ struct Checks<'a> {
     /// The walk only warms the cache (no checks, listing or pairs asked
     /// for): the analysis is skipped.
     warm_only: bool,
+    /// With `--used-only`: the containers earlier runs used.
+    used: Option<&'a HashSet<String>>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -171,6 +173,7 @@ pub fn run(
     pipelines: bool,
     list: bool,
     write_cache: bool,
+    used_only: bool,
     host_lanes: Option<(u32, u32)>,
     jobs: Option<usize>,
 ) -> Result<()> {
@@ -214,6 +217,19 @@ pub fn run(
             emit::host_max_wave(),
             emit::view_heap_limit()
         );
+    }
+    let used = cache
+        .as_ref()
+        .filter(|_| used_only)
+        .and_then(|(dir, _)| {
+            let used = shader_cache::used(dir);
+            if used.is_none() {
+                println!("no {} yet: warming every shader", shader_cache::USED_FILE);
+            }
+            used
+        });
+    if let Some(used) = &used {
+        println!("used only    {} shaders earlier runs used", used.len());
     }
     let pairs: Vec<(String, String)> = std::env::var("VICTORY_PAIRS")
         .unwrap_or_default()
@@ -269,6 +285,7 @@ pub fn run(
                                 .flatten(),
                             cache: cache.as_ref().map(|(_, c)| c),
                             warm_only,
+                            used: used.as_ref(),
                         };
                         while let Some(job) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) {
                             translate(job, entry.path(), &seen, &mut t, &mut checks);
@@ -449,6 +466,14 @@ fn translate(
     // The container as a run hands it over (`parse` checked the size).
     let total = u32::from_le_bytes(bytes[0x18..0x1c].try_into().expect("4 bytes")) as usize;
     let container_bytes = &bytes[..total];
+    // Before the duplicate check: an unused container must not take the
+    // DXIL of a used one.
+    if checks
+        .used
+        .is_some_and(|used| !used.contains(&shader_cache::short_hash(container_bytes)))
+    {
+        return;
+    }
     if !lock(seen).insert(code) {
         t.duplicates += 1;
         if t.list {
