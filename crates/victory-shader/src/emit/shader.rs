@@ -73,6 +73,7 @@ pub const USER_VIEW_BIAS: u32 = 0x103;
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
     pub const RAW_BUFFERS: u64 = 1 << 4;
+    pub const VIEWPORT_RT_INDEX: u64 = 1 << 9;
     pub const STENCIL_REF: u64 = 1 << 11;
     pub const TYPED_UAV_LOADS: u64 = 1 << 13;
     pub const WAVE_OPS: u64 = 1 << 19;
@@ -453,8 +454,10 @@ impl Shader {
         if passes != 0 {
             self.m.optimise(passes);
             let used = self.m.usage();
+            let has_bary_input = self.inputs.iter().any(|e| e.kind == 28);
             for (flag, used) in [
                 (flags::WAVE_OPS, used.wave_ops),
+                (flags::BARYCENTRICS, used.barycentrics || has_bary_input),
                 (flags::INT64, used.int64),
                 (flags::TYPED_UAV_LOADS, used.typed_uav_loads),
                 (flags::RESOURCE_HEAP, used.heap_views),
@@ -464,6 +467,10 @@ impl Shader {
                 if !used {
                     self.flags &= !flag;
                 }
+            }
+            let input_usage = self.m.input_usage(self.inputs.len());
+            for (e, mask) in self.inputs.iter_mut().zip(input_usage) {
+                e.usage = mask;
             }
         }
         let mut resources = None;
@@ -782,6 +789,9 @@ impl Shader {
         }
         if self.flags & flags::TYPED_UAV_LOADS != 0 {
             features |= 0x800;
+        }
+        if self.flags & flags::VIEWPORT_RT_INDEX != 0 {
+            features |= 0x2000;
         }
         if self.flags & flags::WAVE_OPS != 0 {
             features |= 0x4000;

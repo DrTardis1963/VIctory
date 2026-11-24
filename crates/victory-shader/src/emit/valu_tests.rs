@@ -308,6 +308,109 @@ fn packed_add_selects_halves_of_inline_constants() {
     }
 }
 
+/// The float `v_cvt_f32_f64` gives for `x`: Rust's rounding (to nearest
+/// even), with results below the smallest normal float flushed to signed
+/// zero as the console's default float mode does.
+fn cvt_f32_f64_reference(x: f64) -> u32 {
+    let r = x as f32;
+    if r.is_subnormal() || (r == 0.0 && x != 0.0) {
+        r.to_bits() & 0x8000_0000
+    } else {
+        r.to_bits()
+    }
+}
+
+#[test]
+fn v_cvt_f32_f64_rounds_to_nearest_even() {
+    // v_cvt_f32_f64 v0, v[1:2] (VOP1 opcode 0x0f)
+    let shader = build_valu_cs(&[vop1(0x00f, 0, vgpr(1))]);
+    let tie_even = 1.0f64 + f64::from(f32::EPSILON) / 2.0; // ties to 1.0
+    let tie_odd = 1.0f64 + 1.5 * f64::from(f32::EPSILON); // ties up to 1 + 2 ulp
+    let values = [
+        0.0,
+        -0.0,
+        1.0,
+        -2.5,
+        std::f64::consts::PI,
+        1.0e-3,
+        123_456_789.123,
+        tie_even,
+        tie_odd,
+        1.0 + f64::from(f32::EPSILON) * 0.75,
+        f64::from(f32::MAX),
+        f64::from(f32::MAX) * 1.000_000_1, // rounds to infinity
+        1.0e300,
+        -1.0e300,
+        1.0e-40, // a float denormal: flushed
+        -1.0e-300,
+        f64::from(f32::MIN_POSITIVE),
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        f64::NAN,
+    ];
+    let inputs: Vec<[u32; 4]> = values
+        .iter()
+        .map(|x| {
+            let b = x.to_bits();
+            [b as u32, (b >> 32) as u32, 0, 0]
+        })
+        .collect();
+    run_cases(&shader, &inputs, |backend, i, _, got| {
+        let x = values[i];
+        if x.is_nan() {
+            assert!(f32::from_bits(got).is_nan(), "{backend}: cvt({x}) = {got:#010x}, want NaN");
+            return;
+        }
+        let want = cvt_f32_f64_reference(x);
+        assert_eq!(got, want, "{backend}: cvt({x:e}) = {got:#010x}, want {want:#010x}");
+    });
+}
+
+/// The lane `v_permlane16_b32` (`cross` false) or `v_permlanex16_b32` reads
+/// for `lane`, with selector dwords `s1` (lanes 0-7 of a row) and `s2`.
+fn permlane_source(lane: u32, s1: u32, s2: u32, cross: bool) -> u32 {
+    let sel = u64::from(s1) | u64::from(s2) << 32;
+    let pick = (sel >> (4 * (lane & 15)) & 15) as u32;
+    let row = if cross {
+        (lane & !31) | ((lane & 16) ^ 16)
+    } else {
+        lane & !15
+    };
+    row | pick
+}
+
+#[test]
+fn v_permlane16_and_x16_read_the_lanes_their_selectors_pick() {
+    // 32 lanes, each with its lane number in v0; v1 = permute(v0, s0, s1);
+    // lane `read` of v1 into s12, then into v0 for the store.
+    let selectors: [(u32, u32); 3] = [
+        (0x7654_3210, 0xfedc_ba98), // identity within the row
+        (0x89ab_cdef, 0x0123_4567), // reversed
+        (0x1111_1111, 0xf0f0_f0f0), // repeats
+    ];
+    for (op, cross) in [(0x377u16, false), (0x378, true)] {
+        for read in [0u8, 5, 15, 16, 22, 31] {
+            let mut body = Vec::new();
+            body.extend_from_slice(&vop3(op, 1, vgpr(0), sgpr(0), sgpr(1)));
+            // v_readlane_b32 s12, v1, read (inline constant 128 + read)
+            body.extend_from_slice(&vop3(0x360, 12, vgpr(1), 128 + u16::from(read), 0));
+            body.push(vop1(0x001, 0, sgpr(12))); // v_mov_b32 v0, s12
+            let shader = build_cs(&body, 32, 0);
+            let inputs: Vec<[u32; 4]> = selectors.iter().map(|&(a, b)| [a, b, 0, 0]).collect();
+            // Cross-lane code declares WaveSize(32), which WARP's pipeline
+            // creation refuses: hardware only.
+            run_cases_on(&shader, &inputs, &[("hardware", false)], |backend, i, inp, got| {
+                let want = permlane_source(u32::from(read), inp[0], inp[1], cross);
+                assert_eq!(
+                    got, want,
+                    "{backend}: op {op:#x} selectors {:08x?}, lane {read}",
+                    selectors[i]
+                );
+            });
+        }
+    }
+}
+
 #[test]
 fn v_med3_f32_matches_rdna2_with_nan() {
     // v_med3_f32 v0, v1, v2, v3 (VOP3 opcode 0x157)
@@ -472,6 +575,62 @@ fn v_cmp_lg_is_false_for_nan() {
                 inp[0], inp[1],
             );
         });
+    }
+}
+
+/// 64-bit integer compares order by the high dword (signed for i64), then
+/// by the low one. AMD's D3D12 compiler runs an ordered i64 `icmp` as if the
+/// dwords were swapped (RX 9070 and gfx1036 alike), so the lowering compares
+/// the dwords; the values are picked so that the two orders disagree.
+#[test]
+fn v_cmp_u64_and_i64_order_by_the_high_dword() {
+    type Order = fn(u64, u64) -> bool;
+    let ops: [(u16, &str, Order); 12] = [
+        (0x0a1, "v_cmp_lt_i64", |a, b| (a as i64) < (b as i64)),
+        (0x0a2, "v_cmp_eq_i64", |a, b| a == b),
+        (0x0a3, "v_cmp_le_i64", |a, b| (a as i64) <= (b as i64)),
+        (0x0a4, "v_cmp_gt_i64", |a, b| (a as i64) > (b as i64)),
+        (0x0a5, "v_cmp_ne_i64", |a, b| a != b),
+        (0x0a6, "v_cmp_ge_i64", |a, b| (a as i64) >= (b as i64)),
+        (0x0e1, "v_cmp_lt_u64", |a, b| a < b),
+        (0x0e2, "v_cmp_eq_u64", |a, b| a == b),
+        (0x0e3, "v_cmp_le_u64", |a, b| a <= b),
+        (0x0e4, "v_cmp_gt_u64", |a, b| a > b),
+        (0x0e5, "v_cmp_ne_u64", |a, b| a != b),
+        (0x0e6, "v_cmp_ge_u64", |a, b| a >= b),
+    ];
+    let values: [u64; 10] = [
+        0,
+        1,
+        0xFFFF_FFFF,
+        0x1_0000_0000,
+        0x1_FFFF_FFFF,
+        0x0000_0040_C010_FBFF,
+        0x0001_8000_0000_0040,
+        0x7FFF_FFFF_FFFF_FFFF,
+        0x8000_0000_0000_0001,
+        0xFFFF_FFFF_0000_0000,
+    ];
+    let inputs: Vec<[u32; 4]> = values
+        .iter()
+        .flat_map(|&a| values.iter().map(move |&b| (a, b)))
+        .map(|(a, b)| [a as u32, (a >> 32) as u32, b as u32, (b >> 32) as u32])
+        .collect();
+    for (op, name, order) in ops {
+        // op s20, v[1:2], v[3:4] and, sharing v2, op s20, v[1:2], v[2:3];
+        // v_cndmask_b32_e64 v0, 0, 1, s20
+        for second in [3, 2] {
+            let mut body = vop3(op, 20, vgpr(1), vgpr(second), 0x80).to_vec();
+            body.extend_from_slice(&vop3(0x101, 0, 0x80, 0x81, sgpr(20)));
+            let shader = build_valu_cs(&body);
+            let at = usize::from(second) - 1;
+            run_cases(&shader, &inputs, |backend, _, inp, got| {
+                let a = u64::from(inp[0]) | u64::from(inp[1]) << 32;
+                let b = u64::from(inp[at]) | u64::from(inp[at + 1]) << 32;
+                let want = u32::from(order(a, b));
+                assert_eq!(got, want, "{backend}: {name}({a:#018x}, {b:#018x})");
+            });
+        }
     }
 }
 
@@ -1263,4 +1422,637 @@ fn v_cmp_class_f16_matches_rdna2() {
             inp[0], inp[1],
         );
     });
+}
+
+/// SMEM `s_load_dwordx8 s[dst:dst+7], s[base:base+1], 0` (soffset = null).
+const fn s_load_dwordx8(dst: u8, base: u8) -> [u32; 2] {
+    [
+        0x3D << 26 | 0x03 << 18 | (dst as u32) << 6 | (base as u32 >> 1),
+        125 << 25,
+    ]
+}
+
+/// MIMG `image_store vdata, vaddr, s[srsrc:srsrc+7] dmask:dmask dim:2D unorm [d16]`.
+const fn image_store_2d(vdata: u8, vaddr: u8, srsrc: u8, dmask: u8, d16: bool) -> [u32; 2] {
+    let w0 = 0x3C << 26 | 0x08 << 18 | 1 << 12 | (dmask as u32 & 0xF) << 8 | 1 << 3;
+    let w1 = (d16 as u32) << 31
+        | ((srsrc as u32 >> 2) & 0x1F) << 16
+        | (vdata as u32) << 8
+        | (vaddr as u32);
+    [w0, w1]
+}
+
+fn try_build_image_store_cs(dmask: u8, d16: bool) -> Result<HostShader, crate::ShaderError> {
+    let mut words = Vec::new();
+    // s[4:5] = descriptor table address (heap index 0 -> byte offset 0).
+    words.push(s_mov_b32(5, 0x80)); // inline constant 0
+    words.extend_from_slice(&s_load_dwordx8(8, 4));
+    // Data in v1..v4 from root constants s0..s3; 2D texel coordinate (0, 0) in v5..v6.
+    for i in 0..4u8 {
+        words.push(vop1(0x001, i + 1, sgpr(i))); // v_mov_b32
+    }
+    words.push(vop1(0x001, 5, 0x80)); // v5 = 0
+    words.push(vop1(0x001, 6, 0x80)); // v6 = 0
+    words.extend_from_slice(&image_store_2d(1, 5, 8, dmask, d16));
+    words.push(S_ENDPGM);
+
+    let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: false,
+        vgprs: 8,
+        layout: vec![
+            RootParam {
+                root: RootType::Constants,
+                table_offset_dwords: 0,
+                sgprs: 4,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            },
+            RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 4,
+                slot: 1,
+            },
+        ],
+        used: vec![UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 8,
+            user_data: 4,
+            slot: 1,
+        }],
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: 5 << 1, // 5 user SGPRs: s0..s4
+            threads: [1, 1, 1],
+        }),
+        code,
+    };
+
+    let p = ir::build(&native.code, native.wave64, native.vgprs)?;
+    let st = structure::structure(&p)?;
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
+    let io = io::raise(&p, &native)?;
+    let lowered = lower::lower(&lower::Parts {
+        native: &native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        prims: Vec::new(),
+        mesh_stride: 0,
+    })?;
+
+    let shader = HostShader {
+        stage: HwStage::Cs,
+        dxil: lowered.dxil,
+        user_data: lowered.user_data,
+        samplers: lowered.samplers,
+        static_samplers: Vec::new(),
+        root_cbvs: lowered.root_cbvs,
+        root_srvs: lowered.root_srvs,
+        root_uavs: lowered.root_uavs,
+        root_indexed_views: res.root_indexed_views,
+    };
+
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        let ours = copy[4..20].to_vec();
+        v.validate(&mut copy).expect("DXIL validation failed");
+        assert_eq!(copy[4..20], ours[..], "container hash mismatch");
+    }
+
+    Ok(shader)
+}
+
+#[test]
+fn image_store_partial_dmask_writes_expected_channels() {
+    // (dmask, d16, input root constants, expected RGBA texel)
+    let cases: &[(u8, bool, [u32; 4], [f32; 4])] = &[
+        (0x0, false, [1.5f32.to_bits(), 0, 0, 0], [0.0, 0.0, 0.0, 0.0]),
+        (0x1, false, [1.5f32.to_bits(), 0, 0, 0], [1.5, 0.0, 0.0, 0.0]),
+        (
+            0x3,
+            false,
+            [1.5f32.to_bits(), (-2.25f32).to_bits(), 0, 0],
+            [1.5, -2.25, 0.0, 0.0],
+        ),
+        (
+            0x7,
+            false,
+            [
+                1.5f32.to_bits(),
+                (-2.25f32).to_bits(),
+                4.0f32.to_bits(),
+                0,
+            ],
+            [1.5, -2.25, 4.0, 0.0],
+        ),
+        // Sparse masks: RDNA2 packs enabled channels consecutively and zeros disabled ones.
+        (
+            0x5,
+            false,
+            [1.5f32.to_bits(), (-2.25f32).to_bits(), 0, 0],
+            [1.5, 0.0, -2.25, 0.0],
+        ),
+        (
+            0x9,
+            false,
+            [1.5f32.to_bits(), 4.0f32.to_bits(), 0, 0],
+            [1.5, 0.0, 0.0, 4.0],
+        ),
+        // d16: 1.5 (0x3E00) in low half, -2.0 (0xC000) in high half, 4.0 (0x4400) in next VGPR.
+        (0x1, true, [0x0000_3E00, 0, 0, 0], [1.5, 0.0, 0.0, 0.0]),
+        (0x3, true, [0xC000_3E00, 0, 0, 0], [1.5, -2.0, 0.0, 0.0]),
+        (
+            0x7,
+            true,
+            [0xC000_3E00, 0x0000_4400, 0, 0],
+            [1.5, -2.0, 4.0, 0.0],
+        ),
+        (
+            0xD,
+            true,
+            [0xC000_3E00, 0x0000_4400, 0, 0],
+            [1.5, 0.0, -2.0, 4.0],
+        ),
+    ];
+
+    let shaders: Vec<HostShader> = cases
+        .iter()
+        .map(|&(dmask, d16, ..)| {
+            try_build_image_store_cs(dmask, d16)
+                .unwrap_or_else(|e| panic!("dmask={dmask:#x} d16={d16}: {e}"))
+        })
+        .collect();
+
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        for (&(dmask, d16, inputs, want), shader) in cases.iter().zip(&shaders) {
+            let (root, pso) = host
+                .compute_pipeline(shader)
+                .unwrap_or_else(|e| panic!("{label}: dmask={dmask:#x} d16={d16}: {e}"));
+            let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+            for u in &shader.user_data {
+                ud[u.index as usize] = match (u.root, u.slot) {
+                    (RootType::Constants, 0) => inputs[u.dword as usize],
+                    (RootType::Table, 1) => 0,
+                    other => panic!("unexpected user data {other:?}"),
+                };
+            }
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![(0, Root::Constants(ud))],
+                        views: &[View::TextureUav(1, 1)],
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+            let got: [f32; 4] = [
+                f32::from_bits(out[0][0]),
+                f32::from_bits(out[0][1]),
+                f32::from_bits(out[0][2]),
+                f32::from_bits(out[0][3]),
+            ];
+            assert_eq!(
+                got, want,
+                "{label}: image_store dmask={dmask:#x} d16={d16} wrote {got:?}, want {want:?}"
+            );
+        }
+        ran += 1;
+    }
+    assert!(ran > 0, "neither hardware nor WARP supports SM 6.6");
+}
+
+/// EXP `exp target, v0, v1, v2, v3 [done] [vm]` (`en`: 4-bit channel mask).
+const fn exp_inst(target: u8, en: u8, v: [u8; 4], done: bool, vm: bool) -> [u32; 2] {
+    let w0 = 0x3E << 26
+        | (vm as u32) << 12
+        | (done as u32) << 11
+        | (target as u32 & 0x3F) << 4
+        | (en as u32 & 0xF);
+    let w1 = (v[3] as u32) << 24 | (v[2] as u32) << 16 | (v[1] as u32) << 8 | (v[0] as u32);
+    [w0, w1]
+}
+
+#[test]
+fn vs_rt_and_viewport_index_exports_validate_and_create_pso() {
+    use super::container::SigElement;
+    use crate::dxbc::{Container, FourCC};
+
+    let build_stage = |stage: HwStage,
+                       words: &[u32],
+                       layout: Vec<RootParam>,
+                       stage_io: StageIo,
+                       outputs: Vec<SigElement>|
+     -> HostShader {
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let native = NativeProgram {
+            stage,
+            wave64: false,
+            vgprs: 8,
+            layout,
+            used: Vec::new(),
+            io: stage_io,
+            code,
+        };
+        let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+        let st = structure::structure(&p).expect("structure");
+        let res =
+            resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
+        let io = io::raise(&p, &native).expect("io::raise");
+        let lowered = lower::lower(&lower::Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: Vec::new(),
+            outputs,
+            prims: Vec::new(),
+            mesh_stride: 0,
+        })
+        .expect("lower");
+        let shader = HostShader {
+            stage,
+            dxil: lowered.dxil,
+            user_data: lowered.user_data,
+            samplers: lowered.samplers,
+            static_samplers: Vec::new(),
+            root_cbvs: lowered.root_cbvs,
+            root_srvs: lowered.root_srvs,
+            root_uavs: lowered.root_uavs,
+            root_indexed_views: res.root_indexed_views,
+        };
+        if let Ok(mut v) =
+            validator::Validator::load(validator::Validator::default_path().as_deref())
+        {
+            let mut copy = shader.dxil.clone();
+            let ours = copy[4..20].to_vec();
+            v.validate(&mut copy).expect("DXIL validation failed");
+            assert_eq!(copy[4..20], ours[..], "container hash mismatch");
+        }
+        shader
+    };
+
+    // Minimal pixel shader writing SV_Target0 = (1, 0, 0, 1).
+    let ps_words = [
+        vop1(0x001, 0, 0xF2), // v0 = 1.0
+        vop1(0x001, 1, 0x80), // v1 = 0.0
+        vop1(0x001, 2, 0x80), // v2 = 0.0
+        vop1(0x001, 3, 0xF2), // v3 = 1.0
+        exp_inst(0, 0xF, [0, 1, 2, 3], true, true)[0],
+        exp_inst(0, 0xF, [0, 1, 2, 3], true, true)[1],
+        S_ENDPGM,
+    ];
+    let ps = build_stage(
+        HwStage::Ps,
+        &ps_words,
+        Vec::new(),
+        StageIo::Ps {
+            inputs: Vec::new(),
+            input_addr: 0,
+            db_shader_control: 0,
+            patches: Vec::new(),
+        },
+        vec![SigElement {
+            name: "SV_Target".into(),
+            index: 0,
+            kind: 16,
+            comp: 9,
+            interp: 0,
+            row: Some(0),
+            col: 0,
+            cols: 4,
+            usage: 0,
+            half: false,
+        }],
+    );
+
+    // Three VS variants: RT index only, viewport index only, and both + clip distance in pos2.
+    let configs = [
+        (true, false, false),
+        (false, true, false),
+        (true, true, true),
+    ];
+    let mut vs_shaders = Vec::new();
+    for (has_rt, has_vp, has_clip) in configs {
+        let mut words = vec![
+            vop1(0x001, 0, 0x80),    // pos.x = 0.0
+            vop1(0x001, 1, 0x80),    // pos.y = 0.0
+            vop1(0x001, 2, 0x80),    // pos.z = 0.0
+            vop1(0x001, 3, 0xF2),    // pos.w = 1.0
+            vop1(0x001, 4, sgpr(0)), // pos1.z = packed (viewport << 16) | rt
+            vop1(0x001, 5, sgpr(1)), // pos2.x = clip distance
+        ];
+        words.extend_from_slice(&exp_inst(12, 0xF, [0, 1, 2, 3], false, false)); // pos0
+        words.extend_from_slice(&exp_inst(13, 0x4, [0, 0, 4, 0], !has_clip, false)); // pos1.z
+        if has_clip {
+            words.extend_from_slice(&exp_inst(14, 0x1, [5, 0, 0, 0], true, false)); // pos2.x
+        }
+        words.push(S_ENDPGM);
+
+        let mut outputs = vec![SigElement {
+            name: "SV_Position".into(),
+            index: 0,
+            kind: 3,
+            comp: 9,
+            interp: 4,
+            row: Some(0),
+            col: 0,
+            cols: 4,
+            usage: 0,
+            half: false,
+        }];
+        let mut next_row = 1u32;
+        if has_rt {
+            outputs.push(SigElement {
+                name: "SV_RenderTargetArrayIndex".into(),
+                index: 0,
+                kind: 4,
+                comp: 5,
+                interp: 1,
+                row: Some(next_row),
+                col: 0,
+                cols: 1,
+                usage: 0,
+                half: false,
+            });
+            next_row += 1;
+        }
+        if has_vp {
+            outputs.push(SigElement {
+                name: "SV_ViewportArrayIndex".into(),
+                index: 0,
+                kind: 5,
+                comp: 5,
+                interp: 1,
+                row: Some(next_row),
+                col: 0,
+                cols: 1,
+                usage: 0,
+                half: false,
+            });
+            next_row += 1;
+        }
+        if has_clip {
+            outputs.push(SigElement {
+                name: "SV_ClipDistance".into(),
+                index: 0,
+                kind: 6,
+                comp: 9,
+                interp: 2,
+                row: Some(next_row),
+                col: 0,
+                cols: 1,
+                usage: 0,
+                half: false,
+            });
+        }
+
+        let vs = build_stage(
+            HwStage::Vs,
+            &words,
+            vec![RootParam {
+                root: RootType::Constants,
+                table_offset_dwords: 0,
+                sgprs: 2,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            }],
+            StageIo::Vs {
+                inputs: Vec::new(),
+                outputs: Vec::new(),
+            },
+            outputs,
+        );
+        let c = Container::parse(&vs.dxil).expect("parse emitted VS DXIL");
+        let sfi0 = u64::from_le_bytes(
+            c.part(FourCC::SFI0).expect("SFI0").data[..8]
+                .try_into()
+                .unwrap(),
+        );
+        assert_ne!(
+            sfi0 & 0x2000,
+            0,
+            "SFI0 should set ViewPortAndRTArrayIndexFromAnyShaderFeedingRasterizer"
+        );
+        vs_shaders.push(vs);
+    }
+
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        for (i, vs) in vs_shaders.iter().enumerate() {
+            host.pipeline(vs, &ps)
+                .unwrap_or_else(|e| panic!("{label}: graphics pipeline case {i} failed: {e}"));
+        }
+        ran += 1;
+    }
+    assert!(ran > 0, "neither hardware nor WARP supports SM 6.6");
+}
+
+/// An f64 rounded to the nearest-even half (65520 and up to infinity).
+fn f16_rne(x: f64) -> u16 {
+    let sign = if x.is_sign_negative() { 0x8000 } else { 0 };
+    let a = x.abs();
+    if a >= 65520.0 {
+        return sign | 0x7C00;
+    }
+    if a == 0.0 {
+        return sign;
+    }
+    let e = (((a.to_bits() >> 52) & 0x7FF) as i32 - 1023).max(-14);
+    let r = (a / 2f64.powi(e - 10)).round_ties_even() as i32;
+    sign | (((e + 15) << 10) + r - 1024) as u16
+}
+
+#[test]
+fn f16_nearest_switch_rounds_every_narrowing() {
+    // With `VICTORY_F16_NEAREST=1` every f32-to-f16 narrowing rounds to nearest even,
+    // not only the VOP1/VOP2/VOP3 16-bit results: v_cvt_f16_f32, the packed v_pk_*_f16
+    // and v_fma_mixlo/mixhi_f16 too. The host's conversion rounds toward zero (NVIDIA,
+    // AMD and WARP), so each case below is one where the two differ.
+    fn h(x: u16) -> f64 {
+        f64::from(f16_to_f32(x))
+    }
+    let pk = |op: u32, three: bool| {
+        let src2 = if three { 0x103 << 18 } else { 0 };
+        vec![0xCC00_4000 | op << 16, 0x1800_0000 | src2 | 0x102 << 9 | 0x101]
+    };
+    // v_mov_b32 v0, v4 (the destination's other half), then v_fma_mix* v0, v1, v2, v3
+    // with all three sources f32 (op_sel_hi 0).
+    let mix = |op: u32| {
+        vec![vop1(0x001, 0, vgpr(4)), 0xCC00_0000 | op << 16, 0x103 << 18 | 0x102 << 9 | 0x101]
+    };
+    let pack = |lo: u16, hi: u16| u32::from(lo) | u32::from(hi) << 16;
+    let f32b = |x: f32| x.to_bits();
+    type Want = fn([u32; 4]) -> u32;
+    let cases: Vec<(&str, Vec<u32>, Vec<[u32; 4]>, Want)> = vec![
+        (
+            "v_cvt_f16_f32",
+            vec![vop1(0x001, 0, 0x80), vop1(0x00A, 0, vgpr(1))],
+            [0x3F7F_FFFF, 0xBF7F_FFFF, 0x3F80_1001, 0x3F80_1000, 0x477F_F000, 0x3586_0000]
+                .map(|x| [x, 0, 0, 0])
+                .to_vec(),
+            |i| u32::from(f16_rne(f64::from(f32::from_bits(i[0])))),
+        ),
+        (
+            "v_pk_add_f16",
+            pk(0x0F, false),
+            vec![
+                // Marvisak/VIctory#1614's example in the low lane: 0xf8b6 + 0x0001.
+                [pack(0xF8B6, 0x3C01), pack(0x0001, 0x1001), 0, 0],
+                [pack(0x7BFF, 0xC784), pack(0x7BFF, 0x2036), 0, 0],
+            ],
+            |i| {
+                let lane = |k: u32| {
+                    let (a, b) = ((i[0] >> k) as u16, (i[1] >> k) as u16);
+                    u32::from(f16_rne(h(a) + h(b))) << k
+                };
+                lane(0) | lane(16)
+            },
+        ),
+        (
+            "v_pk_fma_f16",
+            pk(0x0E, true),
+            // f32 holds each product and sum exactly, so the only rounding is the narrowing.
+            vec![[pack(0x3C01, 0x3BFF), pack(0x3C01, 0xBC00), pack(0x3C01, 0xBC00), 0]],
+            |i| {
+                let lane = |k: u32| {
+                    let (a, b, c) = ((i[0] >> k) as u16, (i[1] >> k) as u16, (i[2] >> k) as u16);
+                    u32::from(f16_rne(h(a) * h(b) + h(c))) << k
+                };
+                lane(0) | lane(16)
+            },
+        ),
+        (
+            "v_fma_mixlo_f16",
+            mix(0x21),
+            vec![
+                [0x3F7F_FFFF, f32b(1.0), 0, 0xABCD_1234],
+                [f32b(1.0), 0x3F80_1001, 0, 0x5555_AAAA],
+            ],
+            |i| {
+                let r = f64::from(f32::from_bits(i[0])) * f64::from(f32::from_bits(i[1]));
+                i[3] & 0xFFFF_0000 | u32::from(f16_rne(r))
+            },
+        ),
+        (
+            "v_fma_mixhi_f16",
+            mix(0x22),
+            vec![
+                [0x3F7F_FFFF, f32b(1.0), 0, 0xABCD_1234],
+                [f32b(1.0), 0x3F80_1001, 0, 0x5555_AAAA],
+            ],
+            |i| {
+                let r = f64::from(f32::from_bits(i[0])) * f64::from(f32::from_bits(i[1]));
+                i[3] & 0xFFFF | u32::from(f16_rne(r)) << 16
+            },
+        ),
+    ];
+    let mut wrong = Vec::new();
+    for (name, words, inputs, want) in cases {
+        let was = lower::TEST_F16_NEAREST.replace(Some(true));
+        let shader = build_valu_cs(&words);
+        lower::TEST_F16_NEAREST.set(was);
+        let mask = if name == "v_cvt_f16_f32" { 0xFFFF } else { u32::MAX };
+        run_cases(&shader, &inputs, |backend, _, inp, got| {
+            let w = want(inp);
+            if got & mask != w {
+                wrong.push(format!("{backend}: {name}({inp:08x?}) = {got:#010x}, want {w:#010x}"));
+            }
+        });
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+#[test]
+fn float_compares_that_are_always_false_or_true() {
+    let cmp_shader = |op: u16| {
+        let cmp = vop3(op, 6, vgpr(1), vgpr(2), 0);
+        let sel = vop3(0x101, 0, 0x80, 0x81, sgpr(6));
+        build_valu_cs(&[cmp[0], cmp[1], sel[0], sel[1]])
+    };
+    let cmpx_shader = |op: u16| {
+        let vopc = 0x7C00_0000 | (op as u32) << 17 | 2 << 9 | vgpr(1) as u32;
+        build_valu_cs(&[
+            s_mov_b32(6, 0x7E),   // s_mov_b32 s6, exec_lo
+            vop1(0x001, 0, 0x80), // v_mov_b32 v0, 0
+            vopc,                 // v_cmpx_* exec_lo, v1, v2
+            vop1(0x001, 0, 0x81), // v_mov_b32 v0, 1 (guarded by narrowed EXEC)
+            s_mov_b32(0x7E, 6),   // s_mov_b32 exec_lo, s6
+        ])
+    };
+
+    let f32_inputs: &[[u32; 4]] = &[
+        [0.0f32.to_bits(), 0.0f32.to_bits(), 0, 0],
+        [(-0.0f32).to_bits(), 1.0f32.to_bits(), 0, 0],
+        [(-2.5f32).to_bits(), 3.75f32.to_bits(), 0, 0],
+        [f32::INFINITY.to_bits(), f32::NEG_INFINITY.to_bits(), 0, 0],
+        [0x7FC0_0000, 1.0f32.to_bits(), 0, 0], // qNaN
+        [0x7F80_0001, 0xFF80_0001, 0, 0],      // +sNaN, -sNaN
+    ];
+    let f16_inputs: &[[u32; 4]] = &[
+        [0x0000, 0x8000, 0, 0], // +0.0, -0.0
+        [0x3C00, 0xBC00, 0, 0], // +1.0, -1.0
+        [0x7C00, 0xFC00, 0, 0], // +inf, -inf
+        [0x7E00, 0x3C00, 0, 0], // qNaN, +1.0
+        [0x7C01, 0xFC01, 0, 0], // +sNaN, -sNaN
+    ];
+
+    for (name, op, want, inputs) in [
+        ("v_cmp_f_f32", 0x000, 0u32, f32_inputs),
+        ("v_cmp_tru_f32", 0x00f, 1u32, f32_inputs),
+        ("v_cmp_f_f16", 0x0c8, 0u32, f16_inputs),
+        ("v_cmp_tru_f16", 0x0ef, 1u32, f16_inputs),
+    ] {
+        let cs = cmp_shader(op);
+        run_cases(&cs, inputs, |backend, _, inp, got| {
+            assert_eq!(
+                got, want,
+                "{backend}: {name}({:#010x}, {:#010x}) = {got}, want {want}",
+                inp[0], inp[1],
+            );
+        });
+    }
+
+    for (name, op, want, inputs) in [
+        ("v_cmpx_f_f32", 0x010, 0u32, f32_inputs),
+        ("v_cmpx_tru_f32", 0x01f, 1u32, f32_inputs),
+        ("v_cmpx_f_f16", 0x0d8, 0u32, f16_inputs),
+        ("v_cmpx_tru_f16", 0x0ff, 1u32, f16_inputs),
+    ] {
+        let cs = cmpx_shader(op);
+        run_cases(&cs, inputs, |backend, _, inp, got| {
+            assert_eq!(
+                got, want,
+                "{backend}: {name}({:#010x}, {:#010x}) = {got}, want {want}",
+                inp[0], inp[1],
+            );
+        });
+    }
 }

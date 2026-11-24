@@ -128,6 +128,9 @@ pub(crate) struct Staging {
     uploaded: std::sync::atomic::AtomicBool,
     /// When a list last recorded a use of it (`crate::host::moment`).
     used: std::sync::atomic::AtomicU64,
+    /// Highest late-submission number (`crate::host::STARTED`) that may
+    /// still be reading this staging buffer on the GPU (`0` if none).
+    in_flight: std::sync::atomic::AtomicU64,
 }
 
 /// What a texture's staging buffer holds: the hash of the memory detiled
@@ -669,6 +672,19 @@ impl Staging {
         (self.memory as usize, self.layout.size as usize)
     }
 
+    /// Notes that late submission `submission` may still be reading this
+    /// staging buffer on the GPU.
+    pub(crate) fn mark_in_flight(&self, submission: u64) {
+        self.in_flight
+            .fetch_max(submission, std::sync::atomic::Ordering::Release);
+    }
+
+    /// The highest late submission number that may still be reading this
+    /// staging buffer on the GPU (`0` if none).
+    pub(crate) fn in_flight(&self) -> u64 {
+        self.in_flight.load(std::sync::atomic::Ordering::Acquire)
+    }
+
     /// Detiles the texture memory into the staging buffer if it changed
     /// since the last time (and is mapped at all).
     pub(crate) fn refresh(&self) {
@@ -713,11 +729,15 @@ impl Staging {
         // where two textures change (run 58). It is guarded now, as buffers
         // in view memory are: a write of the title's to it faults once and
         // is noted, a mapping is announced by the runtime. While neither
-        // happened the texture is as it was. What the guard cannot see (a
-        // write to the same pages through another view) is still found by
-        // the hash, which is taken every eighth frame only, by the
-        // texture's address, so the textures take turns.
+        // happened the texture is as it was. A write through another view
+        // of the same pages is a fault of that view too (the guard makes
+        // every view of them read-only, `crate::watch`), and a write the
+        // runtime makes itself into physical pages is told to the guard
+        // there; the hash is the net under both, taken every eighth frame
+        // by the texture's address, so the textures take turns.
         // `VICTORY_TEXTURE_GUARD=0` hashes at every check, as before.
+        #[cfg(feature = "diagnostics")]
+        let mut unreported = false;
         static GUARD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if *GUARD.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_GUARD").is_none_or(|v| v != "0"))
             && let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, true))
@@ -728,6 +748,10 @@ impl Staging {
             let turn = crate::frame::current().wrapping_add((start >> 16) as u64).is_multiple_of(HASH_EVERY);
             if unwritten && !turn {
                 return 0;
+            }
+            #[cfg(feature = "diagnostics")]
+            {
+                unreported = unwritten;
             }
         }
         // From here on the texture's memory may be read in place. Held until
@@ -773,6 +797,10 @@ impl Staging {
                     return false;
                 }
                 self.detile(read);
+                #[cfg(feature = "diagnostics")]
+                if unreported {
+                    self.unreported_change();
+                }
                 true
             });
             #[cfg(feature = "diagnostics")]
@@ -793,6 +821,10 @@ impl Staging {
                 last.hash = Some(hash);
                 self.detile(tiled);
                 #[cfg(feature = "diagnostics")]
+                if unreported {
+                    self.unreported_change();
+                }
+                #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
                 size
             });
@@ -809,8 +841,28 @@ impl Staging {
         last.hash = Some(hash);
         self.detile(tiled);
         #[cfg(feature = "diagnostics")]
+        if unreported {
+            self.unreported_change();
+        }
+        #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
         size
+    }
+
+    /// Diagnostics: the first time a texture's hash found a change that the
+    /// guard over its memory did not report (a write through another view
+    /// of its pages, which the guard now watches too).
+    #[cfg(feature = "diagnostics")]
+    fn unreported_change(&self) {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            tracing::warn!(
+                address = format_args!("{:#x}", self.memory as usize),
+                size = self.layout.size,
+                desc = ?self.layout.desc,
+                "a texture's hash found a change its guard did not report: a write through another view of its memory"
+            );
+        });
     }
 
     /// A refresh while the runtime is remapping title memory ([`no_wait`]):
@@ -1125,6 +1177,7 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         dirty: std::sync::atomic::AtomicBool::new(true),
         uploaded: std::sync::atomic::AtomicBool::new(false),
         used: std::sync::atomic::AtomicU64::new(crate::host::moment()),
+        in_flight: std::sync::atomic::AtomicU64::new(0),
     });
     map.insert(resource as usize, s.clone());
     Some(s)

@@ -336,6 +336,8 @@ pub(crate) static HEAP_TEXTURES_WAITING: AtomicU64 = AtomicU64::new(0);
 /// Passes that made no texture because the card had no room
 /// (`crate::resource::room`), for the memory line.
 pub(crate) static HEAP_TEXTURES_FULL: AtomicU64 = AtomicU64::new(0);
+/// Slots given up for lack of room, since the start.
+pub(crate) static HEAP_TEXTURES_EVICTED: AtomicU64 = AtomicU64::new(0);
 /// Times a placed texture's slot was passed over because its memory is not
 /// mapped.
 pub(crate) static HEAP_TEXTURES_AWAY: AtomicU64 = AtomicU64::new(0);
@@ -1576,6 +1578,16 @@ impl State {
             // From here on a host texture is made: not without room. The
             // slot stays due.
             if !room {
+                if refused == 0 {
+                    // Slots keep the copies of what they showed, so the
+                    // card stayed full for the rest of the run (uploads
+                    // stopped at 14 GB with 4,500 slots due): the oldest
+                    // made give theirs up, but not the last seconds'.
+                    HEAP_TEXTURES_EVICTED.fetch_add(
+                        host.texture_slots_evict(now.saturating_sub(4000), 256) as u64,
+                        Ordering::Relaxed,
+                    );
+                }
                 refused += 1;
                 if refused > 256 {
                     break;
@@ -1645,6 +1657,7 @@ impl State {
             SPENT.fetch_add(bytes, Ordering::Relaxed);
             HEAP_TEXTURE_BYTES.fetch_add(bytes, Ordering::Relaxed);
             HEAP_TEXTURES.fetch_add(1, Ordering::Relaxed);
+            host.texture_slot_made(index, now);
             host.texture_slot_done(index, write, again);
         }
     }
@@ -2044,6 +2057,17 @@ impl State {
                         // Only what a shader can index is copied (#1640).
                         let size = size.min(crate::descriptor::host::CONSTANT_MOST);
                         let padded = padded.min(crate::descriptor::host::CONSTANT_MOST);
+                        // A view that lies 256-byte aligned in a shadow copy is
+                        // bound there, as `root_view` does (fxceless #144): no
+                        // upload scratch, no fill waiting on shader writes.
+                        if let Some(shadow) = crate::shadow::find(address, u64::from(padded))
+                            && shadow.gpu(address) % 256 == 0
+                            && shadow.left(address) >= u64::from(padded)
+                        {
+                            shadow.refresh(list, address, u64::from(padded));
+                            host.constant_at(index, shadow.gpu(address), padded);
+                            continue;
+                        }
                         let Some((gpu, to)) = list.scratch(u64::from(padded)) else {
                             host.make_null_constant(index);
                             continue;
