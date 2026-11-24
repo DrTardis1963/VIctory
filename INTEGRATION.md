@@ -30,6 +30,10 @@ turned down upstream.
   r4tedx/VIctory#10 (`VICTORY_PRESENT_1440P`) and a fix for
   level-of-detail queries of array textures. **Fewer programs translate
   than at update 5, on purpose: see "What update 7 costs" below.**
+- Update 8 adds geometry programs: the title's 195 single-stream
+  triangle geometry shaders translate and validate (two commits written
+  for this tree, see "Changes made in this branch"). Nothing else
+  changes in the offline count.
 
 ## What update 7 costs
 
@@ -357,6 +361,13 @@ machines with newer drivers did not show it.
   it, `cargo test` sometimes never finishes, with several GPU tests stuck
   together. On the integration machine, before #433, 4 of 12 runs of the
   shader tests hung; with it, 0 of 12 did.
+- At update 8, one run of the same command with the machine at 100% CPU
+  from other work: 491 passed, 1 failed, 7 ignored. The failure is
+  `frame::tests::waits_end_on_ticks_and_count_frames`, which expects
+  consecutive 5 ms ticks and skipped ten or more at a time; it failed 3
+  of 3 on its own at that load and passed 3 of 3 on its own at update 6.
+  The update does not touch its file. The three geometry tests pass,
+  one of them a draw on the GPU compared with a reference draw.
 - At update 7, one run of the same command after `main` was merged in:
   487 passed, 0 failed, 7 ignored; and one more at the update's head
   (see the commit that adds this line for its numbers).
@@ -565,6 +576,25 @@ is described in its merge or fix commit.
   immediate-offset block, and `main`'s zero for an SGPR the hardware
   does not initialize beside the tree's barycentric inputs; the test
   files merged item by item with all of both sides' tests.
+- **Geometry programs (update 8; two commits by this project's shader
+  work, not an upstream PR yet):** `Shaders: translate uncompressed
+  native FSSM containers` (`native.rs`; the geometry containers need
+  it) and `Shaders: translate single-stream triangle geometry programs`
+  (new `geometry.rs`; the geometry stage reaches DXIL as a geometry
+  shader, with the console's copy vertex shader traced for what each
+  vertex holds). Counted offline over the title's shaders: 195 `Gs`
+  programs that stopped at `an address in an SGPR that is no root
+  parameter` validate, and no other program changes. Other stages take
+  the same path as before (checked in an independent review). Two known
+  limits from that review: a container with a geometry slot or an
+  uncompressed entry that does not parse now fails as a whole, where the
+  slot or entry was skipped before; and every vertex pipeline's stream
+  now names an empty geometry shader, which should be the same pipeline
+  to Direct3D. Not run in the title: nothing is known yet about what
+  these programs draw there. A third commit offered with them (leave a
+  lane mask's dword undefined at a data join) is **not** in the tree:
+  it turned refusals into modules by handing out an undefined value
+  where the console uses the mask's value.
 - **A level-of-detail query passes its spatial coordinates only**
   (`emit/lower.rs`; the fix is MichaelSmithAI's, from #453's
   discussion): `image_get_lod` of an array texture passed the slice as a
