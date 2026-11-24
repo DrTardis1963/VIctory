@@ -51,6 +51,10 @@ static JOURNAL: Mutex<Journal> = Mutex::new(Journal {
 pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Vec<(usize, u64)>)> {
     use windows_sys::Win32::System::Memory::GetWriteWatch;
     const WRITE_WATCH_FLAG_RESET: u32 = 1;
+    if start >= end {
+        let j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+        return Some((j.asked, Vec::new()));
+    }
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
     let j = &mut *j;
@@ -190,6 +194,9 @@ fn protect(g: &mut Guards, from: usize, to: usize) {
 /// notes them written; true if any was guarded.
 fn open(g: &mut Guards, start: usize, end: usize) -> bool {
     use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
+    if start >= end {
+        return false;
+    }
     let blocks: Vec<usize> = g
         .protected
         .range(start / BLOCK..end.div_ceil(BLOCK))
@@ -210,6 +217,9 @@ fn open(g: &mut Guards, start: usize, end: usize) -> bool {
 /// The runtime calls it (as `kernel_will_write`) before the title's kernel
 /// reads into its own memory.
 pub fn writing(at: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
     // The length is the title's (`fread`'s size times count, saturated).
     open(&mut guards(), at, at.saturating_add(len));
 }
@@ -217,6 +227,9 @@ pub fn writing(at: usize, len: usize) {
 /// The runtime mapped or unmapped title memory `[at, at + len)`: what it
 /// shows is new and read-write, so it is no longer guarded.
 pub fn title_memory_remapped(at: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
     let mut g = guards();
     let blocks: Vec<usize> = g
         .protected
@@ -252,7 +265,7 @@ fn install() {
         // since this one faulted, and a copy may have guarded it again since
         // (then it is ours again, not read-only for some other reason).
         let mut g = guards();
-        if open(&mut g, at, at + 1) {
+        if open(&mut g, at, at.saturating_add(1)) {
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::GuardFaults, 1);
             return EXCEPTION_CONTINUE_EXECUTION;
@@ -377,5 +390,65 @@ mod tests {
         let top = usize::MAX - 16;
         writing(top, PAGE);
         title_memory_remapped(top, usize::MAX);
+    }
+
+    /// Maps a pagefile section of `blocks` blocks read-write.
+    fn map_view(blocks: usize) -> (windows_sys::Win32::Foundation::HANDLE, usize) {
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile,
+        };
+        // SAFETY: anonymous pagefile section owned by the test.
+        unsafe {
+            let section = CreateFileMappingW(
+                -1isize as _,
+                std::ptr::null(),
+                PAGE_READWRITE,
+                0,
+                (blocks * BLOCK) as u32,
+                std::ptr::null(),
+            );
+            assert!(!section.is_null());
+            let view = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, blocks * BLOCK).Value as usize;
+            assert_ne!(view, 0);
+            (section, view)
+        }
+    }
+
+    fn unmap_view(section: windows_sys::Win32::Foundation::HANDLE, view: usize, blocks: usize) {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Memory::{
+            MEMORY_MAPPED_VIEW_ADDRESS, UnmapViewOfFile,
+        };
+        // SAFETY: mapped view and section handle created by `map_view`.
+        unsafe {
+            UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {
+                Value: view as *mut _,
+            });
+            CloseHandle(section);
+        }
+        title_memory_remapped(view, blocks * BLOCK);
+    }
+
+    #[test]
+    fn zero_length_writes_and_remaps_leave_guards_intact() {
+        let (section, view) = map_view(2);
+        assert!(guard(view, view + 2 * BLOCK).is_some());
+        writing(view + 100, 0);
+        title_memory_remapped(view + BLOCK + 100, 0);
+        assert_eq!(guard(view, view + 2 * BLOCK), Some(Vec::new()));
+        unmap_view(section, view, 2);
+    }
+
+    #[test]
+    fn empty_and_inverted_watch_ranges_do_not_panic_or_dirty_guards() {
+        let (section, view) = map_view(2);
+        assert!(writes(view + 100, view + 100, true).is_some_and(|(_, pages)| pages.is_empty()));
+        assert!(writes(view + 200, view + 100, true).is_some_and(|(_, pages)| pages.is_empty()));
+        assert!(
+            writes(view + 2 * BLOCK, view + 100, true).is_some_and(|(_, pages)| pages.is_empty())
+        );
+        assert!(guard(view, view + 2 * BLOCK).is_some());
+        assert_eq!(guard(view, view + 2 * BLOCK), Some(Vec::new()));
+        unmap_view(section, view, 2);
     }
 }
