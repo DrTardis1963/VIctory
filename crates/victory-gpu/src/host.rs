@@ -4882,6 +4882,18 @@ impl HostList {
             .push(Step::Fill(dst as usize, src as usize, len));
     }
 
+    /// [`Self::defer_fill`], with the bytes from `len` up to `padded`
+    /// zeroed now: a constant buffer view covers whole 256s, and the tail
+    /// would otherwise hold an earlier list's bytes.
+    pub(crate) fn defer_fill_padded(&self, dst: *mut u8, src: *const u8, len: usize, padded: usize) {
+        if padded > len {
+            // SAFETY: `dst` is the list's mapped upload memory of at least
+            // `padded` bytes (from `scratch`).
+            unsafe { dst.add(len).write_bytes(0, padded - len) };
+        }
+        self.defer_fill(dst, src, len);
+    }
+
     /// Brings `[address, address + len)` of a buffer's host copy up to date
     /// when the list is submitted (once per range until a title copy
     /// intervenes), keeping the copy alive until the list is reset.

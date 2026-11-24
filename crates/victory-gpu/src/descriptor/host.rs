@@ -1212,14 +1212,29 @@ impl HostHeap {
         }
     }
 
+    /// Makes slot `index` a null constant buffer view (reads zeros).
+    pub(crate) fn make_null_constant(&self, index: u32) {
+        self.keep(index, None);
+        let Some(host) = host() else { return };
+        // SAFETY: a slot of our view heap; a null description makes a null CBV.
+        unsafe { host.device.CreateConstantBufferView(None, self.cpu(index)) };
+    }
+
     /// Makes slot `index` (a dynamic one) a constant buffer view of host
     /// memory (the list's own, which it holds).
     pub(crate) fn constant_at(&self, index: u32, gpu: u64, size: u32) {
+        let Some(padded) = (gpu != 0 && size != 0)
+            .then(|| size.checked_next_multiple_of(256))
+            .flatten()
+        else {
+            self.make_null_constant(index);
+            return;
+        };
         self.keep(index, None);
         let Some(host) = host() else { return };
         let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
             BufferLocation: gpu,
-            SizeInBytes: size.next_multiple_of(256),
+            SizeInBytes: padded,
         };
         // SAFETY: a slot of our heap; the memory is the caller's.
         unsafe {
@@ -1897,7 +1912,15 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
     let host = host()?;
     let device = &host.device;
     match view {
+        View::NullConstant => {
+            null_cbv(device, at);
+            Some(None)
+        }
         &View::Constant(address, size) => {
+            if address == 0 || size == 0 {
+                return None;
+            }
+            let padded = size.checked_next_multiple_of(256)?;
             let shadow = crate::shadow::find(address, u64::from(size))?;
             let gpu = shadow.gpu(address);
             if gpu % 256 != 0 {
@@ -1909,7 +1932,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             }
             let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
                 BufferLocation: gpu,
-                SizeInBytes: size.next_multiple_of(256),
+                SizeInBytes: padded,
             };
             // SAFETY: a slot of our heap; the range lies in the host copy.
             unsafe { device.CreateConstantBufferView(Some(&desc), at) };
@@ -2112,8 +2135,7 @@ pub(crate) fn placed_texture(view: &View) -> Option<View> {
 }
 
 /// A null view of the kind `view` is, for a slot whose view the host
-/// cannot make: unordered access (to a buffer or a 2D texture) or a shader
-/// view. Writes to it are dropped, reads give zeros.
+/// cannot make. Writes to it are dropped, reads give zeros.
 fn null_for(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     let Some(host) = host() else { return };
     let is_buffer = |r: &usize| crate::resource::buffer_bytes(*r as crate::object::This).is_some();
@@ -2138,11 +2160,7 @@ fn null_for(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
         View::Placed(false, _, desc) => {
             return null_like(desc[..10].try_into().unwrap_or(&[0; 10]), at);
         }
-        View::Constant(..) => {
-            let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC::default();
-            // SAFETY: a slot of our heap; a zero location makes a null view.
-            return unsafe { host.device.CreateConstantBufferView(Some(&desc), at) };
-        }
+        View::Constant(..) | View::NullConstant => return null_cbv(&host.device, at),
         _ => return null_view(at),
     };
     let desc = if buffer {
@@ -2163,6 +2181,11 @@ fn null_for(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
             at,
         )
     };
+}
+
+fn null_cbv(device: &ID3D12Device, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
+    // SAFETY: a slot of our view heap.
+    unsafe { device.CreateConstantBufferView(None, at) };
 }
 
 /// A null texture UAV of the title's view dimension (1D, 1D or 2D arrays,
@@ -2340,6 +2363,60 @@ mod tests {
         };
         let view = View::Unordered(0, 0, Some([28, 8, 0, 0, 0, 0, 0, 0, 0, 0]));
         null_for(&view, heap.cpu(0));
+        // SAFETY: a plain device query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+    }
+
+    #[test]
+    fn null_cbv_is_mirrored_without_a_buffer() {
+        let Some(host) = host() else {
+            eprintln!("no host D3D12 device for the null CBV test");
+            return;
+        };
+        let heap = HostHeap::new(false, 1).expect("host view heap");
+        let (buffer, _) = host.upload_buffer(256).expect("test constant buffer");
+        // SAFETY: a live upload buffer.
+        heap.constant_at(0, unsafe { buffer.GetGPUVirtualAddress() }, 256);
+        heap.keep(0, Some(buffer));
+
+        let mut slot = [0u64; 4];
+        let handle = slot.as_mut_ptr() as u64;
+        super::super::create_cbv(std::ptr::null(), std::ptr::null(), handle);
+
+        assert_eq!(heap.mirror(0, handle, false), Some(View::NullConstant));
+        assert_ne!(heap.made.lock().unwrap()[0], 0);
+        assert!(heap.kept.lock().unwrap()[0].is_none());
+        // SAFETY: a plain device query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+    }
+
+    /// Zero-sized, null-address, and size-overflowing CBVs become valid null
+    /// constant buffer views instead of panicking or binding `SizeInBytes = 0`
+    /// with a non-null address.
+    #[test]
+    fn zero_sized_and_overflowing_cbvs_become_null_views() {
+        let Some(host) = host() else {
+            return; // no host GPU
+        };
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return;
+        };
+        let Some((buffer, _)) = host.upload_buffer(256) else {
+            return;
+        };
+        // SAFETY: live upload buffer.
+        let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+        heap.constant_at(0, gpu, 0);
+        heap.constant_at(1, 0, 256);
+        heap.constant_at(2, gpu, u32::MAX - 15);
+        heap.make_null_constant(3);
+
+        let dummy = [0u8; 64];
+        let addr = dummy.as_ptr() as u64;
+        assert!(make(&View::Constant(0, 0), heap.cpu(0)).is_none());
+        assert!(make(&View::Constant(0, 256), heap.cpu(1)).is_none());
+        assert!(make(&View::Constant(addr, 0), heap.cpu(2)).is_none());
+        assert!(make(&View::Constant(addr, u32::MAX - 15), heap.cpu(3)).is_none());
         // SAFETY: a plain device query.
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
     }
