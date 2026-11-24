@@ -189,10 +189,14 @@ fn wait(p: &Pending, frame: u64) {
 /// Makes `p` here if no worker has taken it, else waits for it up to
 /// [`COMPUTE_BOUND`]; outside the graphics budget.
 fn wait_compute(p: &Pending) {
+    let started = Instant::now();
+    #[cfg(feature = "diagnostics")]
+    let _timed = Timed(started);
     if p.make() {
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::ComputeMadeHere, 1);
         return;
     }
-    let started = Instant::now();
     let (lock, done) = &DONE;
     let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
     while p.made.get().is_none() {
@@ -206,6 +210,17 @@ fn wait_compute(p: &Pending) {
             return;
         }
         held = done.wait_timeout(held, rest).unwrap_or_else(|e| e.into_inner()).0;
+    }
+}
+
+/// Adds the time since its start to the compute waits when dropped.
+#[cfg(feature = "diagnostics")]
+struct Timed(Instant);
+
+#[cfg(feature = "diagnostics")]
+impl Drop for Timed {
+    fn drop(&mut self) {
+        crate::copystat::add(crate::copystat::C::ComputeWaitUs, crate::copystat::since(self.0));
     }
 }
 

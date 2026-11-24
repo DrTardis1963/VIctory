@@ -1131,6 +1131,8 @@ impl Host {
             }
         }
         SUBMISSION_US[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::PrepOrderUs, crate::copystat::since(started));
         if !has_copies {
             self.execute_batch(&ordered, &mut submitted);
         } else {
@@ -1177,7 +1179,14 @@ impl Host {
                     }
                     if !wait.holds() {
                         drop(submitted);
+                        #[cfg(feature = "diagnostics")]
+                        let waiting = std::time::Instant::now();
                         let waited = wait.wait();
+                        #[cfg(feature = "diagnostics")]
+                        crate::copystat::add(
+                            crate::copystat::C::TitleWaitUs,
+                            crate::copystat::since(waiting),
+                        );
                         submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
                         if let Err(waited) = waited {
                             wait_timed_out(&wait, waited);
@@ -1219,6 +1228,10 @@ impl Host {
 
     fn execute_batch(&self, ordered: &[(&HostList, QueueSegment)], submitted: &mut u64) {
         let started = std::time::Instant::now();
+        #[cfg(feature = "diagnostics")]
+        use crate::copystat::{C, add, since};
+        #[cfg(feature = "diagnostics")]
+        add(C::Batches, 1);
         let runs: Vec<_> = ordered.iter().map(|&(list, _)| list).collect();
         let mut lists: Vec<Option<ID3D12CommandList>> = Vec::with_capacity(2 * runs.len());
         let mut groups = vec![(0, 0)];
@@ -1229,7 +1242,11 @@ impl Host {
         let mut batch = Batch::default();
         let mut previous_copy = false;
         for (i, &(list, segment)) in ordered.iter().enumerate() {
+            #[cfg(feature = "diagnostics")]
+            let step = std::time::Instant::now();
             list.run_deferred(&mut batch);
+            #[cfg(feature = "diagnostics")]
+            add(C::PrepStepsUs, since(step));
             // Legacy buffer states decay at ExecuteCommandLists boundaries.
             // Keep dependent transfers and surrounding shader work in
             // separate executions. Independent transfers can run together.
@@ -1241,14 +1258,32 @@ impl Host {
                 groups.push((lists.len(), i));
             }
             previous_copy = matches!(segment, QueueSegment::Copy { .. });
+            #[cfg(feature = "diagnostics")]
+            let step = std::time::Instant::now();
             if let Some(prelude) = list.prelude() {
                 lists.push(Some(prelude));
             }
+            #[cfg(feature = "diagnostics")]
+            add(C::PrepPreludeUs, since(step));
             lists.push(list.list.cast().ok());
         }
+        #[cfg(feature = "diagnostics")]
+        let step = std::time::Instant::now();
         batch.prepare_bindless();
+        #[cfg(feature = "diagnostics")]
+        let step = {
+            add(C::PrepBindlessUs, since(step));
+            std::time::Instant::now()
+        };
         let writes = batch.snapshot_writes();
+        #[cfg(feature = "diagnostics")]
+        let step = {
+            add(C::PrepSnapshotUs, since(step));
+            std::time::Instant::now()
+        };
         let retired = take_retired();
+        #[cfg(feature = "diagnostics")]
+        add(C::PrepRetiredUs, since(step));
         let prepared = std::time::Instant::now();
         // An ExecuteCommandLists not waited for yet whose prelude list the
         // next one would re-record.
@@ -2487,7 +2522,13 @@ impl Batch {
     /// Whether `staging` is still to be refreshed in this submission (and
     /// notes it refreshed).
     fn texture_due<T>(&mut self, staging: &std::sync::Arc<T>) -> bool {
-        self.textures.insert(std::sync::Arc::as_ptr(staging) as *const () as usize)
+        let due = self.textures.insert(std::sync::Arc::as_ptr(staging) as *const () as usize);
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(
+            if due { crate::copystat::C::TexChecks } else { crate::copystat::C::TexRechecksSaved },
+            1,
+        );
+        due
     }
 
     /// A list of the submission indexes `heap` directly.
@@ -2532,7 +2573,12 @@ impl Batch {
     fn prepare_bindless(&mut self) {
         self.flush();
         for (heap, writes) in std::mem::take(&mut self.bindless) {
-            let Some(plan) = heap.bindless_plan() else {
+            #[cfg(feature = "diagnostics")]
+            let planning = std::time::Instant::now();
+            let plan = heap.bindless_plan();
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::PrepPlanUs, crate::copystat::since(planning));
+            let Some(plan) = plan else {
                 continue;
             };
             plan.copy_constants();

@@ -43,12 +43,40 @@ pub(crate) enum C {
     TexUploadBytes,
     TexSkips,
     TexSkipBytes,
+    /// Of submission preparing, microseconds: ordering the lists and
+    /// copies; the lists' submission-time steps (refreshes, texture
+    /// checks, copies); state preludes; bindless slots (of them, plans
+    /// made again); snapshots of what shaders may write; retired objects.
+    PrepOrderUs,
+    PrepStepsUs,
+    PrepPreludeUs,
+    PrepBindlessUs,
+    PrepPlanUs,
+    PrepSnapshotUs,
+    PrepRetiredUs,
+    /// Executions waited for (submissions are split at copies and waits).
+    Batches,
+    /// Microseconds blocked in title waits (`Wait32/64BitValueX`).
+    TitleWaitUs,
+    /// Texture checks made, and those a batch earlier in the submission
+    /// already made.
+    TexChecks,
+    TexRechecksSaved,
+    /// Microseconds recording threads waited for compute pipelines, and
+    /// pipelines made on the waiting thread.
+    ComputeWaitUs,
+    ComputeMadeHere,
 }
-const COUNTERS: usize = 26;
+const COUNTERS: usize = 39;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
     COUNT[c as usize].fetch_add(n, Relaxed);
+}
+
+/// Microseconds since `started`.
+pub(crate) fn since(started: std::time::Instant) -> u64 {
+    started.elapsed().as_micros() as u64
 }
 
 /// How copies run: 0 guarded (as always), 1 plain, 2 not at all.
@@ -132,6 +160,25 @@ pub(crate) fn log(frames: f64) {
         mb(c[C::TexWatched as usize]),
         mb(c[C::TexHashed as usize]),
         mb(c[C::TexChanged as usize]),
+    );
+    tracing::info!(
+        "submission preparing per frame: {:.1} batches; ordering {:.1} ms, list steps {:.1} ms, \
+         preludes {:.1} ms, bindless {:.1} ms (plans made {:.1} ms), write snapshots {:.1} ms, \
+         retired {:.1} ms; title waits {:.1} ms; {:.0} texture checks, {:.0} saved; compute \
+         pipeline waits on recording threads {:.1} ms ({:.0} made there)",
+        c[C::Batches as usize],
+        ms(c[C::PrepOrderUs as usize]),
+        ms(c[C::PrepStepsUs as usize]),
+        ms(c[C::PrepPreludeUs as usize]),
+        ms(c[C::PrepBindlessUs as usize]),
+        ms(c[C::PrepPlanUs as usize]),
+        ms(c[C::PrepSnapshotUs as usize]),
+        ms(c[C::PrepRetiredUs as usize]),
+        ms(c[C::TitleWaitUs as usize]),
+        c[C::TexChecks as usize],
+        c[C::TexRechecksSaved as usize],
+        ms(c[C::ComputeWaitUs as usize]),
+        c[C::ComputeMadeHere as usize],
     );
     tracing::info!(
         "texture uploads per frame: {:.0} copied {:.1} MB, {:.0} skipped unchanged {:.1} MB",
