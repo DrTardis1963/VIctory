@@ -67,11 +67,11 @@ pub struct Bools {
 }
 
 /// The tables below have small integer keys; SipHash dominated run time.
-type Map<K, V> = HashMap<K, V, BuildHasherDefault<Fx>>;
+pub(crate) type Map<K, V> = HashMap<K, V, BuildHasherDefault<Fx>>;
 
 /// FxHash's multiply-rotate step.
 #[derive(Default)]
-struct Fx(u64);
+pub(crate) struct Fx(u64);
 
 impl Hasher for Fx {
     fn finish(&self) -> u64 {
