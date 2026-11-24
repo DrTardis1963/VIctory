@@ -386,4 +386,261 @@ mod tests {
             .collect();
         assert_eq!(hex, "900150983cd24fb0d6963f7d28e17f72");
     }
+
+    fn sig(
+        name: &str,
+        index: u32,
+        kind: u8,
+        row: Option<u32>,
+        (col, cols, usage): (u8, u8, u8),
+        interp: u8,
+    ) -> SigElement {
+        SigElement {
+            name: name.into(),
+            index,
+            kind,
+            comp: 9,
+            interp,
+            row,
+            col,
+            cols,
+            usage,
+            half: false,
+        }
+    }
+
+    fn read_u32(bytes: &[u8], at: usize) -> u32 {
+        u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap())
+    }
+
+    fn read_cstr(bytes: &[u8], at: usize) -> &str {
+        let end = bytes[at..].iter().position(|&b| b == 0).unwrap();
+        std::str::from_utf8(&bytes[at..at + end]).unwrap()
+    }
+
+    #[test]
+    fn build_and_hash_cover_both_padding_branches() {
+        fn ref_hash(data: &[u8]) -> [u8; 16] {
+            let len = data.len();
+            let left = len % 64;
+            let mut tail = Vec::new();
+            if left < 56 {
+                tail.extend(((len as u32) << 3).to_le_bytes());
+                tail.extend(&data[len - left..]);
+                tail.push(0x80);
+                tail.resize(60, 0);
+            } else {
+                tail.extend(&data[len - left..]);
+                tail.push(0x80);
+                tail.resize(64, 0);
+                tail.extend(((len as u32) << 3).to_le_bytes());
+                tail.resize(124, 0);
+            }
+            tail.extend((((len as u32) << 1) | 1).to_le_bytes());
+            let mut state = [0x6745_2301u32, 0xefcd_ab89, 0x98ba_dcfe, 0x1032_5476];
+            for chunk in data[..len - left]
+                .as_chunks::<64>()
+                .0
+                .iter()
+                .chain(tail.as_chunks::<64>().0)
+            {
+                md5_block(&mut state, chunk);
+            }
+            let mut out = [0u8; 16];
+            for (o, s) in out.as_chunks_mut::<4>().0.iter_mut().zip(state) {
+                o.copy_from_slice(&s.to_le_bytes());
+            }
+            out
+        }
+
+        // With 1 part, `out[20..]` has 24 header/part-table/part-header bytes before payload:
+        // 31 -> 55 (left < 56), 32 -> 56 (left >= 56), 40 -> 64 (full block + left == 0).
+        for payload_len in [31usize, 32, 40] {
+            let payload: Vec<u8> = (0..payload_len).map(|i| (i * 7 + 3) as u8).collect();
+            let built = build(&[(b"TEST", &payload)]);
+            assert_eq!(built[20..].len(), 24 + payload_len);
+            let parsed = crate::dxbc::Container::parse(&built).unwrap();
+            assert_eq!(parsed.version, (1, 0));
+            assert_eq!(parsed.digest, hash(&built[20..]));
+            assert_eq!(parsed.digest, ref_hash(&built[20..]));
+            assert_eq!(
+                parsed.part(crate::dxbc::FourCC(*b"TEST")).unwrap().data,
+                payload.as_slice()
+            );
+
+            let mut flipped = built[20..].to_vec();
+            flipped[24] ^= 0x01;
+            assert_ne!(hash(&flipped), parsed.digest);
+        }
+        assert_eq!(hash(&[0xAB; 55]), ref_hash(&[0xAB; 55]));
+        assert_eq!(hash(&[0xCD; 56]), ref_hash(&[0xCD; 56]));
+    }
+
+    #[test]
+    fn signature_sorts_rows_shares_system_names_and_encodes_masks() {
+        let elements = [
+            sig("SV_ClipDistance", 0, 6, Some(2), (0, 2, 0b11), 0),
+            sig("SV_ClipDistance", 1, 6, Some(1), (2, 1, 0b01), 0),
+            sig("SV_VertexID", 0, 1, None, (0, 1, 0b01), 0),
+            sig("TEXCOORD", 0, 0, Some(0), (0, 4, 0b0101), 2),
+            sig("TEXCOORD", 1, 0, Some(1), (0, 2, 0b10), 2),
+        ];
+        for (input, expected_rw) in [
+            (true, [0b0101u8, 0b0010, 0b0100, 0b0011, 0b0001]),
+            (false, [0b1010u8, 0b1101, 0b1011, 0b1100, 0b1110]),
+        ] {
+            let bytes = signature(&elements, input);
+            assert_eq!(read_u32(&bytes, 0), 5);
+            assert_eq!(read_u32(&bytes, 4), 8);
+
+            let row_at = |idx: usize| 8 + idx * 32;
+            let expected = [
+                (0u32, 0u32, 0b1111u8, 0u32),       // row 0, col 0: TEXCOORD 0
+                (1, 0, 0b0011, 1),                  // row 1, col 0: TEXCOORD 1
+                (1, 2, 0b0100, 1),                  // row 1, col 2: SV_ClipDistance 1
+                (2, 2, 0b0011, 0),                  // row 2, col 0: SV_ClipDistance 0
+                (u32::MAX, 6, 0b0001, 0),           // unallocated: SV_VertexID 0
+            ];
+            let mut name_offsets = Vec::new();
+            for (i, &(row, sys_val, mask, index)) in expected.iter().enumerate() {
+                let r = row_at(i);
+                let name_off = read_u32(&bytes, r + 4) as usize;
+                name_offsets.push(name_off);
+                assert_eq!(read_u32(&bytes, r + 8), index);
+                assert_eq!(read_u32(&bytes, r + 12), sys_val);
+                assert_eq!(read_u32(&bytes, r + 20), row);
+                assert_eq!(bytes[r + 24], mask);
+                assert_eq!(bytes[r + 25], expected_rw[i]);
+            }
+            // Shared string offset for repeated system values; distinct for repeated arbitrary semantics.
+            assert_eq!(name_offsets[2], name_offsets[3]);
+            assert_eq!(read_cstr(&bytes, name_offsets[2]), "SV_ClipDistance");
+            assert_ne!(name_offsets[0], name_offsets[1]);
+            assert_eq!(read_cstr(&bytes, name_offsets[0]), "TEXCOORD");
+            assert_eq!(read_cstr(&bytes, name_offsets[1]), "TEXCOORD");
+            assert_eq!(read_cstr(&bytes, name_offsets[4]), "SV_VertexID");
+        }
+    }
+
+    #[test]
+    fn psv_aligns_strings_and_writes_dependency_masks() {
+        let inputs = [
+            sig("SV_Position", 0, 3, Some(0), (0, 4, 0b1111), 4),
+            sig("COLOR", 0, 0, Some(1), (0, 2, 0b0011), 6),
+        ];
+        let outputs = [sig("SV_Target", 0, 16, Some(0), (0, 4, 0b1111), 0)];
+        let bindings = [Binding {
+            kind: 2,
+            space: 0,
+            register: 3,
+            dxil_kind: 13,
+        }];
+        let bytes = psv(&Psv {
+            stage: 0,
+            flag: true,
+            inputs: &inputs,
+            outputs: &outputs,
+            prims: &[],
+            mesh: None,
+            bindings: &bindings,
+            threads: [0, 0, 0],
+            wave_size: Some(32),
+        });
+
+        assert_eq!(read_u32(&bytes, 0), 48);
+        let info = &bytes[4..52];
+        assert_eq!(info[0], 1); // flag
+        assert_eq!(info[1], 1); // PSInfo.SampleFrequency (interp == 6)
+        assert_eq!(read_u32(info, 16), 32); // wave_size min
+        assert_eq!(read_u32(info, 20), 32); // wave_size max
+        assert_eq!(info[24], 0); // stage: pixel
+        assert_eq!(info[28], 2); // input element count
+        assert_eq!(info[29], 1); // output element count
+        assert_eq!(info[31], 2); // in_vectors
+        assert_eq!(info[32], 1); // out_vectors
+
+        let mut at = 52usize;
+        assert_eq!(read_u32(&bytes, at), 1); // binding count
+        assert_eq!(read_u32(&bytes, at + 4), 24); // binding stride
+        assert_eq!(read_u32(&bytes, at + 8), 2); // kind
+        assert_eq!(read_u32(&bytes, at + 16), 3); // register
+        assert_eq!(read_u32(&bytes, at + 24), 13); // dxil_kind
+        at += 8 + 24;
+
+        let str_len = read_u32(&bytes, at) as usize;
+        at += 4;
+        assert_eq!(str_len % 4, 0);
+        let strings = &bytes[at..at + str_len];
+        assert_eq!(strings[0], 0);
+        assert_eq!(read_cstr(strings, 1), "COLOR");
+        at += str_len;
+
+        let idx_count = read_u32(&bytes, at) as usize;
+        at += 4;
+        assert_eq!(idx_count, 1);
+        assert_eq!(read_u32(&bytes, at), 0);
+        at += 4 * idx_count;
+
+        assert_eq!(read_u32(&bytes, at), 16); // signature element stride
+        at += 4;
+        // System value uses offset 0 (""); arbitrary COLOR points to offset 1.
+        assert_eq!(read_u32(&bytes, at), 0);
+        assert_eq!(read_u32(&bytes, at + 16), 1);
+        at += 3 * 16;
+
+        // 2 input vectors -> 8 input scalars (`ni = 6`, `no = 4` -> first 6 get 0xf, last 2 get 0).
+        let deps: Vec<u32> = (0..8).map(|k| read_u32(&bytes, at + 4 * k)).collect();
+        assert_eq!(deps, [0xF, 0xF, 0xF, 0xF, 0xF, 0xF, 0, 0]);
+        assert_eq!(at + 8 * 4, bytes.len());
+
+        // Plain interpolation leaves SampleFrequency == 0; repeated arbitrary names share string offset.
+        let plain_inputs = [
+            sig("TEXCOORD", 0, 0, Some(0), (0, 2, 0b11), 2),
+            sig("TEXCOORD", 1, 0, Some(1), (0, 2, 0b11), 2),
+        ];
+        let plain = psv(&Psv {
+            stage: 0,
+            flag: false,
+            inputs: &plain_inputs,
+            outputs: &outputs,
+            prims: &[],
+            mesh: None,
+            bindings: &[],
+            threads: [0, 0, 0],
+            wave_size: None,
+        });
+        assert_eq!(plain[5], 0);
+        let plain_str_len = read_u32(&plain, 56) as usize;
+        assert_eq!(plain_str_len % 4, 0);
+        // "\0TEXCOORD\0" = 10 bytes, padded to 12; deduplicated (not emitted twice).
+        assert_eq!(plain_str_len, 12);
+
+        // Mesh metadata populates shared memory, max vertices/primitives, prims count & topology.
+        let prims = [sig("SV_CullPrimitive", 0, 30, Some(0), (0, 1, 0b1), 0)];
+        let mesh_psv = psv(&Psv {
+            stage: 13,
+            flag: false,
+            inputs: &[],
+            outputs: &outputs,
+            prims: &prims,
+            mesh: Some((
+                crate::emit::shader::Mesh {
+                    max_vertices: 64,
+                    max_primitives: 126,
+                    topology: 2,
+                },
+                4096,
+            )),
+            bindings: &[],
+            threads: [32, 1, 1],
+            wave_size: None,
+        });
+        let minfo = &mesh_psv[4..52];
+        assert_eq!(read_u32(minfo, 0), 4096);
+        assert_eq!(u16::from_le_bytes(minfo[12..14].try_into().unwrap()), 64);
+        assert_eq!(u16::from_le_bytes(minfo[14..16].try_into().unwrap()), 126);
+        assert_eq!(minfo[26], 1); // prim_vectors
+        assert_eq!(minfo[27], 2); // topology
+        assert_eq!(minfo[30], 1); // prims.len()
+    }
 }
