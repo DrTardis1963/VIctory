@@ -427,6 +427,21 @@ mod tests {
     };
     const MEM_WRITE_WATCH: u32 = 0x20_0000;
 
+    #[test]
+    fn submission_runs_merge_and_answer_only_what_they_cover() {
+        let mut runs = BTreeMap::new();
+        cover(&mut runs, 10, 20);
+        cover(&mut runs, 30, 40);
+        assert!(covered(&runs, 12, 18));
+        assert!(!covered(&runs, 18, 32), "the gap between runs");
+        cover(&mut runs, 20, 30);
+        assert_eq!(runs.len(), 1, "touching runs merge");
+        assert!(covered(&runs, 10, 40));
+        assert!(!covered(&runs, 5, 12));
+        cover(&mut runs, 0, 50);
+        assert_eq!(runs.into_iter().collect::<Vec<_>>(), vec![(0, 50)]);
+    }
+
     thread_local! {
         /// The kernel askings `writes` made on this thread (each test runs
         /// on its own).
