@@ -349,13 +349,17 @@ pub fn run(
                         if let Some(source) = src_ref.resolve(&batch.data) {
                             translate(&source, &batch.path, &seen, &mut t, &mut checks);
                             let n = done.fetch_add(1, Ordering::Relaxed) + 1;
-                            if n.is_multiple_of(100) {
+                            if n.is_multiple_of(500) {
                                 let secs = started.elapsed().as_secs_f64();
                                 match expected {
-                                    Some(e) => eprint!(
-                                        "\r  {n} / {e} shaders ({}%, {secs:.0} s)   ",
-                                        (n * 100 / e).min(99)
-                                    ),
+                                    Some(e) => {
+                                        let left = e.saturating_sub(n);
+                                        let eta = secs / n as f64 * left as f64 / 60.0;
+                                        eprint!(
+                                            "\r  {n} / {e} shaders ({}%), {left} left, ~{eta:.0} min   ",
+                                            (n * 100 / e).min(99)
+                                        )
+                                    }
                                     None => eprint!("\r  {n} shaders checked ({secs:.0} s)   "),
                                 }
                             }
