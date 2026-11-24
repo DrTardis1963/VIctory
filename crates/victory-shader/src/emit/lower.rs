@@ -3195,20 +3195,41 @@ impl<'a> Lower<'a> {
             }
             return Ok(());
         }
-        if matches!(kind, Some(u) if u.kind == ResourceType::Srv) {
-            let h = self.handle(site, src, false, (11, 0))?;
+        if let Some(u) = kind
+            && matches!(u.kind, ResourceType::Srv | ResourceType::Uav)
+        {
+            let u_bit = if u.kind == ResourceType::Uav { 0x1000 } else { 0 };
+            let structured = u.stride >= 4 && u.stride.is_multiple_of(4);
+            let h = self.handle(
+                site,
+                src,
+                false,
+                if structured {
+                    (12 | u_bit, u.stride)
+                } else {
+                    (11 | u_bit, 0)
+                },
+            )?;
+            let st = structured.then(|| self.s.m.i32(u.stride));
             for k in 0..count {
                 let off = self.s.m.i32(4 * k);
                 let a = self.s.m.bin(c, Bin::Add, addr, off);
+                let (idx, elem_off) = match st {
+                    Some(st) => (
+                        self.s.m.bin(c, Bin::UDiv, a, st),
+                        self.s.m.bin(c, Bin::URem, a, st),
+                    ),
+                    None => (a, self.s.m.undef(self.s.t.i32)),
+                };
                 let mask = self.s.m.i8(1);
-                let (u, al) = (self.s.m.undef(self.s.t.i32), self.s.m.i32(4));
+                let al = self.s.m.i32(4);
                 let r = self.s.op(
                     c,
                     "rawBufferLoad.f32",
                     Attr::ReadOnly,
                     self.s.t.res_ret,
                     139,
-                    &[h, a, u, mask, al],
+                    &[h, idx, elem_off, mask, al],
                 );
                 let x = self.s.m.extract(c, r, 0);
                 let x = self.as_int(x);
@@ -3288,19 +3309,40 @@ impl<'a> Lower<'a> {
             Some("x16") => 16,
             _ => return Err("a scalar memory read as data"),
         };
-        // How the program uses the descriptor tells the view's kind.
-        let use_at = self
+        // How the program uses the descriptor tells the view's kind. Prefer an
+        // image or vector buffer use when a descriptor has both scalar and
+        // vector uses, since those carry format and indexing cues.
+        let mut use_at: Option<(Site, u8)> = None;
+        for d in self
             .x
             .res
             .descriptors
             .iter()
             .filter(|d| d.role == Role::Resource)
-            .find_map(|d| {
-                d.source.leaves().into_iter().find_map(|l| match *l {
-                    Source::Loaded { load, first } if load == site => Some((d.site, first)),
-                    _ => None,
-                })
-            });
+        {
+            for l in d.source.leaves() {
+                if let Source::Loaded { load, first } = *l
+                    && load == site
+                {
+                    let ui = &self.x.p.blocks[d.site.0].insts[d.site.1];
+                    let rich = matches!(ui.fields, Fields::Image { .. } | Fields::Buffer { .. });
+                    if use_at.is_none() || rich {
+                        use_at = Some((d.site, first));
+                        if rich {
+                            break;
+                        }
+                    }
+                }
+            }
+            if let Some((at, _)) = use_at
+                && matches!(
+                    self.x.p.blocks[at.0].insts[at.1].fields,
+                    Fields::Image { .. } | Fields::Buffer { .. }
+                )
+            {
+                break;
+            }
+        }
         let Some((at, first)) = use_at else {
             return Err("a descriptor read only as data");
         };
@@ -3338,6 +3380,18 @@ impl<'a> Lower<'a> {
                 if used.is_some_and(|u| u.kind == ResourceType::Cbv) {
                     return Err("a constant buffer's descriptor read as data");
                 }
+                (props, None)
+            }
+            Fields::Smem { .. } if un.starts_with("s_buffer_") => {
+                if used.is_some_and(|u| u.kind == ResourceType::Cbv) {
+                    return Err("a constant buffer's descriptor read as data");
+                }
+                let stride = used.map_or(0, |u| u.stride);
+                let props = if stride >= 4 && stride.is_multiple_of(4) {
+                    (12 | u, stride)
+                } else {
+                    (11 | u, 0)
+                };
                 (props, None)
             }
             _ => return Err("a scalar memory read as data"),
@@ -6240,7 +6294,11 @@ impl<'a> Lower<'a> {
             "image_get_lod" if self.s.pixel => (81, true),
             // Implicit derivatives: pixel shaders only.
             "image_sample_c" | "image_sample_c_cl" if self.s.pixel => (64, true),
-            "image_gather4" | "image_gather4_lz" | "image_gather4_lz_o" => (73, true),
+            "image_gather4"
+            | "image_gather4_lz"
+            | "image_gather4_lz_o"
+            | "image_gather4_l"
+            | "image_gather4_l_o" => (73, true),
             "image_load" | "image_load_mip" => (66, false),
             "image_get_resinfo" => (72, false),
             _ => return Err(name),
@@ -6294,8 +6352,8 @@ impl<'a> Lower<'a> {
             // Comparison: the reference value is the first address after
             // the bias, and the sampler is a comparison sampler.
             let cmp = matches!(op, 64 | 65);
-            if cmp && (*a16 || dmask.count_ones() != 1) {
-                return Err("a comparison sample of 16-bit coordinates or several channels");
+            if cmp && dmask.count_ones() != 1 {
+                return Err("a comparison sample of several channels");
             }
             let sh = self.handle(site, ss, true, (14 | if cmp { 0x8000 } else { 0 }, 0))?;
             // Texel offsets (`_o`) come first: x in bits 0-5, y in 8-13,
@@ -6359,7 +6417,14 @@ impl<'a> Lower<'a> {
                         Attr::ReadOnly,
                         f32t,
                         81,
-                        &[h, sh, cs[0], cs[1], cs[2], clamped],
+                        &[
+                            h,
+                            sh,
+                            cs[0],
+                            if spatial > 1 { cs[1] } else { fu },
+                            if spatial > 2 { cs[2] } else { fu },
+                            clamped,
+                        ],
                     );
                     let x = self.as_int(lod);
                     self.write(inst, Reg::V(reg + k as u8), x, guard);
@@ -6481,6 +6546,98 @@ impl<'a> Lower<'a> {
                             let k26 = self.s.m.i32(26);
                             os[k] = self.s.m.bin(c, Bin::AShr, t, k26);
                         }
+                    }
+                    if matches!(name, "image_gather4_l" | "image_gather4_l_o") {
+                        // Console-only Gather at an explicit mip level: DXIL's
+                        // textureGather has no LOD argument, so emulate with
+                        // four clamped textureLoad calls at that mip in HLSL
+                        // gather order: (-,+), (+,+), (+,-), (-,-).
+                        if kind != 2 {
+                            return Err("a gather with explicit level on a non-2D texture");
+                        }
+                        let lod = addr_packed(self, coord_base, coords)?;
+                        let lod = to_float(self, lod);
+                        let i32t = self.s.t.i32;
+                        let f32t = self.s.t.f32;
+                        let dims = self.s.m.named_struct("dx.types.Dimensions", vec![i32t; 4]);
+                        let d0 = self
+                            .s
+                            .op(c, "getDimensions", Attr::ReadOnly, dims, 72, &[h, zero]);
+                        let levels = self.s.m.extract(c, d0, 3);
+                        let one = self.s.m.i32(1);
+                        let max_mip = self.s.m.bin(c, Bin::Sub, levels, one);
+                        let fzero = self.s.m.f32(0);
+                        let lod = self.binary(35, lod, fzero);
+                        let mip = self.s.m.cast(c, Cast::FpToUi, lod, i32t);
+                        let over = self.s.m.cmp(c, pred::IUGT, mip, max_mip);
+                        let mip = self.s.m.select(c, over, max_mip, mip);
+                        let dm = self
+                            .s
+                            .op(c, "getDimensions", Attr::ReadOnly, dims, 72, &[h, mip]);
+                        let w = self.s.m.extract(c, dm, 0);
+                        let ht = self.s.m.extract(c, dm, 1);
+                        let half = self.s.m.f32(0.5f32.to_bits());
+                        let clamp_pair = |l: &mut Self, coord: V, dim: V, off: V| {
+                            let df = l.s.m.cast(c, Cast::UiToFp, dim, f32t);
+                            let p = l.s.m.bin(c, Bin::Mul, coord, df);
+                            let p = l.s.m.bin(c, Bin::Sub, p, half);
+                            let fl = l.s.op(c, "unary.f32", Attr::ReadNone, f32t, 27, &[p]);
+                            let t0 = l.s.m.cast(c, Cast::FpToSi, fl, i32t);
+                            let t0 = l.s.m.bin(c, Bin::Add, t0, off);
+                            let t1 = l.s.m.bin(c, Bin::Add, t0, one);
+                            let hi = l.s.m.bin(c, Bin::Sub, dim, one);
+                            let mut cl = |x: V| {
+                                let lo_c = l.s.m.cmp(c, pred::SLT, x, zero);
+                                let x = l.s.m.select(c, lo_c, zero, x);
+                                let hi_c = l.s.m.cmp(c, pred::SGT, x, hi);
+                                l.s.m.select(c, hi_c, hi, x)
+                            };
+                            (cl(t0), cl(t1))
+                        };
+                        let (x0, x1) = clamp_pair(self, cs[0], w, os[0]);
+                        let (y0, y1) = clamp_pair(self, cs[1], ht, os[1]);
+                        let ch = dmask.trailing_zeros();
+                        let Operand::Vector { reg, .. } = *data else {
+                            return Err("an image result");
+                        };
+                        let mut xs = Vec::with_capacity(4);
+                        for (xi, yi) in [(x0, y1), (x1, y1), (x1, y0), (x0, y0)] {
+                            let tl = self.s.op(
+                                c,
+                                "textureLoad.f32",
+                                Attr::ReadOnly,
+                                self.s.t.res_ret,
+                                66,
+                                &[h, mip, xi, yi, iu, iu, iu, iu],
+                            );
+                            let x = self.s.m.extract(c, tl, ch);
+                            xs.push(if *d16 {
+                                self.s
+                                    .op(c, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[x])
+                            } else {
+                                self.as_int(x)
+                            });
+                        }
+                        if *d16 {
+                            let k16 = self.s.m.i32(16);
+                            xs = xs
+                                .chunks(2)
+                                .map(|pair| {
+                                    let lo = pair[0];
+                                    match pair.get(1) {
+                                        Some(&hi) => {
+                                            let hi = self.s.m.bin(c, Bin::Shl, hi, k16);
+                                            self.s.m.bin(c, Bin::Or, lo, hi)
+                                        }
+                                        None => lo,
+                                    }
+                                })
+                                .collect();
+                        }
+                        for (k, x) in xs.into_iter().enumerate() {
+                            self.write(inst, Reg::V(reg + k as u8), x, guard);
+                        }
+                        return Ok(());
                     }
                     args.extend(&os[..2]);
                     args.push(self.s.m.i32(dmask.trailing_zeros()));
@@ -7553,6 +7710,18 @@ impl<'a> Lower<'a> {
         for (v, b, i) in std::mem::take(&mut self.data_phis) {
             let phi = &p.blocks[b].phis[i];
             let bit = phi.reg == Reg::Scc;
+            // A register initialized only on one branch may carry a dead
+            // descriptor dword left over from earlier register reuse on the
+            // other branch (guarded by a separate predicate). Only treat a
+            // descriptor-dword `Missing` as fatal when no incoming edge carries
+            // a real data value.
+            let has_data = !bit
+                && p.blocks[b]
+                    .preds
+                    .iter()
+                    .enumerate()
+                    .filter(|&(_, &q)| self.tail[q].is_some())
+                    .any(|(n, _)| matches!(self.vals.get(&phi.args[n]), Some(Val::I32(_))));
             let mut incoming = Vec::new();
             for (n, &q) in p.blocks[b].preds.iter().enumerate() {
                 let Some(qb) = self.tail[q] else { continue };
@@ -7560,6 +7729,16 @@ impl<'a> Lower<'a> {
                 let arg = phi.args[n];
                 let x = match (self.vals.get(&arg).copied(), bit) {
                     (Some(Val::I32(x)), false) | (Some(Val::Bit(x)), true) => x,
+                    (Some(Val::Missing(why)), false)
+                        if has_data
+                            && matches!(
+                                why,
+                                "a descriptor's address or format read as data"
+                                    | "a descriptor read only as data"
+                            ) =>
+                    {
+                        self.s.m.i32(0)
+                    }
                     (Some(Val::Bit(_)), false) if self.read_phis.contains(&phi.value) => {
                         return Err(Stop::Retry(phi.value, "an SCC joined with SGPR values"));
                     }
