@@ -1690,6 +1690,12 @@ impl State {
                 "a dispatch without a host pipeline dropped"
             );
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            // The next dispatch may read what the ones before this wrote,
+            // and a dropped one records none of the state changes that
+            // would have ordered them: a global UAV barrier stands in
+            // (port of PR #1392; device removals without it).
+            // SAFETY: an open list.
+            unsafe { list.list.ResourceBarrier(&[crate::indirect::uav_barrier()]) };
             #[cfg(feature = "diagnostics")]
             {
                 crate::pipeline::note_drop(self.pipeline as This);
