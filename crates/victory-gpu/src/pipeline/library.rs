@@ -476,7 +476,11 @@ fn open(device: &ID3D12Device1, blob: Blob) -> Option<Library> {
                     saving: RwLock::new(()),
                 });
             }
-            Err(e) => tracing::info!(error = %e, "host pipeline library rejected; starting an empty one"),
+            Err(e) => tracing::warn!(
+                error = %e,
+                why = rejected_why(e.code()),
+                "host pipeline library rejected; starting an empty one (the early list still starts its pipelines during loading)"
+            ),
         }
     } else {
         tracing::info!("no host pipeline library yet; starting an empty one");
@@ -491,6 +495,17 @@ fn open(device: &ID3D12Device1, blob: Blob) -> Option<Library> {
         added: AtomicU64::new(0),
         saving: RwLock::new(()),
     })
+}
+
+/// Why the host refused a saved library, for the log: a driver update (the
+/// usual case) or another adapter makes every saved pipeline unusable.
+fn rejected_why(code: windows::core::HRESULT) -> &'static str {
+    use windows::Win32::Foundation::{D3D12_ERROR_ADAPTER_NOT_FOUND, D3D12_ERROR_DRIVER_VERSION_MISMATCH};
+    match code {
+        D3D12_ERROR_DRIVER_VERSION_MISMATCH => "saved by another driver version",
+        D3D12_ERROR_ADAPTER_NOT_FOUND => "saved on another adapter",
+        _ => "damaged or not a library",
+    }
 }
 
 /// A pipeline's name in the library: the hash of what its host
