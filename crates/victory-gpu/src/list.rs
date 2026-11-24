@@ -886,14 +886,21 @@ extern "system" fn reset_x(this: This, allocator: This, pipeline: This, _flags: 
 /// its instance descriptions there (and wrote through our old
 /// `E_NOTIMPL` as a pointer).
 extern "system" fn allocate_upload(this: This, size: u64, alignment: u64) -> *mut u8 {
-    let align = usize::try_from(alignment).unwrap_or(0).max(16);
+    let Ok(raw_align) = usize::try_from(alignment) else {
+        return std::ptr::null_mut();
+    };
+    if this.is_null() || (raw_align != 0 && !raw_align.is_power_of_two()) {
+        return std::ptr::null_mut();
+    }
+    let align = raw_align.max(16);
     let Some(len) = usize::try_from(size).ok().and_then(|s| s.checked_add(align)) else {
         return std::ptr::null_mut();
     };
-    if this.is_null() || !align.is_power_of_two() {
+    let mut block = Vec::new();
+    if block.try_reserve_exact(len).is_err() {
         return std::ptr::null_mut();
     }
-    let mut block = vec![0u8; len];
+    block.resize(len, 0);
     let start = block.as_mut_ptr();
     // SAFETY: the offset is below `align`, so `size` bytes fit after it.
     let at = unsafe { start.add(start.align_offset(align)) };
@@ -1031,10 +1038,16 @@ mod state {
         one_range: i32,
         depth: *const u64,
     ) {
-        let handles: Vec<u64> = if one_range != 0 && !handles.is_null() {
+        let handles: Vec<u64> = if one_range != 0 && count > 0 && !handles.is_null() {
             // SAFETY: the title passes the first handle.
             let first = unsafe { *handles };
-            (0..u64::from(count)).map(|i| first + 128 * i).collect()
+            let Some(handles) = (0..u64::from(count))
+                .map(|i| first.checked_add(128 * i))
+                .collect::<Option<Vec<u64>>>()
+            else {
+                return;
+            };
+            handles
         } else {
             items(handles, count).to_vec()
         };
@@ -1062,7 +1075,7 @@ mod state {
     /// programs take `x` groups only.
     pub(super) extern "system" fn dispatch_mesh(this: This, x: u32, y: u32, z: u32) {
         super::count_draw();
-        if y * z != 1 {
+        if y != 1 || z != 1 {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!(x, y, z, "a mesh dispatch with y or z groups"));
         }
@@ -1162,8 +1175,14 @@ extern "system" fn execute_indirect(
     let Some((stride, args)) = crate::signature::layout(signature) else {
         return;
     };
-    let address = crate::resource::buffer_bytes(arguments).map(|(p, _)| p as u64 + offset);
-    let counter = crate::resource::buffer_bytes(count).map(|(p, _)| p as u64 + count_offset);
+    let address = crate::resource::buffer_bytes(arguments)
+        .and_then(|(p, size)| (offset <= size).then(|| (p as u64).checked_add(offset))?);
+    let counter = crate::resource::buffer_bytes(count).and_then(|(p, size)| {
+        count_offset
+            .checked_add(4)
+            .filter(|&end| end <= size)
+            .and_then(|_| (p as u64).checked_add(count_offset))
+    });
     let mut ran = false;
     #[cfg(windows)]
     if let ([[kind, ..]], Some(address)) = (args, address)
@@ -1443,6 +1462,138 @@ mod tests {
         // SAFETY: the list is ours.
         assert!(unsafe { &(*list.cast::<List>()).uploads }.lock().unwrap().is_empty());
         let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        assert_eq!(release(list), 0);
+        assert_eq!(release(allocator), 0);
+    }
+
+    #[test]
+    fn command_list_guards_against_overflows_and_bad_allocations() {
+        let null = std::ptr::null();
+        let mut allocator = null;
+        assert_eq!(
+            create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator),
+            S_OK
+        );
+        let mut list = null;
+        assert_eq!(
+            create_list(null, 0, 0, allocator, null, &LIST_IIDS[0], &mut list),
+            S_OK
+        );
+
+        assert!(allocate_upload(list, 1 << 63, 16).is_null());
+        assert!(allocate_upload(list, 8, 3).is_null());
+
+        #[cfg(windows)]
+        {
+            let overflow_base = u64::MAX - 64;
+            state::targets(list, 2, &overflow_base, 1, std::ptr::null());
+            state::targets(list, 0, std::ptr::dangling::<u64>(), 1, std::ptr::null());
+            state::dispatch_mesh(list, 1, 0x1_0000, 0x1_0000);
+        }
+
+        #[repr(C)]
+        struct SigDesc {
+            stride: u32,
+            count: u32,
+            arguments: *const [u32; 4],
+            nodes: u32,
+        }
+        #[repr(C)]
+        struct HeapProps {
+            kind: u32,
+            cpu_pages: u32,
+            pool: u32,
+            creation_nodes: u32,
+            visible_nodes: u32,
+        }
+        #[repr(C)]
+        struct ResDesc {
+            dimension: u32,
+            alignment: u64,
+            width: u64,
+            height: u32,
+            depth_or_array_size: u16,
+            mip_levels: u16,
+            format: u32,
+            sample_count: u32,
+            sample_quality: u32,
+            layout: u32,
+            flags: u32,
+        }
+        let device = crate::device::device();
+        type CreateSig =
+            extern "system" fn(This, *const SigDesc, This, *const Iid, *mut This) -> HRESULT;
+        type CreateRes = extern "system" fn(
+            This,
+            *const HeapProps,
+            u32,
+            *const ResDesc,
+            u32,
+            *const std::ffi::c_void,
+            *const Iid,
+            *mut This,
+        ) -> HRESULT;
+        let arg = [0u32; 4]; // draw argument
+        let sig_desc = SigDesc {
+            stride: 16,
+            count: 1,
+            arguments: &arg,
+            nodes: 0,
+        };
+        let mut sig = std::ptr::null();
+        assert_eq!(
+            slot::<CreateSig>(device, 0x148)(
+                device,
+                &sig_desc,
+                std::ptr::null(),
+                &PAGEABLE_IIDS[0],
+                &mut sig
+            ),
+            S_OK
+        );
+        let heap = HeapProps {
+            kind: 2,
+            cpu_pages: 0,
+            pool: 0,
+            creation_nodes: 0,
+            visible_nodes: 0,
+        };
+        let res_desc = ResDesc {
+            dimension: 1,
+            alignment: 0,
+            width: 256,
+            height: 1,
+            depth_or_array_size: 1,
+            mip_levels: 1,
+            format: 0,
+            sample_count: 1,
+            sample_quality: 0,
+            layout: 1,
+            flags: 0,
+        };
+        let mut buf = std::ptr::null();
+        assert_eq!(
+            slot::<CreateRes>(device, 0xd8)(
+                device,
+                &heap,
+                0,
+                &res_desc,
+                0,
+                std::ptr::null(),
+                &PAGEABLE_IIDS[0],
+                &mut buf
+            ),
+            S_OK
+        );
+
+        execute_indirect(list, sig, 1, buf, u64::MAX, std::ptr::null(), 0);
+        execute_indirect(list, sig, 1, buf, 512, std::ptr::null(), 0);
+        execute_indirect(list, sig, 1, buf, 0, buf, u64::MAX);
+        execute_indirect(list, sig, 1, buf, 0, buf, 254);
+
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        assert_eq!(release(buf), 0);
+        assert_eq!(release(sig), 0);
         assert_eq!(release(list), 0);
         assert_eq!(release(allocator), 0);
     }
