@@ -260,8 +260,13 @@ impl Staging {
 /// unmapped until their pages arrive).
 pub(crate) fn committed(at: *const u8, len: usize) -> bool {
     use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQuery};
+    if len == 0 {
+        return true;
+    }
     let mut p = at as usize;
-    let end = p + len;
+    let Some(end) = p.checked_add(len) else {
+        return false;
+    };
     while p < end {
         // SAFETY: plain data filled in by the query.
         let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
@@ -270,7 +275,13 @@ pub(crate) fn committed(at: *const u8, len: usize) -> bool {
         if n == 0 || info.State != MEM_COMMIT {
             return false;
         }
-        p = info.BaseAddress as usize + info.RegionSize;
+        let Some(next) = (info.BaseAddress as usize).checked_add(info.RegionSize) else {
+            return true;
+        };
+        if next <= p {
+            return false;
+        }
+        p = next;
     }
     true
 }
@@ -341,4 +352,19 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     });
     map.insert(resource as usize, s.clone());
     Some(s)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn committed_rejects_overflowing_and_unmapped_ranges() {
+        let buf = [0u8; 64];
+        assert!(committed(buf.as_ptr(), buf.len()));
+        assert!(committed(buf.as_ptr(), 0));
+        assert!(!committed(buf.as_ptr(), usize::MAX));
+        assert!(!committed(usize::MAX as *const u8, 2));
+        assert!(!committed(std::ptr::null(), 1));
+    }
 }
