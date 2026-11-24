@@ -18,12 +18,13 @@
 //! the intro and menus stutter while a cold library was filled. A pass the
 //! title runs only once and whose pipeline takes longer is lost.
 //!
-//! A dispatch is not dropped that way: what a compute pass writes is read
-//! later (by draws, other passes, the CPU), and a dropped one leaves that
-//! memory never written. Its first use waits until the pipeline is made,
-//! making it on the waiting thread if no worker has taken it yet, for at
-//! most [`COMPUTE_BOUND`]. Every compute pipeline is started when the title
-//! creates it, so the workers have usually made it by then.
+//! A dispatch waits within the same budget and is dropped past it, as a
+//! draw is. Waiting for every compute pipeline at its first dispatch (up to
+//! 20 s each, made on the recording thread if no worker had taken it) held
+//! the world's first frame until hundreds of them were made: a black screen
+//! for minutes with a stale library (made ~170 per 20 s). Every compute
+//! pipeline is still started when the title creates it, so most are made
+//! during loading; a dispatch promotes its own ahead of those.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
@@ -145,63 +146,10 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
         super::library::note_used(&p.key);
     }
     if p.made.get().is_none() {
-        if p.compute() {
-            wait_compute(p);
-        } else {
-            start(p, REQUESTED);
-            wait(p, crate::frame::current());
-        }
+        start(p, REQUESTED);
+        wait(p, crate::frame::current());
     }
     p.made.get()?.as_ref()
-}
-
-/// Waiting allowed for one compute pipeline at its first use: beyond the
-/// slowest driver compiles seen (3.4 s), and below what a hung worker
-/// would cost.
-const COMPUTE_BOUND: Duration = Duration::from_secs(20);
-
-/// Makes `p` here if no worker has taken it, else waits for it up to
-/// [`COMPUTE_BOUND`]; outside the graphics budget.
-fn wait_compute(p: &Pending) {
-    let started = Instant::now();
-    let here = {
-        // Under the queue's lock, so a worker cannot claim it meanwhile.
-        let _queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
-        match p.queue_state.swap(MAKING, Ordering::Relaxed) {
-            MAKING => false,
-            // Its early entry is now skipped by the workers: not counted.
-            EARLY => {
-                WAITING.fetch_sub(1, Ordering::Relaxed);
-                true
-            }
-            // Not queued, or queued as requested (a worker pops and counts
-            // that entry; making it again is a no-op).
-            _ => true,
-        }
-    };
-    if here {
-        p.make();
-    } else {
-        let (lock, done) = &DONE;
-        let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
-        while p.made.get().is_none() {
-            let rest = COMPUTE_BOUND.saturating_sub(started.elapsed());
-            if rest.is_zero() {
-                tracing::warn!(
-                    shaders = ?p.shaders,
-                    "a compute pipeline was not made within {} s: its dispatches are dropped until it is",
-                    COMPUTE_BOUND.as_secs()
-                );
-                break;
-            }
-            held = done.wait_timeout(held, rest).unwrap_or_else(|e| e.into_inner()).0;
-        }
-    }
-    #[cfg(feature = "diagnostics")]
-    crate::copystat::add(
-        crate::copystat::C::PipelineWaitUs,
-        started.elapsed().as_micros() as u64,
-    );
 }
 
 /// Makes `p` on this thread if it is not made yet (waiting for a worker
@@ -213,8 +161,8 @@ pub(crate) fn now(p: &Arc<Pending>) -> bool {
 
 /// At the title's creation of a pipeline: starts it at once if an earlier
 /// run drew with it (during loading, so the world's first frames find it),
-/// and every compute pipeline: its first dispatch waits for it, and a frame
-/// that first dispatches hundreds of them (the world's) waited minutes.
+/// and every compute pipeline: what a dropped dispatch writes is missing
+/// until its pipeline is made, so the world's are made while it loads.
 pub(crate) fn early(p: &Arc<Pending>) {
     if !p.shaders.is_empty() && (p.compute() || super::library::wanted_early(&p.key)) {
         super::library::EARLY.fetch_add(1, Ordering::Relaxed);
@@ -446,21 +394,29 @@ mod tests {
         assert!(matches!(p.made.get(), Some(None)));
     }
 
-    /// A compute pipeline is started at its creation, and its first dispatch
-    /// gets an answer instead of being dropped past the frame's budget.
+    /// A compute pipeline is started at its creation, and a dispatch whose
+    /// pipeline a worker is still making waits only within the frame's
+    /// budget (it waited up to 20 s per pipeline, and the world's first
+    /// frame minutes), then is dropped.
     #[test]
-    fn a_compute_pipeline_starts_early_and_its_dispatch_waits() {
+    fn a_compute_dispatch_waits_only_within_the_frame_budget() {
         let cs = Arc::new(super::super::Shader {
             stage: "compute",
             hash: "c0c0c0c0c0c0c0c0".to_owned(),
             container: Vec::new(),
             translated: OnceLock::new(),
         });
+        let early_one = Arc::new(Pending::new(vec![cs.clone()], None));
+        early(&early_one);
+        assert_ne!(early_one.queue_state.load(Ordering::Relaxed), NOT_QUEUED);
+
         let p = Arc::new(Pending::new(vec![cs], None));
-        early(&p);
-        assert_ne!(p.queue_state.load(Ordering::Relaxed), NOT_QUEUED);
+        // A worker has taken it and cannot finish it yet.
+        p.queue_state.store(MAKING, Ordering::Relaxed);
+        let started = Instant::now();
         assert!(ready(&p).is_none());
-        assert!(matches!(p.made.get(), Some(None)), "made, here or by a worker");
+        assert!(p.made.get().is_none(), "not made on the recording thread");
+        assert!(started.elapsed() <= wait_budget(0) + Duration::from_millis(250));
     }
 
     #[test]
