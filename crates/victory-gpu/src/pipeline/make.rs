@@ -320,9 +320,11 @@ fn start(p: &Arc<Pending>) {
 }
 
 /// At the title's creation of a pipeline: starts it at once if an earlier
-/// run drew with it (during loading, so the world's first frames find it).
+/// run drew with it (during loading, so the world's first frames find it),
+/// and every compute pipeline: its first dispatch waits for it, and a frame
+/// that first dispatches hundreds of them (the world's) waited minutes.
 pub(crate) fn early(p: &Arc<Pending>) {
-    if !p.shaders.is_empty() && super::library::wanted_early(&p.key) {
+    if !p.shaders.is_empty() && (p.compute() || super::library::wanted_early(&p.key)) {
         super::library::EARLY.fetch_add(1, Ordering::Relaxed);
         start(p);
     }
