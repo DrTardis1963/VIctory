@@ -9954,6 +9954,30 @@ impl<'a> Lower<'a> {
                 }
             }
         }
+        // Mask dwords of a pixel or vertex join that stand as their ballot
+        // (below in `fill_phis`).
+        let mut balloted = HashSet::new();
+        for k in 0..self.data_phis.len() {
+            let (_, b, i) = self.data_phis[k];
+            let phi = &p.blocks[b].phis[i];
+            if self.mask_data != MaskData::Host
+                || phi.reg == Reg::Scc
+                || !self.read_phis.contains(&phi.value)
+            {
+                continue;
+            }
+            for (&q, &arg) in p.blocks[b].preds.iter().zip(&phi.args) {
+                let lo = self.x.st.highs.get(&arg).copied().unwrap_or(arg);
+                if self.tail[q].is_some()
+                    && !matches!(self.vals.get(&arg), Some(Val::I32(_)))
+                    && self.x.st.masks.contains_key(&lo)
+                    && self.def_block.get(&lo).is_some_and(|&d| d != self.cur_ir)
+                    && self.mask_dword(arg).is_ok()
+                {
+                    balloted.insert(arg);
+                }
+            }
+        }
         let mut found = Vec::new();
         let mut missing = HashMap::new();
         loop {
@@ -9983,6 +10007,7 @@ impl<'a> Lower<'a> {
                             (Some(Val::Bit(_)), false) => Some("an SCC joined with SGPR values"),
                             // Left undefined below (`descriptor_dword`).
                             (Some(Val::Missing(_)), _) if self.descriptor_dword(*arg) => None,
+                            (None | Some(Val::Missing(_)), false) if balloted.contains(arg) => None,
                             (Some(Val::Missing(why)), _) => Some(why),
                             _ => Some("a join of mismatched values"),
                         }
@@ -10034,6 +10059,18 @@ impl<'a> Lower<'a> {
                     Some(&(f, h)) if !self.loop_bodies[&h].contains(&q) => Some(f),
                     _ => self.vals.get(&arg).copied(),
                 };
+                let lo = self.x.st.highs.get(&arg).copied().unwrap_or(arg);
+                let ballot_ok = self.mask_data == MaskData::Host
+                    && !bit
+                    && self.read_phis.contains(&phi.value)
+                    && self.x.st.masks.contains_key(&lo)
+                    && self.def_block.get(&lo).is_some_and(|&d| d != self.cur_ir);
+                let ballot = if ballot_ok {
+                    self.mask_dword(arg).ok()
+                } else {
+                    None
+                };
+                let ballot_ok = ballot.is_some();
                 let x = match (looked, bit) {
                     (Some(Val::I32(x)), false) | (Some(Val::Bit(x)), true) => x,
                     (Some(Val::Bit(_)), false) if self.read_phis.contains(&phi.value) => {
@@ -10050,6 +10087,12 @@ impl<'a> Lower<'a> {
                             self.s.m.undef(self.s.t.i32)
                         }
                     }
+                    // A mask dword the other path left in the register: its ballot
+                    // (a pixel or vertex program reads such a join only through a
+                    // zero test or a count). shortcut: the ballot is the host
+                    // wave's, so a join read some other way would differ from the
+                    // console, which `mask_ok` does not see; upgrade if one shows up.
+                    (None | Some(Val::Missing(_)), false) if ballot_ok => ballot.unwrap(),
                     (Some(Val::Missing(why)), _) if self.read_phis.contains(&phi.value) => {
                         return Err(Stop::Retry(vec![(phi.value, why)]));
                     }
