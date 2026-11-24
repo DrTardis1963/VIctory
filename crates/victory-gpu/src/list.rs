@@ -135,19 +135,32 @@ fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::dra
     f(&list, &mut state.lock().unwrap_or_else(|e| e.into_inner()));
 }
 
+/// The draw state of a closed title list, for submission-time work: unlike
+/// [`with_state`], opens no buffer-copy continuation (one opened after the
+/// title closed the list would be submitted open, and the device removed).
+#[cfg(windows)]
+fn with_closed_state(this: This, f: impl FnOnce(&mut crate::draw::State)) {
+    if host_list(this).is_none() {
+        return;
+    }
+    // SAFETY: the title passes one of our lists.
+    let state = unsafe { &(*this.cast::<List>()).state };
+    f(&mut state.lock().unwrap_or_else(|e| e.into_inner()));
+}
+
 /// Before a submission of a title list: false if it must not run (its
 /// dynamic slots were taken back, see `State::take_back`).
 #[cfg(windows)]
 pub(crate) fn take_back_slots(this: This) -> bool {
     let mut runs = true;
-    with_state(this, |_, state| runs = state.take_back());
+    with_closed_state(this, |state| runs = state.take_back());
     runs
 }
 
 /// After a submission of a title list ran: its dynamic slots may be lent.
 #[cfg(windows)]
 pub(crate) fn lend_slots(this: This) {
-    with_state(this, |_, state| state.lend());
+    with_closed_state(this, |state| state.lend());
 }
 
 /// The host list behind a title list, if there is a host GPU.
