@@ -155,6 +155,10 @@ impl TitleList {
         host_list(self.list).expect("native command list")
     }
 
+    fn recording(&self) -> RecordingList<'_> {
+        recording_list(self.list).expect("native recording command list")
+    }
+
     fn copy(
         &self,
         dst: &TitleBuffer,
@@ -195,6 +199,10 @@ impl TitleList {
 
     fn close(&self) {
         assert_eq!(close(self.list), S_OK);
+    }
+
+    fn reset(&self) {
+        assert_eq!(reset(self.list, self.allocator, std::ptr::null()), S_OK);
     }
 }
 
@@ -260,15 +268,18 @@ impl Shader {
     }
 
     fn write(&self, list: &TitleList, target: &TitleBuffer, word: usize, value: u32) {
-        let list = list.host();
-        let shadow = target.shadow(list, word, true);
+        let list = list.recording();
+        let shadow = target.shadow(&list, word, true);
+        self.write_gpu(&list, target.gpu(&shadow, word), value);
+    }
+
+    fn write_gpu(&self, list: &HostList, address: u64, value: u32) {
         // SAFETY: the open list holds the shadow via the usual refresh/write steps.
         unsafe {
             list.list.SetComputeRootSignature(&self.root);
             list.list.SetPipelineState(&self.pipeline);
             list.list.SetComputeRoot32BitConstant(0, value, 0);
-            list.list
-                .SetComputeRootUnorderedAccessView(1, target.gpu(&shadow, word));
+            list.list.SetComputeRootUnorderedAccessView(1, address);
             list.list.Dispatch(1, 1, 1);
         }
     }
@@ -280,19 +291,81 @@ impl Shader {
         source_word: usize,
         target: &TitleBuffer,
     ) {
-        let list = list.host();
-        let input = source.shadow(list, source_word, false);
+        let list = list.recording();
+        let input = source.shadow(&list, source_word, false);
+        self.read_gpu(&list, source.gpu(&input, source_word), target);
+    }
+
+    fn read_gpu(&self, list: &HostList, address: u64, target: &TitleBuffer) {
         let output = target.shadow(list, 0, true);
         // SAFETY: the open list holds both shadows via the usual refresh/write steps.
         unsafe {
             list.list.SetComputeRootSignature(&self.root);
             list.list.SetPipelineState(&self.pipeline);
-            list.list
-                .SetComputeRootShaderResourceView(0, source.gpu(&input, source_word));
+            list.list.SetComputeRootShaderResourceView(0, address);
             list.list
                 .SetComputeRootUnorderedAccessView(1, target.gpu(&output, 0));
             list.list.Dispatch(1, 1, 1);
         }
+    }
+
+    fn write_indirect(
+        &self,
+        list: &TitleList,
+        args: &TitleBuffer,
+        target: &TitleBuffer,
+        value: u32,
+    ) {
+        let list = list.recording();
+        let argument = D3D12_INDIRECT_ARGUMENT_DESC {
+            Type: D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH,
+            ..Default::default()
+        };
+        let desc = D3D12_COMMAND_SIGNATURE_DESC {
+            ByteStride: 12,
+            NumArgumentDescs: 1,
+            pArgumentDescs: &argument,
+            NodeMask: 0,
+        };
+        let mut signature: Option<ID3D12CommandSignature> = None;
+        // SAFETY: valid one-argument signature without root arguments.
+        unsafe {
+            crate::host::host()
+                .unwrap()
+                .device
+                .CreateCommandSignature(&desc, None::<&ID3D12RootSignature>, &mut signature)
+                .unwrap();
+        }
+        let signature = signature.unwrap();
+        list.keep(&signature);
+        let input = shadow::find(args.address, 12).unwrap();
+        input.refresh(&list, args.address, 12);
+        input.gpu_writes(&list, args.address, 12);
+        let output = target.shadow(&list, 0, true);
+        assert!(crate::indirect::bound(
+            &list,
+            &input.buffer,
+            input.gpu(args.address),
+            (2, 12, 1),
+        ));
+        // SAFETY: the clamp performed the argument transition, and the
+        // resources and signature are kept by the list.
+        unsafe {
+            list.list.SetComputeRootSignature(&self.root);
+            list.list.SetPipelineState(&self.pipeline);
+            list.list.SetComputeRoot32BitConstant(0, value, 0);
+            list.list
+                .SetComputeRootUnorderedAccessView(1, target.gpu(&output, 0));
+            list.list.ExecuteIndirect(
+                &signature,
+                1,
+                &input.buffer,
+                input.offset(args.address),
+                None,
+                0,
+            );
+        }
+        crate::indirect::done(&list, &input.buffer);
     }
 }
 
@@ -438,7 +511,6 @@ fn test_gpu() -> Option<TestGpu> {
 }
 
 #[test]
-#[ignore = "known upstream buffer-copy ordering defect"]
 fn gpu_producer_copy_and_gpu_consumer_are_ordered() {
     let Some(gpu) = test_gpu() else { return };
     let writer = Shader::new(gpu.host, s!("write_word"));
@@ -470,7 +542,6 @@ fn gpu_producer_copy_and_gpu_consumer_are_ordered() {
 }
 
 #[test]
-#[ignore = "known upstream buffer-copy ordering defect"]
 fn gpu_read_before_copy_observes_original_value() {
     let Some(gpu) = test_gpu() else { return };
     let reader = Shader::new(gpu.host, s!("read_word"));
@@ -496,7 +567,6 @@ fn gpu_read_before_copy_observes_original_value() {
 }
 
 #[test]
-#[ignore = "known upstream buffer-copy ordering defect"]
 fn consecutive_copies_forward_gpu_produced_bytes() {
     let Some(gpu) = test_gpu() else { return };
     let writer = Shader::new(gpu.host, s!("write_word"));
@@ -516,7 +586,6 @@ fn consecutive_copies_forward_gpu_produced_bytes() {
 }
 
 #[test]
-#[ignore = "known upstream buffer-copy ordering defect"]
 fn ordered_copies_span_multiple_lists_in_one_submission() {
     let Some(gpu) = test_gpu() else { return };
     let writer = Shader::new(gpu.host, s!("write_word"));
@@ -563,7 +632,6 @@ fn copy_reads_write_from_an_earlier_submission() {
 }
 
 #[test]
-#[ignore = "known upstream buffer-copy ordering defect"]
 fn buffer_copy_resource_preserves_order() {
     let Some(gpu) = test_gpu() else { return };
     let writer = Shader::new(gpu.host, s!("write_word"));
@@ -630,12 +698,174 @@ fn cpu_staging_fill_observes_copy_destination() {
     let list = TitleList::new();
     let (_upload, mapped) = list.host().upload(gpu.host, 4).unwrap();
     list.copy(&dest, 0, &source, 0, 4);
-    list.host().defer_fill(mapped, dest.address as *const u8, 4);
+    list.recording()
+        .defer_fill(mapped, dest.address as *const u8, 4);
     list.close();
     gpu.execute(&[list.host()]);
     // SAFETY: the completed submission filled four bytes of the live upload mapping.
     assert_eq!(unsafe { mapped.cast::<u32>().read_unaligned() }, 27);
     assert_eq!(dest.words(), [27]);
+}
+
+#[test]
+fn cpu_staging_reads_back_a_gpu_ordered_copy_before_gpu_consumes_upload() {
+    let Some(gpu) = test_gpu() else { return };
+    let writer = Shader::new(gpu.host, s!("write_word"));
+    let reader = Shader::new(gpu.host, s!("read_word"));
+    let source = TitleBuffer::new(&[27]);
+    let dest = TitleBuffer::new(&[13]);
+    let output = TitleBuffer::new(&[0]);
+    let list = TitleList::new();
+    let (upload, mapped) = list.host().upload(gpu.host, 4).unwrap();
+    writer.write(&list, &source, 0, 500);
+    list.copy(&dest, 0, &source, 0, 4);
+    let recording = list.recording();
+    recording.defer_fill(mapped, dest.address as *const u8, 4);
+    // SAFETY: the upload is kept by the list and contains four bytes.
+    reader.read_gpu(
+        &recording,
+        unsafe { upload.GetGPUVirtualAddress() },
+        &output,
+    );
+    list.close();
+    gpu.execute(&[list.host()]);
+    assert_eq!(dest.words(), [500]);
+    assert_eq!(output.words(), [500]);
+}
+
+#[test]
+fn disjoint_ranges_in_one_native_buffer_copy_in_gpu_order() {
+    let Some(gpu) = test_gpu() else { return };
+    let writer = Shader::new(gpu.host, s!("write_word"));
+    let reader = Shader::new(gpu.host, s!("read_word"));
+    let buffer = TitleBuffer::new(&[11, 22, 33]);
+    let output = TitleBuffer::new(&[0]);
+    let list = TitleList::new();
+    writer.write(&list, &buffer, 0, 500);
+    list.copy(&buffer, 4, &buffer, 0, 4);
+    list.copy(&buffer, 0, &buffer, 0, 4);
+    list.copy(&buffer, 4, &buffer, 0, 8);
+    reader.read(&list, &buffer, 1, &output);
+    list.close();
+    gpu.execute(&[list.host()]);
+    assert_eq!(buffer.words(), [500, 500, 33]);
+    assert_eq!(output.words(), [500]);
+}
+
+#[test]
+fn independent_copies_share_a_handoff_and_duplicate_copy_preserves_result() {
+    let Some(gpu) = test_gpu() else { return };
+    let writer = Shader::new(gpu.host, s!("write_word"));
+    let reader = Shader::new(gpu.host, s!("read_word"));
+    let a = TitleBuffer::new(&[13]);
+    let b = TitleBuffer::new(&[27]);
+    let dest = TitleBuffer::new(&[0, 0]);
+    let output = TitleBuffer::new(&[0]);
+    let list = TitleList::new();
+    writer.write(&list, &a, 0, 500);
+    list.copy(&dest, 0, &a, 0, 4);
+    list.copy(&dest, 0, &a, 0, 4);
+    list.copy(&dest, 4, &b, 0, 4);
+    reader.read(&list, &dest, 1, &output);
+    list.close();
+    gpu.execute(&[list.host()]);
+    assert_eq!(dest.words(), [500, 27]);
+    assert_eq!(output.words(), [27]);
+}
+
+#[test]
+fn ordered_copy_keeps_released_buffer_backing_until_reset() {
+    let Some(gpu) = test_gpu() else { return };
+    let writer = Shader::new(gpu.host, s!("write_word"));
+    let reader = Shader::new(gpu.host, s!("read_word"));
+    let source = TitleBuffer::new(&[27]);
+    let dest = TitleBuffer::new(&[13]);
+    let output = TitleBuffer::new(&[0]);
+    let list = TitleList::new();
+    writer.write(&list, &source, 0, 500);
+    list.copy(&dest, 0, &source, 0, 4);
+    reader.read(&list, &dest, 0, &output);
+    list.close();
+    drop(source);
+    drop(dest);
+    gpu.execute(&[list.host()]);
+    assert_eq!(output.words(), [500]);
+    list.reset();
+    let cpu_source = TitleBuffer::new(&[77]);
+    list.copy(&output, 0, &cpu_source, 0, 4);
+    list.close();
+    gpu.execute(&[list.host()]);
+    assert_eq!(output.words(), [77]);
+}
+
+#[test]
+fn copyback_reconciles_a_later_destination_in_a_snapshot_gap() {
+    let Some(gpu) = test_gpu() else { return };
+    let writer = Shader::new(gpu.host, s!("write_word"));
+    let source = TitleBuffer::new(&[0]);
+    let dest = TitleBuffer::new(&[13, 27, 59]);
+    let list = TitleList::new();
+    writer.write(&list, &dest, 0, 500);
+    list.copy(&dest, 8, &source, 0, 4);
+    list.copy(&dest, 4, &source, 0, 4);
+    list.close();
+    gpu.execute(&[list.host()]);
+    assert_eq!(dest.words(), [500, 0, 0]);
+}
+
+#[test]
+fn copyback_preserves_order_for_distinct_shadows_over_same_title_word() {
+    let Some(gpu) = test_gpu() else { return };
+    let writer = Shader::new(gpu.host, s!("write_word"));
+    let title = TitleBuffer::new(&[13, 27]);
+    let word = title.address + 4;
+    // Model an inner buffer registration in the same title allocation.
+    let key = std::ptr::from_ref(&word) as usize;
+    shadow::register(key, word, 4);
+    let inner = shadow::find(word, 4);
+    shadow::unregister(key, word);
+    let inner = inner.unwrap();
+    let outer = shadow::find(title.address, 8).unwrap();
+    assert!(!Arc::ptr_eq(&inner, &outer));
+    let (first, second) = if Arc::as_ptr(&inner) > Arc::as_ptr(&outer) {
+        (inner, outer)
+    } else {
+        (outer, inner)
+    };
+
+    let list = TitleList::new();
+    let recording = list.recording();
+    for (shadow, value) in [(first, 111), (second, 222)] {
+        shadow.refresh(&recording, word, 4);
+        shadow.gpu_writes(&recording, word, 4);
+        writer.write_gpu(&recording, shadow.gpu(word), value);
+    }
+    list.close();
+    gpu.execute(&[list.host()]);
+    assert_eq!(title.words(), [13, 222]);
+}
+
+#[test]
+fn copy_handoffs_between_indirect_producer_and_consumer() {
+    let Some(gpu) = test_gpu() else { return };
+    let writer = Shader::new(gpu.host, s!("write_word"));
+    let a = TitleBuffer::new(&[1, 1, 1]);
+    let b = TitleBuffer::new(&[0, 0, 0]);
+    let before = TitleBuffer::new(&[0]);
+    let after = TitleBuffer::new(&[0]);
+    let list = TitleList::new();
+    writer.write_indirect(&list, &a, &before, 55);
+    list.copy(&b, 0, &a, 0, 12);
+    writer.write_indirect(&list, &b, &after, 77);
+    list.close();
+    for _ in 0..2 {
+        before.set(0, 0);
+        after.set(0, 0);
+        gpu.execute(&[list.host()]);
+        assert_eq!(before.words(), [55]);
+        assert_eq!(after.words(), [77]);
+        assert_eq!(b.words(), [1, 1, 1]);
+    }
 }
 
 #[test]

@@ -155,24 +155,93 @@ zero shadow refresh and copyback bytes. The prototype refreshed both endpoints
 and reconciled the destination. The additional transfers give a reason to
 keep a CPU copy when the command stream proves it is equivalent.
 
-## Implementation checkpoint
+## Implementation
 
-The stale copy and early-read failures are reproducible. A general native
-replacement needs decisions about buffer access with indirect execution,
-legacy continuation lists, and ordered consumers of CPU staging. This branch
-contains the regression fixture and the design checkpoint. The title copy path
-still uses the baseline implementation.
+The title-facing buffer copies record ordered copy operations. The submission
+keeps a mapped copy while all preceding command segments are known to have
+left title buffers untouched. This prefix needs no native shadow allocation
+or additional queue submission. An opaque command or deferred access ends the
+prefix for the rest of the title submission.
+
+A GPU-ordered copy records against the source and destination shadows. The
+producer, transfer, and consumer run through successive
+`ExecuteCommandLists` calls on the same direct queue. Native buffer states
+decay to COMMON between calls, so the copy can promote to COPY_SOURCE and
+COPY_DEST and the following work can promote to its required state. Separate
+calls also give execution ordering without adding a CPU fence between them.
+Consecutive independent transfers can share a call. Adjacent identical GPU
+copies use one transfer.
+The continuation restores topology, rasterizer state and targets, then
+rebinds the pipeline, root signature, and heaps on demand. The title list
+retains ownership of scratch, dynamic descriptors, and the indirect budget
+until reset.
+
+When a fill or CPU transformation reads bytes that a previous native segment
+writes, the host waits for that segment and copies back the data before
+running the deferred CPU step. This covers upload staging, CBV scratch,
+rectangle expansion and texture detiling where the dependency crosses a
+native segment boundary. Opaque steps that can write title memory also
+require visibility of preceding writes. Pure GPU chains keep the existing
+one-fence completion.
+
+The copy refreshes both endpoints and marks the destination pending before
+later refreshes. The submission snapshots after all refreshes and merges
+copyback ranges per shadow. When distinct shadows cover the same title
+addresses, it preserves the declaration order. A regression with two copies
+of zero into an existing snapshot's gap returned `[500, 27, 0]` before this
+change and `[500, 0, 0]` after it.
+The recorded copy keeps both title buffers alive until reset. An identical
+range is a no-op. Intersecting ranges are rejected. Disjoint ranges in the
+same native buffer use a two-transfer scratch handoff.
 
 Queue synchronization, texture readback, and faster shadow copyback each
 address a different part of the pipeline. Directly indexed SRV refresh can
 make a shadow current at submission, while the copy still has to occur between
 the producer and consumer on the GPU timeline. [PR #32](https://github.com/Marvisak/VIctory/pull/32) · [PR #67](https://github.com/Marvisak/VIctory/pull/67) · [PR #124](https://github.com/Marvisak/VIctory/pull/124) · [PR #185](https://github.com/Marvisak/VIctory/pull/185)
 
-Before proposing the runtime change, require the focused failures to pass with
-the debug layer and resource-state tracking active, including copy operations
-before and after indirect execution, aliased or released resources, and a
-dependent host upload. Measure CPU preparation, GPU execution, bytes refreshed
-and copied back, allocation count, synchronization, and wall time for small and
-large copies, repeated copies, CPU and GPU producers, and dependent lists.
-Measure enhanced and legacy paths individually because native submission
-boundaries affect the legacy cost.
+The focused GPU tests are gated by `VICTORY_TEST_BUFFER_COPY=1`. For full
+GPU-based validation set `VICTORY_TEST_BUFFER_COPY_GBV=1` and provide an
+active D3D12 debug runtime. Use `VICTORY_D3D12_WARP=1` with a diagnostics
+build to select WARP, or `VICTORY_TEST_BUFFER_COPY_NVIDIA=1` to select NVIDIA
+in a test build. Run
+`cargo test -p victory-gpu --features diagnostics list::buffer_copy_tests -- --test-threads=1 --nocapture`.
+The fixture checks actual device validation flags and reports the adapter.
+
+### Validation of the implementation
+
+All 17 focused cases passed on AMD Radeon Graphics, NVIDIA RTX 5070 Laptop,
+and Microsoft WARP with the Agility SDK 1.620.2 debug layer and full GPU-based
+resource-state tracking active. The same-list GPU writer, copy, and consumer
+now return 500 on all three adapters. The two GPU reads around a CPU-produced
+copy return 13 and 27 in order. The suite also covers copied indirect
+arguments, repeated submission, destination aliasing, releasing the buffers
+before execution, and a GPU consumer of a CPU-staged upload.
+
+### Performance of the implementation
+
+These are medians of three runs of 32 warm submissions on AMD with
+validation disabled. Every GPU case returns 11 on the checkpoint and 500
+after the fix. GPU time is the queue timestamp interval from before the
+producer to after the consumer. It includes GPU submission gaps. The CPU
+cases issue no GPU buffer transfer. Both builds did 32 fence waits in
+every case and allocated no new command lists during the warm measurement.
+Each cold command-list pair includes a texture-state prelude.
+
+| Work | CPU prep µs, before / after | GPU µs, before / after | Wall µs, before / after | Shadow refresh / copyback bytes after | Native calls, before / after | Cold list pairs, before / after |
+| --- | --- | --- | --- | --- | --- | --- |
+| CPU 4 B | 64 / 64 | 0 / 0 | 158 / 194 | 0 / 0 | 32 / 32 | 1 / 1 |
+| CPU 1 MiB | 1581 / 1719 | 0 / 0 | 1987 / 1991 | 0 / 0 | 32 / 32 | 1 / 1 |
+| CPU 128 × 4 B | 6867 / 7216 | 0 / 0 | 7017 / 7416 | 0 / 0 | 32 / 32 | 1 / 1 |
+| GPU 4 B | 291 / 604 | 29.8 / 3704.1 | 4507 / 10280 | 384 / 256 | 32 / 96 | 1 / 3 |
+| GPU 1 MiB, dirty destination | 1686 / 9770 | 29.6 / 7292.3 | 7475 / 356755 | 67108992 / 33554560 | 32 / 96 | 1 / 3 |
+| GPU 128 identical × 4 B | 8681 / 707 | 29.4 / 3672 | 15801 / 8931 | 384 / 256 | 32 / 96 | 1 / 3 |
+| GPU 4 B across three title lists | 351 / 569 | 122.7 / 3855.9 | 6258 / 11498 | 384 / 256 | 32 / 96 | 3 / 4 |
+| GPU 128 disjoint × 4 B | 6171 / 16032 | 26.2 / 9675 | 12194 / 37341 | 16640 / 16512 | 32 / 96 | 1 / 130 |
+
+The dirty 1 MiB case resets the whole destination before every submission.
+The fixed path refreshes both ranges and reconciles the full changed
+destination, which accounts for substantial cost in this synthetic case.
+Independent copies share native calls but still allocate individual transfer
+lists on first use. The tests measure synthetic workloads. Game performance
+and shader-to-CPU staging dependencies inside a single unsplit native segment
+remain unverified. [Copyback work in PR #261](https://github.com/Marvisak/VIctory/pull/261) · [Mapped copy costs in PR #322](https://github.com/Marvisak/VIctory/pull/322) · [Buffer state tracking in PR #334](https://github.com/Marvisak/VIctory/pull/334)
