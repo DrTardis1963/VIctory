@@ -370,6 +370,50 @@ fn first_lane_reads_are_the_console_waves() {
     console_flow_case("DPP and v_readfirstlane", &body, 64, |_| 0);
 }
 
+/// A `v_readfirstlane` of a value every lane holds the same of reads the
+/// console's first lane from either half: the program stays split in halves
+/// (no console flow, so groups of several console waves translate too). One
+/// made under an EXEC its read is not under is each lane's own: console flow
+/// (refused in a group of 128).
+#[test]
+fn first_lane_reads_of_uniform_values_stay_split() {
+    let uniform = [
+        0x7E06_02FA,
+        0xFF00_E400, // v_mov_b32_dpp v3, v0 quad_perm:[0,1,2,3]
+        0x7E02_0287, // v_mov_b32 v1, 7
+        0x7E12_0501, // v_readfirstlane_b32 s9, v1
+        0x7E04_0209, // v_mov_b32 v2, s9
+    ];
+    let partial = [
+        0x7E06_02FA,
+        0xFF00_E400, // v_mov_b32_dpp v3, v0 quad_perm:[0,1,2,3]
+        0x7E02_0287, // v_mov_b32 v1, 7
+        0x7D88_0094, // v_cmp_gt_u32 vcc, 20, v0
+        0xBE8A_246A, // s_and_saveexec_b64 s[10:11], vcc
+        0x7E02_0289, // v_mov_b32 v1, 9
+        0x88FE_0A7E, // s_or_b64 exec, exec, s[10:11]
+        0x7E12_0501, // v_readfirstlane_b32 s9, v1
+        0x7E04_0209, // v_mov_b32 v2, s9
+    ];
+    let nvidia = super::Target {
+        lanes_min: 32,
+        lanes_max: 32,
+    };
+    for threads in [64, 128] {
+        let cs = emit_for(&program(&uniform, threads), nvidia).expect("split in halves");
+        assert_eq!(wave_size(&cs.dxil), Some(32));
+    }
+    assert!(emit_for(&program(&partial, 128), nvidia).is_err());
+    flow_case(
+        "v_readfirstlane of a uniform value",
+        &uniform,
+        128,
+        |_| 7,
+        true,
+    );
+    console_flow_case("v_readfirstlane after a partial EXEC", &partial, 64, |_| 9);
+}
+
 /// `v_writelane` ignores EXEC: inside a branch only lanes below 20 take,
 /// it still writes lane 40. The per-lane form never had lane 40 there.
 #[test]

@@ -914,16 +914,31 @@ impl<'a> Lower<'a> {
             // become wave operations over the host's wave).
             // (`v_readfirstlane` reads the console wave's first lane, which
             // the upper half does not hold: such programs take the console
-            // flow below.)
+            // flow below. Not when every lane it may read holds the same
+            // value, nor a waterfall loop's read, which is each lane's own.)
+            let first_lane_reads = || {
+                if !insts().any(|i| i.name() == "v_readfirstlane_b32") {
+                    return false;
+                }
+                let uni = wave_uniform(p);
+                insts().any(|i| {
+                    i.name() == "v_readfirstlane_b32"
+                        && !i
+                            .writes
+                            .first()
+                            .is_some_and(|w| x.res.waterfall.reads.contains(&w.1))
+                        && !first_lane_uniform(i, &uni)
+                })
+            };
             split = console_lanes
                 && x.native.wave64
                 && !reads_whole
-                && !insts().any(|i| i.name() == "v_readfirstlane_b32")
                 && !masks_held
                 && s.lds_dwords == 0
                 && !x.target.runs(64)
                 && x.target.runs(32)
-                && (0..p.blocks.len()).all(|b| super::wave::sections(p, b).is_empty());
+                && (0..p.blocks.len()).all(|b| super::wave::sections(p, b).is_empty())
+                && !first_lane_reads();
             // The rest of such programs need the halves to exchange values
             // (masks read whole, lanes of the other half) or to share LDS in
             // the console's instruction order: the console flow, for a group
@@ -10407,6 +10422,131 @@ fn interp_mode(kind: Barycentric) -> Option<u8> {
         Barycentric::LinearSample => 7,
         Barycentric::PerspectivePullModel => return None,
     })
+}
+
+/// Values every lane of a console wave holds the same of, by the EXEC a
+/// vector value was made under: `None` holds in every lane that exists,
+/// `Some(exec)` in the lanes active under that EXEC (the others keep their
+/// old value). Scalars not taken from lane masks or other lanes are `None`;
+/// a vector value is uniform when what it is made of is, for its EXEC (a
+/// load from a uniform address too). Optimistic: everything starts uniform
+/// and loses it by its definition, until nothing changes. Vector phis count
+/// as varying (a divergent join gives each lane its own path's value).
+fn wave_uniform(p: &Program) -> HashMap<Value, Option<(Value, Option<Value>)>> {
+    let mask = |r: Reg| matches!(r, Reg::S(c) if c == EXEC || c == EXEC + 1 || c == crate::ir::VCC || c == crate::ir::VCC + 1);
+    let input = |r: Reg| p.inputs.iter().find(|i| i.0 == r).map(|i| i.1);
+    let all_lanes = (input(Reg::S(EXEC)), input(Reg::S(EXEC + 1)));
+    // A vector instruction's reads: its operands, then EXEC, then the old
+    // value of what it writes (`ir`), which only lanes outside EXEC keep.
+    let split = |inst: &Inst| -> Option<(usize, Option<(Value, Option<Value>)>)> {
+        let vector = !matches!(
+            inst.fields,
+            Fields::Sop { .. } | Fields::Sopp { .. } | Fields::Smem { .. }
+        );
+        if !vector {
+            return Some((inst.reads.len(), None));
+        }
+        let k = inst.reads.iter().position(|r| r.0 == Reg::S(EXEC))?;
+        let lo = inst.reads[k].1;
+        let hi = inst.read(Reg::S(EXEC + 1));
+        // EXEC read as an operand is a lane mask.
+        let operand_exec = matches!(&inst.fields, Fields::Valu(v)
+            if v.src.iter().any(|o| matches!(*o, Operand::Scalar { code, .. } if code == EXEC || code == EXEC + 1)));
+        if operand_exec || p.wave64 && inst.reads.get(k + 1).map(|r| r.0) != Some(Reg::S(EXEC + 1))
+        {
+            return None;
+        }
+        let exec = ((Some(lo), hi) != all_lanes).then_some((lo, hi));
+        Some((k, exec))
+    };
+    let mut uni: HashMap<Value, Option<(Value, Option<Value>)>> = p
+        .inputs
+        .iter()
+        .filter(|(r, _)| matches!(r, Reg::S(_) | Reg::Scc) && !mask(*r))
+        .map(|&(_, v)| (v, None))
+        .collect();
+    for block in &p.blocks {
+        uni.extend(
+            block
+                .phis
+                .iter()
+                .filter(|phi| !matches!(phi.reg, Reg::V(_)))
+                .map(|phi| (phi.value, None)),
+        );
+        for inst in &block.insts {
+            let exec = split(inst).and_then(|s| s.1);
+            uni.extend(
+                inst.writes
+                    .iter()
+                    .map(|&(r, v)| (v, if matches!(r, Reg::V(_)) { exec } else { None })),
+            );
+        }
+    }
+    loop {
+        let mut changed = false;
+        for block in &p.blocks {
+            for phi in &block.phis {
+                if uni.contains_key(&phi.value)
+                    && !phi.args.iter().all(|a| uni.get(a) == Some(&None))
+                {
+                    uni.remove(&phi.value);
+                    changed = true;
+                }
+            }
+            for inst in &block.insts {
+                let n = inst.name();
+                let operands = split(inst);
+                let uniform_reads = operands.is_some_and(|(k, exec)| {
+                    inst.reads[..k]
+                        .iter()
+                        .all(|r| uni.get(&r.1).is_some_and(|&t| t.is_none() || t == exec))
+                });
+                let lane_op = n.starts_with("v_mbcnt")
+                    || n == "v_writelane_b32"
+                    || n.contains("permute")
+                    || n.contains("atomic")
+                    || n.contains("d16")
+                    || n.starts_with("s_getreg")
+                    || n.contains("memtime")
+                    || n.contains("memrealtime")
+                    || matches!(&inst.fields, Fields::Valu(v) if v.dpp.is_some())
+                    || matches!(inst.fields, Fields::Ds { .. } | Fields::Vintrp { .. });
+                // A vector instruction's scalar results are lane masks, but
+                // for the lane reads.
+                let valu_scalar = |r: Reg| {
+                    !matches!(
+                        inst.fields,
+                        Fields::Sop { .. } | Fields::Sopp { .. } | Fields::Smem { .. }
+                    ) && !matches!(r, Reg::V(_))
+                        && !matches!(n, "v_readfirstlane_b32" | "v_readlane_b32")
+                };
+                for &(reg, v) in &inst.writes {
+                    if uni.contains_key(&v)
+                        && (!uniform_reads || lane_op || mask(reg) || valu_scalar(reg))
+                    {
+                        uni.remove(&v);
+                        changed = true;
+                    }
+                }
+            }
+        }
+        if !changed {
+            return uni;
+        }
+    }
+}
+
+/// Whether a `v_readfirstlane_b32` reads the same value in every lane it
+/// may read (see [`wave_uniform`]): then any lane's is the console's first.
+fn first_lane_uniform(inst: &Inst, uni: &HashMap<Value, Option<(Value, Option<Value>)>>) -> bool {
+    let Some(&src) = inst.reads.first() else {
+        return false;
+    };
+    let exec = inst
+        .read(Reg::S(EXEC))
+        .map(|lo| (lo, inst.read(Reg::S(EXEC + 1))));
+    uni.get(&src.1).is_some_and(|&t| t.is_none() || t == exec)
+        && !matches!(src.0, Reg::S(c) if c == EXEC || c == EXEC + 1)
 }
 
 /// IR blocks containing `s_barrier` (not already in `skip`) that are
