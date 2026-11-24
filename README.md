@@ -11,6 +11,35 @@ it can and on first use where it must (shaders). See
 The Windows executable can also be launched under Proton on x86-64 Linux. See
 [Running with the Proton launcher](docs/proton-launcher.md).
 
+## Progress on NVIDIA (this fork)
+
+<!-- progress:start -->
+![shaders: 97.2%](https://img.shields.io/badge/shaders-97.2%25-green)
+![Mesh shaders: 99.8%](https://img.shields.io/badge/Mesh%20shaders-99.8%25-brightgreen)
+![Vertex/pixel shaders: 97.6%](https://img.shields.io/badge/Vertex%2Fpixel%20shaders-97.6%25-green)
+![Compute shaders: 85.7%](https://img.shields.io/badge/Compute%20shaders-85.7%25-yellow)
+![measured: 2026-11-24](https://img.shields.io/badge/measured-2026--11--24-blue)
+
+| Part | Progress | % | Count |
+|---|---|---|---|
+| **All shaders** | `███████████████████░` | **97.2%** | 24633 / 25334 |
+| Mesh shaders | `████████████████████` | 99.8% | 8703 / 8713 |
+| Vertex/pixel shaders | `████████████████████` | 97.6% | 13715 / 14039 |
+| Compute shaders | `█████████████████░░░` | 85.7% | 2215 / 2582 |
+| **Game stages working** | `██████████░░░░░░░░░░` | **50.0%** | 3 / 6 |
+
+| Game stage | State | Measured |
+|---|---|---|
+| Boot and first-boot screens | ✅ | 30 fps |
+| Intro video with sound | ✅ | 30 fps, 33.3 ms per frame |
+| Start screen and menus | ✅ | 30 fps |
+| First loading screen | ⚠️ | 1-2 fps; ~2.5 min without a frame while the driver makes the world's pipelines (cold cache) |
+| First cutscene | ⚠️ | reached; 90-160 s per frame; some runs lose the device after 2-4 min |
+| Free roam | ❌ | not reached |
+
+*Measured 2026-11-24 on NVIDIA GeForce RTX 4060 Ti 8 GB, Intel Core i7-13700K, Windows 11 (`bba12c00`). Shader counts are the console shaders of the Xbox Series 1.0.2.1 dump that translate for this host (`victory translate`); game stages are what a run reached. Regenerate with `cargo xtask progress` after editing `docs/progress/progress.json`.*
+<!-- progress:end -->
+
 ## Status (2026-11-23)
 
 **Not playable yet.** The title boots, runs its menus at its own 30 fps and
