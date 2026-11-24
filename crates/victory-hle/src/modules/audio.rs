@@ -622,6 +622,15 @@ fn decode(context: Context, voice: &mut Voice) -> bool {
     true
 }
 
+#[cfg(any(test, feature = "diagnostics"))]
+fn validate_xma_dump_dir(dir: &std::path::Path) -> bool {
+    if let Err(e) = victory_core::ensure_outside_repo(dir) {
+        tracing::warn!("VICTORY_XMA_DUMP ignored: {e}");
+        return false;
+    }
+    true
+}
+
 /// `VICTORY_XMA_DUMP=<dir>`: saves the context words (`<n>-<index>.ctx`)
 /// and input buffer 0 (`.xma`) of the first 32 voices enabled, to test
 /// the decoder on a title's streams outside the title.
@@ -631,11 +640,14 @@ fn dump_input(index: u32, context: Context) {
     let Some(dir) = std::env::var_os("VICTORY_XMA_DUMP") else {
         return;
     };
+    let dir = std::path::PathBuf::from(dir);
+    if !validate_xma_dump_dir(&dir) {
+        return;
+    }
     let n = COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     if n >= 32 {
         return;
     }
-    let dir = std::path::PathBuf::from(dir);
     let words: Vec<u8> = (0..16).flat_map(|w| context.get(w).to_le_bytes()).collect();
     let input = heap_bytes(
         context.get(5) & !0x7ff,
@@ -1163,5 +1175,14 @@ mod tests {
         assert_eq!((m.message_count)(acp), 1, "disconnected");
         (m.release)(acp);
         assert_eq!(AcpHalReleaseShapeContexts(), S_OK);
+    }
+
+    #[test]
+    fn xma_dump_dir_must_be_outside_repo() {
+        let inside = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("xma-dump");
+        assert!(!validate_xma_dump_dir(&inside));
+
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(validate_xma_dump_dir(&tmp.path().join("xma-dump")));
     }
 }

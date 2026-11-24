@@ -48,6 +48,11 @@ impl IActivateAudioInterfaceCompletionHandler_Impl for Activated_Impl {
 /// Names the process to record, in the recorder's environment.
 const TARGET: &str = "VICTORY_AUDIO_CAPTURE_OF";
 
+/// Validates that an audio capture output path lies outside the repository.
+fn validate_capture_path(path: &Path) -> Result<(), victory_core::PolicyError> {
+    victory_core::ensure_outside_repo(path)
+}
+
 /// Starts the recorder if `VICTORY_AUDIO_CAPTURE` names a file. With this
 /// module's debug log, also logs once a second what a `Sleep(1)` takes in
 /// this process (the title's millisecond waits get the same).
@@ -66,13 +71,18 @@ pub fn start() {
                 }
             });
     }
-    if std::env::var_os("VICTORY_AUDIO_CAPTURE").is_some()
-        && let Err(e) = std::env::current_exe().and_then(|exe| {
-            std::process::Command::new(exe)
-                .env(TARGET, std::process::id().to_string())
-                .spawn()
-        })
-    {
+    let Some(path) = std::env::var_os("VICTORY_AUDIO_CAPTURE") else {
+        return;
+    };
+    if let Err(e) = validate_capture_path(Path::new(&path)) {
+        tracing::warn!("VICTORY_AUDIO_CAPTURE ignored: {e}");
+        return;
+    }
+    if let Err(e) = std::env::current_exe().and_then(|exe| {
+        std::process::Command::new(exe)
+            .env(TARGET, std::process::id().to_string())
+            .spawn()
+    }) {
         tracing::warn!("audio capture not started: {e}");
     }
 }
@@ -116,6 +126,7 @@ fn header(frames: u64) -> [u8; 44] {
 }
 
 fn record(pid: u32, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    validate_capture_path(path)?;
     // SAFETY: COM calls with parameters built here; buffers are used only
     // between `GetBuffer` and `ReleaseBuffer`.
     unsafe {
@@ -225,5 +236,19 @@ fn record(pid: u32, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
                 return Ok(());
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_capture_path;
+
+    #[test]
+    fn capture_path_must_be_outside_repo() {
+        let inside = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("capture.wav");
+        assert!(validate_capture_path(&inside).is_err());
+
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(validate_capture_path(&tmp.path().join("capture.wav")).is_ok());
     }
 }

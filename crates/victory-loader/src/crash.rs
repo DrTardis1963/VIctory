@@ -35,11 +35,27 @@ pub(crate) const MAX_FRAMES: usize = 40;
 static SAVE: std::sync::OnceLock<Vec<(usize, usize, std::path::PathBuf)>> =
     std::sync::OnceLock::new();
 
+#[cfg(any(test, feature = "diagnostics"))]
+fn filter_save_ranges(
+    ranges: Vec<(usize, usize, std::path::PathBuf)>,
+) -> Vec<(usize, usize, std::path::PathBuf)> {
+    ranges
+        .into_iter()
+        .filter(|(_, _, file)| match victory_core::ensure_outside_repo(file) {
+            Ok(()) => true,
+            Err(e) => {
+                eprintln!("VIctory: crash save disabled: {e}");
+                false
+            }
+        })
+        .collect()
+}
+
 /// Debugging aid: on a reported crash, also write each `[address, address
 /// + len)` (readable title memory, e.g. an engine table) to its file.
 #[cfg(feature = "diagnostics")]
 pub fn save_on_crash(ranges: Vec<(usize, usize, std::path::PathBuf)>) {
-    let _ = SAVE.set(ranges);
+    let _ = SAVE.set(filter_save_ranges(ranges));
 }
 
 /// The file crash reports are appended to, besides being printed.
@@ -48,6 +64,10 @@ static LOG: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new()
 /// Also appends every unhandled-exception report and panic to `file`, so a
 /// crash can be read after the console is gone.
 pub fn log_crashes_to(file: std::path::PathBuf) {
+    if let Err(e) = victory_core::ensure_outside_repo(&file) {
+        eprintln!("VIctory: crash log disabled: {e}");
+        return;
+    }
     if LOG.set(file).is_ok() {
         let print = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
@@ -987,5 +1007,22 @@ mod tests {
             assert_eq!(instruction_bytes(end as usize), "0f 01 fd");
             VirtualFree(page.cast(), 0, MEM_RELEASE);
         }
+    }
+
+    #[test]
+    fn crash_outputs_must_be_outside_repo() {
+        let inside = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("crash.bin");
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tmp.path().join("crash.bin");
+
+        let kept = filter_save_ranges(vec![
+            (0x1000, 16, inside.clone()),
+            (0x2000, 16, outside.clone()),
+        ]);
+        assert_eq!(kept, vec![(0x2000, 16, outside)]);
+
+        // Rejected before touching `LOG`.
+        log_crashes_to(inside);
+        assert!(LOG.get().is_none());
     }
 }

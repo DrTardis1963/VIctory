@@ -8,11 +8,24 @@ use std::path::PathBuf;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 
+/// Resolves a `VICTORY_CAPTURE` path only if it lies outside the repository.
+fn resolve_folder(path: PathBuf) -> Option<PathBuf> {
+    if let Err(e) = victory_core::ensure_outside_repo(&path) {
+        tracing::warn!("VICTORY_CAPTURE ignored: {e}");
+        return None;
+    }
+    Some(path)
+}
+
 /// The folder frames go to, if capturing.
 pub(crate) fn folder() -> Option<&'static PathBuf> {
     static FOLDER: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
     FOLDER
-        .get_or_init(|| std::env::var_os("VICTORY_CAPTURE").map(PathBuf::from))
+        .get_or_init(|| {
+            std::env::var_os("VICTORY_CAPTURE")
+                .map(PathBuf::from)
+                .and_then(resolve_folder)
+        })
         .as_ref()
 }
 
@@ -537,5 +550,15 @@ mod tests {
         assert_eq!(super::to_rgba(89, 1, 1, 4, &xr), Some(vec![255, 127, 0, 255]));
         // B8G8R8A8 still swaps to RGBA.
         assert_eq!(super::to_rgba(87, 1, 1, 4, &[1, 2, 3, 4]), Some(vec![3, 2, 1, 255]));
+    }
+
+    #[test]
+    fn resolve_folder_rejects_paths_inside_repo() {
+        let inside = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("capture-out");
+        assert!(super::resolve_folder(inside).is_none());
+
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tmp.path().join("frames");
+        assert_eq!(super::resolve_folder(outside.clone()), Some(outside));
     }
 }

@@ -12,6 +12,8 @@ use anyhow::{Context, Result, bail};
 
 const MAX_FILE_SIZE: usize = 512 * 1024;
 const MAX_ENCODED_RUN: usize = 512;
+const MAX_ESCAPED_HEX_RUN: usize = 128;
+const MAX_HEX_ARRAY_RUN: usize = 256;
 
 const ALLOWED_EXTENSIONS: &[&str] = &[
     "rs", "toml", "md", "txt", "lock", "yml", "yaml", "json", "hlsl", "hlsli", "ps1", "cmd", "sh",
@@ -27,9 +29,11 @@ const ALLOWED_NAMES: &[&str] = &[
     "LICENSE-APACHE",
 ];
 
-/// Paths explicitly exempted, with a reason. Keep this empty if at all possible.
-const EXCEPTIONS: &[(&str, &str)] = &[(
+/// Paths explicitly exempted, with pinned BLAKE3 hash and reason.
+/// Keep this list empty if at all possible.
+const EXCEPTIONS: &[(&str, &str, &str)] = &[(
     "crates/victory-formats/src/bcpack-tables.bin",
+    "f0f032aa310e7cfd431c075d2816decdd39d21b1927cbffc38386599c0de73c0",
     "the BCPack format's constant tables: nothing decodes without them and they cannot be derived (owner's decision, 2026-11-23; docs/asset-policy.md)",
 )];
 
@@ -52,9 +56,6 @@ pub fn run(root: &Path, staged: bool) -> Result<()> {
     let files = list_files(root, staged)?;
     let mut violations = Vec::new();
     for path in &files {
-        if EXCEPTIONS.iter().any(|(p, _)| p == path) {
-            continue;
-        }
         let content = if staged {
             let out = Command::new("git")
                 .args(["show", &format!(":{path}")])
@@ -70,6 +71,12 @@ pub fn run(root: &Path, staged: bool) -> Result<()> {
                 Err(_) => continue,
             }
         };
+        if let Some((_, expected_hash, _)) = EXCEPTIONS.iter().find(|(p, _, _)| p == path) {
+            if let Some(problem) = check_exception(expected_hash, &content) {
+                violations.push(format!("{path}: {problem}"));
+            }
+            continue;
+        }
         for problem in check(path, &content) {
             violations.push(format!("{path}: {problem}"));
         }
@@ -167,18 +174,142 @@ pub fn check(path: &str, content: &[u8]) -> Vec<String> {
     }
     if content.contains(&0) {
         problems.push("binary content (NUL bytes)".to_owned());
-    } else if let Some(run) = longest_encoded_run(content)
-        && run > MAX_ENCODED_RUN
-    {
-        problems.push(format!("{run}-character hex/base64 run (embedded data?)"));
+    } else {
+        if let Some(run) = longest_encoded_run(content)
+            && run > MAX_ENCODED_RUN
+        {
+            problems.push(format!("{run}-character hex/base64 run (embedded data?)"));
+        }
+        let escapes = longest_escaped_hex_run(content);
+        if escapes > MAX_ESCAPED_HEX_RUN {
+            problems.push(format!("{escapes}-byte \\x escape run (embedded data?)"));
+        }
+        let hex_array = longest_hex_array_run(content);
+        if hex_array > MAX_HEX_ARRAY_RUN {
+            problems.push(format!("{hex_array}-byte hex array run (embedded data?)"));
+        }
+        if let Some(kind) = detect_credential(content) {
+            problems.push(format!("looks like a committed {kind}"));
+        }
     }
     problems
+}
+
+/// Verifies an exempted file against its pinned BLAKE3 hex hash.
+pub fn check_exception(expected_blake3: &str, content: &[u8]) -> Option<String> {
+    let actual = blake3::hash(content).to_hex();
+    if actual.as_str() == expected_blake3 {
+        None
+    } else {
+        Some(format!(
+            "exempted file BLAKE3 changed (got {actual}, expected {expected_blake3})"
+        ))
+    }
 }
 
 /// Longest run of characters that could be hex or base64 payload.
 fn longest_encoded_run(content: &[u8]) -> Option<usize> {
     let is_payload = |b: &u8| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'=');
     content.split(|b| !is_payload(b)).map(<[u8]>::len).max()
+}
+
+/// Longest contiguous run of `\xHH` escapes (allowing quotes/whitespace between literal lines).
+fn longest_escaped_hex_run(content: &[u8]) -> usize {
+    let (mut best, mut cur, mut i) = (0, 0, 0);
+    while i < content.len() {
+        if i + 3 < content.len()
+            && content[i] == b'\\'
+            && content[i + 1] == b'x'
+            && content[i + 2].is_ascii_hexdigit()
+            && content[i + 3].is_ascii_hexdigit()
+        {
+            cur += 1;
+            best = best.max(cur);
+            i += 4;
+        } else if cur > 0 && (content[i].is_ascii_whitespace() || content[i] == b'"') {
+            i += 1;
+        } else {
+            cur = 0;
+            i += 1;
+        }
+    }
+    best
+}
+
+/// Longest comma/whitespace-separated sequence of `0xH` or `0xHH` hex byte literals.
+fn longest_hex_array_run(content: &[u8]) -> usize {
+    let (mut best, mut cur, mut i) = (0, 0, 0);
+    while i < content.len() {
+        if i + 2 < content.len()
+            && content[i] == b'0'
+            && (content[i + 1] == b'x' || content[i + 1] == b'X')
+            && content[i + 2].is_ascii_hexdigit()
+        {
+            let start = i + 2;
+            let mut end = start;
+            while end < content.len() && content[end].is_ascii_hexdigit() {
+                end += 1;
+            }
+            if (1..=2).contains(&(end - start))
+                && (i == 0 || !content[i - 1].is_ascii_alphanumeric())
+            {
+                cur += 1;
+                best = best.max(cur);
+                i = end;
+                continue;
+            }
+            cur = 0;
+            i = end;
+        } else if cur > 0 && (content[i].is_ascii_whitespace() || content[i] == b',') {
+            i += 1;
+        } else {
+            cur = 0;
+            i += 1;
+        }
+    }
+    best
+}
+
+/// Detects private-key PEM headers or GitHub token prefixes in text files.
+fn detect_credential(content: &[u8]) -> Option<&'static str> {
+    let Ok(text) = std::str::from_utf8(content) else {
+        return None;
+    };
+    let begin = concat!("-----BEGIN ", "");
+    let key_end = concat!("PRIVATE ", "KEY-----");
+    let mut rest = text;
+    while let Some(idx) = rest.find(begin) {
+        let after = &rest[idx + begin.len()..];
+        let window = &after[..after.len().min(40)];
+        if window.contains(key_end) {
+            return Some("private key");
+        }
+        rest = after;
+    }
+    let prefixes = [
+        concat!("gh", "p_"),
+        concat!("gh", "o_"),
+        concat!("gh", "u_"),
+        concat!("gh", "s_"),
+        concat!("gh", "r_"),
+        concat!("github", "_pat_"),
+    ];
+    for prefix in prefixes {
+        let mut scan = text;
+        while let Some(idx) = scan.find(prefix) {
+            let boundary = idx == 0 || !scan.as_bytes()[idx - 1].is_ascii_alphanumeric();
+            let tail = &scan[idx + prefix.len()..];
+            let token_len = tail
+                .bytes()
+                .take_while(|b| b.is_ascii_alphanumeric() || *b == b'_')
+                .count();
+            if boundary && token_len >= 20 {
+                return Some("GitHub token");
+            }
+            scan = tail;
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -219,5 +350,26 @@ mod tests {
     fn rejects_data_smuggled_into_text() {
         let blob = format!("const DATA: &str = \"{}\";", "A1".repeat(400));
         assert!(!check("src/blob.rs", blob.as_bytes()).is_empty());
+
+        let escaped = format!("const DATA: &[u8] = b\"{}\";", "\\x41".repeat(150));
+        assert!(!check("src/esc.rs", escaped.as_bytes()).is_empty());
+
+        let hex_array = format!(
+            "const DATA: &[u8] = &[{}];",
+            std::iter::repeat_n("0x41", 260).collect::<Vec<_>>().join(", ")
+        );
+        assert!(!check("src/arr.rs", hex_array.as_bytes()).is_empty());
+    }
+
+    #[test]
+    fn rejects_tampered_exception_and_credentials() {
+        let expected = super::EXCEPTIONS[0].1;
+        assert!(super::check_exception(expected, b"tampered").is_some());
+
+        let token = format!("{}0123456789abcdefghij", concat!("gh", "p_"));
+        assert!(!check("src/secret.rs", token.as_bytes()).is_empty());
+
+        let pem = format!("-----BEGIN RSA {}-----", concat!("PRIVATE ", "KEY"));
+        assert!(!check("src/key.txt", pem.as_bytes()).is_empty());
     }
 }

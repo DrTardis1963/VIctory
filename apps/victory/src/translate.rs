@@ -150,6 +150,21 @@ struct Checks {
     keep: Option<Kept>,
     validator: Option<Validator>,
     host: Option<(Host, emit::HostShader)>,
+    emit_dump: Option<PathBuf>,
+}
+
+fn validate_emit_dump_dir(dir: &Path) -> Result<()> {
+    victory_core::ensure_outside_repo(dir)
+        .map_err(|e| anyhow::anyhow!("VICTORY_EMIT_DUMP rejected: {e}"))
+}
+
+fn emit_dump_dir() -> Result<Option<PathBuf>> {
+    let Ok(dir) = std::env::var("VICTORY_EMIT_DUMP") else {
+        return Ok(None);
+    };
+    let path = PathBuf::from(dir);
+    validate_emit_dump_dir(&path)?;
+    Ok(Some(path))
 }
 
 pub fn run(
@@ -159,6 +174,7 @@ pub fn run(
     list: bool,
     jobs: Option<usize>,
 ) -> Result<()> {
+    let emit_dump = emit_dump_dir()?;
     let paths = crate::default_paths(paths)?;
     let dll = validate.then(Validator::default_path).flatten();
     if validate {
@@ -211,6 +227,7 @@ pub fn run(
                             host: pipelines
                                 .then(|| Host::new(false).ok().map(|h| (h, host::stub_ps())))
                                 .flatten(),
+                            emit_dump: emit_dump.clone(),
                         };
                         while let Some(job) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) {
                             translate(job, entry.path(), &seen, &mut t, &mut checks);
@@ -422,14 +439,14 @@ fn check(
     }
     // `VICTORY_EMIT_DUMP` with `--list`: every emitted shader as a file.
     if t.list
-        && let Ok(dir) = std::env::var("VICTORY_EMIT_DUMP")
+        && let Some(dir) = &checks.emit_dump
     {
         let name: String = label()
             .chars()
             .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
             .collect();
         let _ = std::fs::write(
-            format!("{dir}/{}.dxil", &name[name.len().saturating_sub(100)..]),
+            dir.join(format!("{}.dxil", &name[name.len().saturating_sub(100)..])),
             &shader.dxil,
         );
     }
@@ -466,22 +483,25 @@ fn check(
                 .find(|l| l.contains("error"))
                 .unwrap_or(text.lines().next().unwrap_or(""))
                 .to_owned();
-            if let Ok(dir) = std::env::var("VICTORY_EMIT_DUMP") {
+            if let Some(dir) = &checks.emit_dump {
                 let n = t
                     .failed
                     .get(&format!("validator: {first}"))
                     .map_or(0, |f| f.0);
                 if n < 3 {
-                    let name = format!(
-                        "{dir}/{}_{n}",
+                    let stem = format!(
+                        "{}_{n}",
                         first
                             .chars()
                             .filter(char::is_ascii_alphanumeric)
                             .take(40)
                             .collect::<String>()
                     );
-                    let _ = std::fs::write(format!("{name}.dxil"), &shader.dxil);
-                    let _ = std::fs::write(format!("{name}.txt"), format!("{}\n{text}", label()));
+                    let _ = std::fs::write(dir.join(format!("{stem}.dxil")), &shader.dxil);
+                    let _ = std::fs::write(
+                        dir.join(format!("{stem}.txt")),
+                        format!("{}\n{text}", label()),
+                    );
                 }
             }
             t.fail(format!("validator: {first}"), label);
@@ -659,4 +679,18 @@ fn tally_structured(program: &ir::Program, s: &structure::Structured, t: &mut Ta
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_emit_dump_dir;
+
+    #[test]
+    fn emit_dump_dir_must_be_outside_repo() {
+        let inside = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("shader-dump");
+        assert!(validate_emit_dump_dir(&inside).is_err());
+
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(validate_emit_dump_dir(&tmp.path().join("shader-dump")).is_ok());
+    }
 }
