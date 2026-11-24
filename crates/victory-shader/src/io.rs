@@ -217,7 +217,11 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
                         row: i.row,
                         channel,
                     };
-                    loaded.push((Reg::V(i.vgpr + channel), input));
+                    let vgpr = i
+                        .vgpr
+                        .checked_add(channel)
+                        .ok_or(ShaderError::Malformed("vertex attribute VGPR out of range"))?;
+                    loaded.push((Reg::V(vgpr), input));
                 }
             }
             (loaded, &[][..], &outputs[..])
@@ -696,5 +700,42 @@ mod tests {
                 (3, Input::Position(1)),
             ]
         );
+    }
+
+    #[test]
+    fn vertex_attribute_vgpr_overflow_is_malformed() {
+        let p = program(&[S_ENDPGM]);
+        let native = NativeProgram {
+            stage: HwStage::Vs,
+            wave64: false,
+            vgprs: 256,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Vs {
+                inputs: vec![crate::native::VsInput {
+                    usage: Usage::Generic,
+                    row: 0,
+                    mask: 0b0100,
+                    vgpr: 254,
+                }],
+                outputs: vec![],
+            },
+            code: vec![],
+        };
+        assert!(matches!(raise(&p, &native), Err(ShaderError::Malformed(_))));
+
+        let valid = NativeProgram {
+            io: StageIo::Vs {
+                inputs: vec![crate::native::VsInput {
+                    usage: Usage::Generic,
+                    row: 0,
+                    mask: 0b0001,
+                    vgpr: 255,
+                }],
+                outputs: vec![],
+            },
+            ..native
+        };
+        assert!(raise(&p, &valid).is_ok());
     }
 }
