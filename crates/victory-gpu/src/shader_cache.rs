@@ -90,12 +90,31 @@ pub fn used(dir: &std::path::Path) -> Option<HashSet<String>> {
 /// unless its entry is there already (`victory translate --write-cache`):
 /// `Ok(true)` if it was translated now.
 pub fn warm(cache: &Cache, container: &[u8]) -> Result<bool, String> {
-    let input = [&build()[..], container].concat();
+    let translate = |c: &[u8]| victory_shader::emit::translate(c).map_err(|e| e.to_string());
+    warm_with(cache, build(), last(), container, translate)
+}
+
+fn warm_with(
+    cache: &Cache,
+    build: &[u8; 32],
+    last: &[u8; 32],
+    container: &[u8],
+    translate: impl Fn(&[u8]) -> Result<HostShader, String>,
+) -> Result<bool, String> {
+    let input = [&build[..], container].concat();
     if cache.path_for(&CacheKey::new(&KeySpec, &input)).is_file() {
         return Ok(false);
     }
-    let translate = |c: &[u8]| victory_shader::emit::translate(c).map_err(|e| e.to_string());
-    cached(cache, build(), last(), container, translate).map(|_| true)
+    // As [`cached`] stores a miss, without reading the entry back: nothing
+    // here uses the shader, and opening the file just written cost an
+    // eighth of a cold warm-up. (The failure reads as the converter's.)
+    let shader = translate(container)
+        .map_err(|e| format!("converter {} v{}: {e}", KeySpec.id(), KeySpec.version()))?;
+    cache
+        .replace(&KeySpec, &input, &encode(&shader))
+        .map_err(|e| format!("{e:#}"))?;
+    remember(cache, last, container, &input);
+    Ok(true)
 }
 
 /// Shaders found in the cache and translated since the start.
@@ -522,6 +541,26 @@ mod tests {
         assert!(cached(&cache, &[2; 32], &LAST, container, fail).is_err());
         // Other settings (another last key) do not.
         assert!(run(&[2; 32], &[3; 32], fail).is_err());
+    }
+
+    #[test]
+    fn a_warmed_entry_serves_a_run_and_is_the_last_that_worked() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::open(dir.path()).unwrap();
+        let container = b"a console container".as_slice();
+        let fail = |_: &[u8]| Err::<HostShader, _>("unsupported".to_owned());
+        let ok = |_: &[u8]| Ok(shader());
+        assert_eq!(warm_with(&cache, &[1; 32], &LAST, container, ok), Ok(true));
+        // Already there: not translated again.
+        assert_eq!(warm_with(&cache, &[1; 32], &LAST, container, fail), Ok(false));
+        // A run of that build reads it, and a later build that fails gets it.
+        assert_eq!(cached(&cache, &[1; 32], &LAST, container, fail), Ok(shader()));
+        let later = cached(&cache, &[2; 32], &LAST, container, fail);
+        assert_eq!(or_last_worked(&cache, &LAST, container, later), Ok(shader()));
+        // A failure reads as the converter's and stores nothing.
+        let failed = warm_with(&cache, &[3; 32], &LAST, b"other", fail);
+        assert_eq!(failed, Err("converter shader.dxil v1: unsupported".to_owned()));
+        assert!(cached(&cache, &[3; 32], &LAST, b"other", fail).is_err());
     }
 
     fn shader() -> HostShader {
