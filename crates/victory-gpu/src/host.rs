@@ -1065,6 +1065,8 @@ impl Host {
             })
             .collect();
         let has_copies = continuations.iter().any(|parts| !parts.is_empty());
+        // Textures checked in this submission, across its batches.
+        let mut textures = std::collections::HashSet::new();
         // Per run, how many of its bottom-of-pipe writes are done (before a
         // wait).
         let mut written = vec![0; runs.len()];
@@ -1134,7 +1136,7 @@ impl Host {
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::PrepOrderUs, crate::copystat::since(started));
         if !has_copies {
-            self.execute_batch(&ordered, &mut submitted);
+            self.execute_batch(&ordered, &mut submitted, &mut textures);
         } else {
             let mut start = 0;
             let mut pending = Vec::new();
@@ -1167,7 +1169,7 @@ impl Host {
                         continue;
                     }
                     if i != start {
-                        self.execute_batch(&ordered[start..i], &mut submitted);
+                        self.execute_batch(&ordered[start..i], &mut submitted, &mut textures);
                         pending.clear();
                         start = i;
                     }
@@ -1191,6 +1193,9 @@ impl Host {
                         if let Err(waited) = waited {
                             wait_timed_out(&wait, waited);
                         }
+                        // Title threads ran meanwhile: what it waited for
+                        // may be texture data they wrote.
+                        textures.clear();
                     }
                 }
                 let Some(&(list, _)) = ordered.get(i) else {
@@ -1202,14 +1207,14 @@ impl Host {
                             .iter()
                             .any(|(other, _)| std::ptr::eq(*other, list)))
                 {
-                    self.execute_batch(&ordered[start..i], &mut submitted);
+                    self.execute_batch(&ordered[start..i], &mut submitted, &mut textures);
                     pending.clear();
                     start = i;
                 }
                 list.add_gpu_writes(&mut pending);
             }
             if start < ordered.len() {
-                self.execute_batch(&ordered[start..], &mut submitted);
+                self.execute_batch(&ordered[start..], &mut submitted, &mut textures);
             }
         }
         for (r, list) in runs.iter().enumerate() {
@@ -1226,7 +1231,13 @@ impl Host {
         let _ = error;
     }
 
-    fn execute_batch(&self, ordered: &[(&HostList, QueueSegment)], submitted: &mut u64) {
+    /// `textures`: those checked earlier in the submission, still current.
+    fn execute_batch(
+        &self,
+        ordered: &[(&HostList, QueueSegment)],
+        submitted: &mut u64,
+        textures: &mut std::collections::HashSet<usize>,
+    ) {
         let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         use crate::copystat::{C, add, since};
@@ -1239,7 +1250,10 @@ impl Host {
         let timed = timing();
         #[cfg(not(feature = "diagnostics"))]
         let timed = false;
-        let mut batch = Batch::default();
+        let mut batch = Batch {
+            textures: std::mem::take(textures),
+            ..Batch::default()
+        };
         let mut previous_copy = false;
         for (i, &(list, segment)) in ordered.iter().enumerate() {
             #[cfg(feature = "diagnostics")]
@@ -1284,6 +1298,7 @@ impl Host {
         let retired = take_retired();
         #[cfg(feature = "diagnostics")]
         add(C::PrepRetiredUs, since(step));
+        *textures = std::mem::take(&mut batch.textures);
         let prepared = std::time::Instant::now();
         // An ExecuteCommandLists not waited for yet whose prelude list the
         // next one would re-record.
@@ -1360,7 +1375,12 @@ impl Host {
         // Copy back merged ranges before a dependent CPU phase or the
         // bottom-of-pipe writes that tell the title the GPU is done.
         let copying = std::time::Instant::now();
-        COPY_BACK[1].fetch_add(writes.copy_back() as u64, Ordering::Relaxed);
+        let copied_back = writes.copy_back();
+        // Shaders' writes went back to title memory: textures may have changed.
+        if copied_back > 0 {
+            textures.clear();
+        }
+        COPY_BACK[1].fetch_add(copied_back as u64, Ordering::Relaxed);
         COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
     }
 
