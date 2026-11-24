@@ -1435,3 +1435,7 @@ mod tests {
         assert_eq!(release(allocator), 0);
     }
 }
+
+#[cfg(all(test, windows))]
+#[path = "list/tests/buffer_copy.rs"]
+mod buffer_copy_tests;
