@@ -82,8 +82,8 @@ enum Command {
         #[arg(long)]
         list: bool,
         /// Write translated shaders into `<cache_dir>/shaders` to warm the
-        /// runtime shader cache ahead of time (only a run of this same
-        /// executable reads them); shaders already there are skipped.
+        /// runtime shader cache ahead of time (any build with the same
+        /// translator sources reads them); shaders already there are skipped.
         #[arg(long)]
         write_cache: bool,
         /// Only the shaders earlier runs used (`used-shaders.txt` in the
