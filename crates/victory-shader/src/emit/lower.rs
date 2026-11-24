@@ -5498,17 +5498,13 @@ impl<'a> Lower<'a> {
             let has_cl = name.ends_with("_cl");
             let first = usize::from(offset_word) + usize::from(op == 61) + usize::from(cmp);
             // Coordinates the size divides (not the array slice); explicit
-            // gradients (x then y) come before the coordinates, each group
-            // starting at a fresh VGPR when a16 is set.
+            // gradients (x then y) come before the coordinates and remain
+            // 32-bit floats on GFX10.3 unless the opcode is a `_g16` form.
             let spatial = coords - usize::from(kind == 6 || kind == 7);
-            let deriv_regs = if op == 63 {
-                if *a16 { spatial.div_ceil(2) } else { spatial }
-            } else {
-                0
-            };
+            let deriv_regs = if op == 63 { spatial } else { 0 };
             let coord_base = first + 2 * deriv_regs;
             let mut cs = vec![fu; 4];
-            // With a16, sampling coordinates, gradients, LOD and clamp are f16.
+            // With a16, sampling coordinates, bias (low half), LOD and clamp are f16.
             let to_float = |l: &mut Self, x: V| {
                 if *a16 {
                     let f = l.s.t.f32;
@@ -5589,8 +5585,16 @@ impl<'a> Lower<'a> {
                         .op(c, "sample.f32", Attr::ReadOnly, self.s.t.res_ret, 60, &args)
                 }
                 61 => {
+                    // With a16, bias occupies a full VGPR but holds an f16 in
+                    // its low 16 bits (upper half undefined).
                     let bias = addr_u32(self, usize::from(offset_word))?;
-                    let bias = self.as_float(bias);
+                    let bias = if *a16 {
+                        let mask = self.s.m.i32(0xFFFF);
+                        let lo = self.s.m.bin(c, Bin::And, bias, mask);
+                        to_float(self, lo)
+                    } else {
+                        self.as_float(bias)
+                    };
                     args.extend(&os);
                     args.extend([bias, clamp]);
                     self.s.op(
@@ -5605,10 +5609,10 @@ impl<'a> Lower<'a> {
                 63 => {
                     let mut g = vec![fu; 6];
                     for k in 0..spatial {
-                        let x = addr_packed(self, first, k)?;
-                        g[k] = to_float(self, x);
-                        let y = addr_packed(self, first + deriv_regs, k)?;
-                        g[3 + k] = to_float(self, y);
+                        let x = addr_u32(self, first + k)?;
+                        g[k] = self.as_float(x);
+                        let y = addr_u32(self, first + deriv_regs + k)?;
+                        g[3 + k] = self.as_float(y);
                     }
                     args.extend(&os);
                     args.extend(g);
