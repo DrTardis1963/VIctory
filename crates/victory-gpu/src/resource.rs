@@ -1024,6 +1024,9 @@ struct Resource {
 pub(crate) struct HostTexture {
     pub(crate) texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource,
     pub(crate) state: std::sync::atomic::AtomicU32,
+    /// The generation of its title texture's staging buffer it was last
+    /// copied from (0: none yet).
+    pub(crate) staged: std::sync::atomic::AtomicU64,
 }
 
 #[cfg(windows)]
@@ -1272,6 +1275,7 @@ fn hand_out_resource(
             std::sync::Arc::new(HostTexture {
                 texture,
                 state: state.into(),
+                staged: 0.into(),
             })
         }),
     });

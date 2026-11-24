@@ -3,12 +3,13 @@
 //! atlases. Such a texture lives in console memory in its tiled layout;
 //! before a submission samples its host copy, the memory is detiled into a
 //! staging buffer when its content changed, and the staging buffer is
-//! copied into the host texture.
+//! copied into the host texture (in the list's prelude) unless the host
+//! texture already holds it.
 //!
-//! "Changed" means a page of the memory was written since the last detiling
-//! ([`crate::watch`]), in write-watched memory; in physical-page views,
-//! which cannot be watched, a content hash of the whole memory at every
-//! submission that samples it.
+//! "Changed" means the content hash of the whole memory differs from the
+//! last detiling's; in write-watched memory it is taken only when a page of
+//! the memory was written since ([`crate::watch`]), in physical-page views,
+//! which cannot be watched, at every submission that samples it.
 //!
 //! shortcut: a change detiles the whole texture, not the pages written.
 //! Only textures read through descriptor tables are brought up to date
@@ -17,6 +18,7 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex};
 
 use windows::Win32::Graphics::Direct3D12::*;
@@ -50,10 +52,14 @@ pub(crate) struct Staging {
     /// 4-byte staging buffer.
     widened_from: Option<u32>,
     last: Mutex<Last>,
+    /// Incremented at each detiling; host textures note the one they got
+    /// ([`crate::resource::HostTexture::staged`]). Starts above their 0:
+    /// the first use always copies.
+    generation: AtomicU64,
 }
 
-/// What a texture's staging buffer holds: the hash of the memory detiled
-/// (memory not watched), or the write-watch asking it was detiled after,
+/// What a texture's staging buffer holds: the hash of the memory detiled,
+/// and the write-watch asking it was last checked after (watched memory),
 /// with room to read the memory into.
 #[derive(Default)]
 struct Last {
@@ -107,10 +113,10 @@ pub(crate) fn title_written(texture: &ID3D12Resource) -> bool {
     unsafe { texture.GetDesc() }.Flags.0 & TARGET_DEPTH_UNORDERED == 0
 }
 
-/// Records, once per list, the copy of `resource`'s staging buffer into
-/// its host copy, and the detiling that refreshes the staging buffer at
-/// submission if the memory changed. Leaves the texture in the copy
-/// destination state.
+/// Brings `resource`'s host copy up to date when a list that samples it is
+/// submitted: the staging buffer is refreshed (detiled if the memory
+/// changed), and the list's prelude copies it into the host texture unless
+/// the host texture already holds those bytes. Once per list.
 pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) {
     let host_written = HOST_WRITTEN
         .lock()
@@ -122,65 +128,65 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
     if host_written || !list.first_use(resource as usize) {
         return;
     }
-    let Some(staging) = staging(resource, texture) else {
+    let (Some(staging), Some(copy)) = (staging(resource, texture), crate::resource::host_copy(resource))
+    else {
         return;
     };
-    const COPY_DEST: u32 = 0x400;
-    crate::list::ensure_state(list, resource, COPY_DEST);
-    // The staging buffer lives as long as `staging`, which the deferred
-    // refresh below holds until the list is reset.
-    for (i, footprint) in staging.footprints.iter().enumerate() {
-        #[cfg(feature = "diagnostics")]
-        {
-            let f = footprint.Footprint;
-            // SAFETY: live resources.
-            let (gpu, d) = unsafe { (staging.buffer.GetGPUVirtualAddress(), texture.GetDesc()) };
-            let len = u64::from(f.RowPitch) * u64::from(staging.rows[i]) * u64::from(f.Depth);
-            list.note_read(
-                || {
-                    format!(
-                        "texture upload {resource:?} ({}x{}x{} f{} mips {}) sub {i} of {} from staging {gpu:#x}+{:#x}: offset {:#x} {}x{}x{} pitch {}",
-                        d.Width,
-                        d.Height,
-                        d.DepthOrArraySize,
-                        d.Format.0,
-                        d.MipLevels,
-                        staging.footprints.len(),
-                        staging.size,
-                        footprint.Offset,
-                        f.Width,
-                        f.Height,
-                        f.Depth,
-                        f.RowPitch
-                    )
-                },
-                (gpu + footprint.Offset, len),
-            );
-        }
-        let to = D3D12_TEXTURE_COPY_LOCATION {
-            // SAFETY: a borrowed pointer the location never releases.
-            pResource: unsafe { std::mem::transmute_copy(texture) },
-            Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
-            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-                SubresourceIndex: i as u32,
-            },
-        };
-        let from = D3D12_TEXTURE_COPY_LOCATION {
-            // SAFETY: as above.
-            pResource: unsafe { std::mem::transmute_copy(&staging.buffer) },
-            Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
-            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-                PlacedFootprint: *footprint,
-            },
-        };
-        // SAFETY: an open list; both locations name live resources.
-        unsafe { list.list.CopyTextureRegion(&to, 0, 0, 0, &from, None) };
-    }
-    // Once per submission however many of its lists sample the texture.
-    list.defer_texture(staging);
+    list.defer_texture(staging, copy);
+}
+
+/// Whether a host texture that last got generation `held` of its staging
+/// buffer must get `generation` (and notes that it does).
+fn due(held: &AtomicU64, generation: u64) -> bool {
+    held.swap(generation, Relaxed) != generation
 }
 
 impl Staging {
+    /// At submission, after the refresh: whether the host texture whose
+    /// staging generation is `held` lacks the staging buffer's bytes (and
+    /// notes that it gets them). Unchanged textures are not copied again
+    /// in every list and submission that samples them.
+    pub(crate) fn upload_due(&self, held: &AtomicU64) -> bool {
+        let due = due(held, self.generation.load(Relaxed));
+        #[cfg(feature = "diagnostics")]
+        {
+            use crate::copystat::{C, add};
+            let (n, bytes) = if due {
+                (C::TexUploads, C::TexUploadBytes)
+            } else {
+                (C::TexSkips, C::TexSkipBytes)
+            };
+            add(n, 1);
+            add(bytes, self.size);
+        }
+        due
+    }
+
+    /// Records the copy of the staging buffer into `texture`, which is in
+    /// the copy destination state.
+    pub(crate) fn record_upload(&self, list: &ID3D12GraphicsCommandList, texture: &ID3D12Resource) {
+        for (i, footprint) in self.footprints.iter().enumerate() {
+            let to = D3D12_TEXTURE_COPY_LOCATION {
+                // SAFETY: a borrowed pointer the location never releases.
+                pResource: unsafe { std::mem::transmute_copy(texture) },
+                Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                    SubresourceIndex: i as u32,
+                },
+            };
+            let from = D3D12_TEXTURE_COPY_LOCATION {
+                // SAFETY: as above.
+                pResource: unsafe { std::mem::transmute_copy(&self.buffer) },
+                Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                    PlacedFootprint: *footprint,
+                },
+            };
+            // SAFETY: an open list; both locations name live resources.
+            unsafe { list.CopyTextureRegion(&to, 0, 0, 0, &from, None) };
+        }
+    }
+
     pub(crate) fn title_range(&self) -> (usize, usize) {
         (self.memory as usize, self.layout.size as usize)
     }
@@ -209,12 +215,16 @@ impl Staging {
             last.asked = now;
             // Read through the copy, which stands unmapped pages: memory of
             // big pools is too slow to ask page by page.
-            last.read.resize(size, 0);
-            crate::host::copy_mapped(last.read.as_mut_ptr(), self.memory, size, false);
-            self.detile(&last.read);
+            let mut read = std::mem::take(&mut last.read);
+            read.resize(size, 0);
+            crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::TexWatched, size as u64);
-            return size;
+            // The watch is per page and the title writes next to its textures
+            // (and rewrites what it wrote): detile only if the bytes changed.
+            let n = self.changed(last, &read);
+            last.read = read;
+            return n;
         }
         if !committed(self.memory, size) {
             #[cfg(feature = "diagnostics")]
@@ -248,6 +258,7 @@ impl Staging {
         }
         last.hash = Some(hash);
         self.detile(tiled);
+        self.generation.fetch_add(1, Relaxed);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
         size
@@ -421,6 +432,7 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         memory,
         widened_from,
         last: Mutex::default(),
+        generation: AtomicU64::new(1),
     });
     map.insert(resource as usize, s.clone());
     Some(s)
@@ -430,6 +442,21 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
 mod tests {
     use super::*;
     use victory_formats::texture::{Dimension, Swizzle, Texture, TextureDesc};
+
+    #[test]
+    fn unchanged_staging_is_copied_once() {
+        // A new host texture (0) gets the staging buffer's first contents.
+        let held = AtomicU64::new(0);
+        assert!(due(&held, 1));
+        // Later lists and submissions with the same bytes copy nothing ...
+        assert!(!due(&held, 1));
+        assert!(!due(&held, 1));
+        // ... until a detiling changes them.
+        assert!(due(&held, 2));
+        assert!(!due(&held, 2));
+        // A host texture made again starts over.
+        assert!(due(&AtomicU64::new(0), 2));
+    }
 
     #[test]
     fn detile_widened_packed16_expands_into_rgba8_staging() {

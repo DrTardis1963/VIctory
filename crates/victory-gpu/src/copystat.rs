@@ -32,13 +32,19 @@ pub(crate) enum C {
     Fallbacks,
     /// Writes taken by the guard on view memory.
     GuardFaults,
-    /// Texture bytes detiled after a watched write; hashed; detiled after a
+    /// Texture bytes read after a watched write; hashed; detiled after a
     /// hash change.
     TexWatched,
     TexHashed,
     TexChanged,
+    /// Staging buffers copied into host textures (and their bytes), and
+    /// those not copied because the host texture already held them.
+    TexUploads,
+    TexUploadBytes,
+    TexSkips,
+    TexSkipBytes,
 }
-const COUNTERS: usize = 22;
+const COUNTERS: usize = 26;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -126,6 +132,13 @@ pub(crate) fn log(frames: f64) {
         mb(c[C::TexWatched as usize]),
         mb(c[C::TexHashed as usize]),
         mb(c[C::TexChanged as usize]),
+    );
+    tracing::info!(
+        "texture uploads per frame: {:.0} copied {:.1} MB, {:.0} skipped unchanged {:.1} MB",
+        c[C::TexUploads as usize],
+        mb(c[C::TexUploadBytes as usize]),
+        c[C::TexSkips as usize],
+        mb(c[C::TexSkipBytes as usize]),
     );
     let ranges = RANGES.lock().unwrap_or_else(|e| e.into_inner()).take();
     let mut ranges: Vec<_> = ranges.into_iter().flatten().collect();

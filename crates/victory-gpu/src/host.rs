@@ -701,7 +701,12 @@ enum Step {
     GpuWrite(std::sync::Arc<crate::shadow::Shadow>, usize, usize),
     /// Brings a texture's staging buffer up to date: once per submission,
     /// whichever lists sample it, until a `Copy` or `Run` intervenes.
-    Texture(std::sync::Arc<crate::texture::Staging>),
+    /// The host copy is copied from it in the list's prelude if it lacks
+    /// its bytes.
+    Texture(
+        std::sync::Arc<crate::texture::Staging>,
+        std::sync::Arc<crate::resource::HostTexture>,
+    ),
 }
 
 /// What a list does on the CPU when it is submitted: copies between host
@@ -1573,33 +1578,78 @@ impl HostList {
     }
 
     /// At submission: the list that moves each texture this list uses from
-    /// its real state to the one the list starts with; the textures' real
-    /// states become those the list ends with.
+    /// its real state to the one the list starts with, copying the staging
+    /// buffers of title textures whose host copy lacks their bytes (after
+    /// the list's refreshes); the textures' real states become those the
+    /// list ends with.
     fn prelude(&self) -> Option<ID3D12CommandList> {
-        let states = self.states.lock().unwrap_or_else(|e| e.into_inner());
-        let barriers: Vec<D3D12_RESOURCE_BARRIER> = states
-            .values()
-            .filter_map(|(first, last, copy)| {
-                let real = copy.state.swap(*last, Ordering::Relaxed);
-                (real != *first).then(|| {
-                    transition(
-                        &copy.texture,
-                        D3D12_RESOURCE_STATES(real as i32),
-                        D3D12_RESOURCE_STATES(*first as i32),
-                    )
-                })
+        const COPY_DEST: u32 = 0x400;
+        let uploads: Vec<_> = self
+            .deferred()
+            .copies
+            .iter()
+            .filter_map(|step| match step {
+                Step::Texture(staging, copy) if staging.upload_due(&copy.staged) => {
+                    Some((staging.clone(), copy.clone()))
+                }
+                _ => None,
             })
             .collect();
-        if barriers.is_empty() {
+        let uploading = |copy: &crate::resource::HostTexture| {
+            uploads.iter().any(|(_, c)| std::ptr::eq(c.as_ref(), copy))
+        };
+        let states = self.states.lock().unwrap_or_else(|e| e.into_inner());
+        // Barriers before the copies and after them.
+        let (mut before, mut after) = (Vec::new(), Vec::new());
+        let barrier = |copy: &crate::resource::HostTexture, from: u32, to: u32| {
+            transition(
+                &copy.texture,
+                D3D12_RESOURCE_STATES(from as i32),
+                D3D12_RESOURCE_STATES(to as i32),
+            )
+        };
+        for (first, last, copy) in states.values() {
+            let real = copy.state.swap(*last, Ordering::Relaxed);
+            if uploading(copy) {
+                let dest = legal_state(&copy.texture, COPY_DEST);
+                if real != dest {
+                    before.push(barrier(copy, real, dest));
+                }
+                if dest != *first {
+                    after.push(barrier(copy, dest, *first));
+                }
+            } else if real != *first {
+                before.push(barrier(copy, real, *first));
+            }
+        }
+        // A texture uploaded but not otherwise used stays a copy destination.
+        for (_, copy) in &uploads {
+            if !states.contains_key(&(std::sync::Arc::as_ptr(copy) as usize)) {
+                let dest = legal_state(&copy.texture, COPY_DEST);
+                let real = copy.state.swap(dest, Ordering::Relaxed);
+                if real != dest {
+                    before.push(barrier(copy, real, dest));
+                }
+            }
+        }
+        if before.is_empty() && uploads.is_empty() {
             return None;
         }
         let (allocator, list) = &self.prelude;
         // SAFETY: the prelude is not executing (every submission is waited
-        // for); the textures are live.
+        // for); the textures and staging buffers are live.
         let recorded = unsafe {
             allocator.Reset().and_then(|()| {
                 list.Reset(allocator, None)?;
-                list.ResourceBarrier(&barriers);
+                if !before.is_empty() {
+                    list.ResourceBarrier(&before);
+                }
+                for (staging, copy) in &uploads {
+                    staging.record_upload(list, &copy.texture);
+                }
+                if !after.is_empty() {
+                    list.ResourceBarrier(&after);
+                }
                 list.Close()
             })
         };
@@ -1862,9 +1912,14 @@ impl HostList {
     }
 
     /// Brings a texture's staging buffer up to date when the list is
-    /// submitted, keeping it alive until the list is reset.
-    pub(crate) fn defer_texture(&self, staging: std::sync::Arc<crate::texture::Staging>) {
-        self.deferred().copies.push(Step::Texture(staging));
+    /// submitted, and its host copy from it in the list's prelude, keeping
+    /// both alive until the list is reset.
+    pub(crate) fn defer_texture(
+        &self,
+        staging: std::sync::Arc<crate::texture::Staging>,
+        copy: std::sync::Arc<crate::resource::HostTexture>,
+    ) {
+        self.deferred().copies.push(Step::Texture(staging, copy));
     }
 
     fn needs_title_bytes(&self, pending: &[ShadowRange]) -> bool {
@@ -1883,7 +1938,7 @@ impl HostList {
             Step::Refresh(ref shadow, at, len) => pending.iter().any(|(other, from, to)| {
                 !Arc::ptr_eq(shadow, other) && overlaps((at, len), (*from, to - from))
             }),
-            Step::Texture(ref staging) => depends(staging.title_range()),
+            Step::Texture(ref staging, _) => depends(staging.title_range()),
             Step::Run(_) => !pending.is_empty(),
             _ => false,
         })
@@ -1940,7 +1995,7 @@ impl HostList {
                 Step::GpuWrite(shadow, address, len) => {
                     batch.queue_write(shadow, *address, *len);
                 }
-                Step::Texture(staging) => {
+                Step::Texture(staging, _) => {
                     if batch.texture_due(staging) {
                         staging.refresh();
                     }
