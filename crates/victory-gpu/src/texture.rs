@@ -8,8 +8,10 @@
 //!
 //! "Changed" means the content hash of the whole memory differs from the
 //! last detiling's; in write-watched memory it is taken only when a page of
-//! the memory was written since ([`crate::watch`]), in physical-page views,
-//! which cannot be watched, at every submission that samples it.
+//! the memory was written since ([`crate::watch`]), and once it was read
+//! whole, of the written pages only, compared with the bytes read last; in
+//! physical-page views, which cannot be watched, at every submission that
+//! samples it.
 //!
 //! shortcut: a change detiles the whole texture, not the pages written.
 //! Only textures read through descriptor tables are brought up to date
@@ -212,10 +214,15 @@ impl Staging {
             if last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked) {
                 return 0;
             }
-            last.asked = now;
+            let since = std::mem::replace(&mut last.asked, now);
+            let mut read = std::mem::take(&mut last.read);
+            if since != 0 && read.len() == size {
+                let n = self.changed_pages(last, &mut read, &written, since);
+                last.read = read;
+                return n;
+            }
             // Read through the copy, which stands unmapped pages: memory of
             // big pools is too slow to ask page by page.
-            let mut read = std::mem::take(&mut last.read);
             read.resize(size, 0);
             crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
             #[cfg(feature = "diagnostics")]
@@ -244,6 +251,44 @@ impl Staging {
             crate::host::copy_mapped(tiled.as_mut_ptr(), self.memory, size, false);
             self.changed(last, tiled)
         })
+    }
+
+    /// Watched memory read whole before into `read`: reads only the pages
+    /// written after asking `since` (by runs of pages), and detiles if any
+    /// of their bytes changed; the rest is as it was read. Returns the
+    /// bytes read.
+    fn changed_pages(
+        &self,
+        last: &mut Last,
+        read: &mut [u8],
+        written: &[(usize, u64)],
+        since: u64,
+    ) -> usize {
+        let start = self.memory as usize;
+        let (mut bytes, mut changed) = (0, false);
+        for (from, to) in written_runs(written, since, start, start + read.len()) {
+            SCRATCH.with_borrow_mut(|now| {
+                now.resize(to - from, 0);
+                let at = (start + from) as *const u8;
+                crate::host::copy_mapped(now.as_mut_ptr(), at, to - from, false);
+                if read[from..to] != now[..] {
+                    read[from..to].copy_from_slice(now);
+                    changed = true;
+                }
+            });
+            bytes += to - from;
+        }
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::TexWatched, bytes as u64);
+        if changed {
+            // The hash is of an older read: the next whole read detiles.
+            last.hash = None;
+            self.detile(read);
+            self.generation.fetch_add(1, Relaxed);
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::TexChanged, read.len() as u64);
+        }
+        bytes
     }
 
     /// After reading the texture's memory into `tiled`: detiles it unless
@@ -307,6 +352,30 @@ impl Staging {
             }
         }
     }
+}
+
+/// The runs of whole pages written after asking `since` (`written`: pages
+/// and their last writes, in page order), cut to `[start, end)`, as byte
+/// ranges from `start`.
+fn written_runs(
+    written: &[(usize, u64)],
+    since: u64,
+    start: usize,
+    end: usize,
+) -> Vec<(usize, usize)> {
+    use crate::watch::PAGE;
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    for &(page, _) in written.iter().filter(|&&(_, w)| w > since) {
+        let (from, to) = ((page * PAGE).max(start), ((page + 1) * PAGE).min(end));
+        if from >= to {
+            continue;
+        }
+        match runs.last_mut() {
+            Some((_, last)) if *last == from - start => *last = to - start,
+            _ => runs.push((from - start, to - start)),
+        }
+    }
+    runs
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -442,6 +511,18 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
 mod tests {
     use super::*;
     use victory_formats::texture::{Dimension, Swizzle, Texture, TextureDesc};
+
+    #[test]
+    fn written_runs_join_neighbouring_pages_and_cut_to_the_memory() {
+        use crate::watch::PAGE;
+        let written = [(10, 3), (11, 5), (12, 6), (14, 2), (15, 9), (20, 7)];
+        let (start, end) = (10 * PAGE + 16, 16 * PAGE - 32);
+        assert_eq!(
+            written_runs(&written, 4, start, end),
+            [(PAGE - 16, 3 * PAGE - 16), (5 * PAGE - 16, end - start)]
+        );
+        assert!(written_runs(&written, 9, start, end).is_empty());
+    }
 
     #[test]
     fn unchanged_staging_is_copied_once() {
