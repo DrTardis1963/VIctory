@@ -1779,6 +1779,64 @@ fn whole_uav(texture: &ID3D12Resource) -> D3D12_UNORDERED_ACCESS_VIEW_DESC {
     desc
 }
 
+/// Adjusts the most detailed mip and mip count in a shader resource view
+pub fn adjust_mips(most_detailed: &mut u32, mip_levels: &mut u32, drop: u32, host_mips: u32) {
+    let dropped_from_view = drop.saturating_sub(*most_detailed);
+    *most_detailed = most_detailed.saturating_sub(drop);
+    if *mip_levels != u32::MAX {
+        let surviving_mips = mip_levels.saturating_sub(dropped_from_view);
+        let max_mips = host_mips.saturating_sub(*most_detailed);
+        *mip_levels = surviving_mips.min(max_mips).max(1);
+    }
+}
+
+/// Clamps shader resource view mips to the surviving host miplevel range
+/// when the underlying host texture had mips dropped for low VRAM budgets.
+fn adjust_srv_for_dropped_mips(
+    desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC,
+    drop: u32,
+    host_mips: u32,
+) {
+    match desc.ViewDimension {
+        D3D12_SRV_DIMENSION_TEXTURE1D => {
+            // SAFETY: matching union variant for ViewDimension.
+            let tex = unsafe { &mut desc.Anonymous.Texture1D };
+            adjust_mips(&mut tex.MostDetailedMip, &mut tex.MipLevels, drop, host_mips);
+        }
+        D3D12_SRV_DIMENSION_TEXTURE1DARRAY => {
+            // SAFETY: matching union variant for ViewDimension.
+            let tex = unsafe { &mut desc.Anonymous.Texture1DArray };
+            adjust_mips(&mut tex.MostDetailedMip, &mut tex.MipLevels, drop, host_mips);
+        }
+        D3D12_SRV_DIMENSION_TEXTURE2D => {
+            // SAFETY: matching union variant for ViewDimension.
+            let tex = unsafe { &mut desc.Anonymous.Texture2D };
+            adjust_mips(&mut tex.MostDetailedMip, &mut tex.MipLevels, drop, host_mips);
+        }
+        D3D12_SRV_DIMENSION_TEXTURE2DARRAY => {
+            // SAFETY: matching union variant for ViewDimension.
+            let tex = unsafe { &mut desc.Anonymous.Texture2DArray };
+            adjust_mips(&mut tex.MostDetailedMip, &mut tex.MipLevels, drop, host_mips);
+        }
+        D3D12_SRV_DIMENSION_TEXTURE3D => {
+            // SAFETY: matching union variant for ViewDimension.
+            let tex = unsafe { &mut desc.Anonymous.Texture3D };
+            adjust_mips(&mut tex.MostDetailedMip, &mut tex.MipLevels, drop, host_mips);
+        }
+        D3D12_SRV_DIMENSION_TEXTURECUBE => {
+            // SAFETY: matching union variant for ViewDimension.
+            let tex = unsafe { &mut desc.Anonymous.TextureCube };
+            adjust_mips(&mut tex.MostDetailedMip, &mut tex.MipLevels, drop, host_mips);
+        }
+        D3D12_SRV_DIMENSION_TEXTURECUBEARRAY => {
+            // SAFETY: matching union variant for ViewDimension.
+            let tex = unsafe { &mut desc.Anonymous.TextureCubeArray };
+            adjust_mips(&mut tex.MostDetailedMip, &mut tex.MipLevels, drop, host_mips);
+        }
+        _ => {}
+    }
+}
+
 /// Makes the host descriptor for `view` at `at`: the host resource it
 /// views, or `None` if it cannot.
 fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
@@ -1813,6 +1871,18 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                 let mut desc = desc.as_ref().map(srv_desc);
                 if !fits(texture, desc.as_mut().map(|d| &mut d.Format), false) {
                     return None;
+                }
+                let drop = crate::resource::texture_memory(resource)
+                    .map(|(_, orig)| {
+                        // SAFETY: live texture.
+                        let host_mips = unsafe { texture.GetDesc() }.MipLevels;
+                        u32::from(orig.mip_levels).saturating_sub(u32::from(host_mips))
+                    })
+                    .unwrap_or(0);
+                if let (true, Some(d)) = (drop > 0, desc.as_mut()) {
+                    // SAFETY: live texture.
+                    let host_mips = unsafe { texture.GetDesc() }.MipLevels;
+                    adjust_srv_for_dropped_mips(d, drop, u32::from(host_mips));
                 }
                 // SAFETY: a live texture and a slot of our heap.
                 unsafe {
@@ -3566,5 +3636,40 @@ void main(uint3 id : SV_DispatchThreadID) {
 
         // SAFETY: live host device.
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+    }
+
+    /// Dropped mips correctly clamp straddled and fully pruned SRV windows.
+    #[test]
+    fn srv_mips_adjustment_handles_straddled_and_dropped_views() {
+        let mut most_detailed = 1;
+        let mut mip_levels = 3;
+        // 64x64 texture with 7 levels, drop 2 -> host has 5 levels (0..4 representing guest 2..6).
+        // Guest view requests levels 1..=3 (3 levels).
+        // Level 1 dropped, surviving are 2..=3 (2 levels).
+        // Host should receive MostDetailedMip: 0, MipLevels: 2 (representing guest 2..=3).
+        adjust_mips(&mut most_detailed, &mut mip_levels, 2, 5);
+        assert_eq!(most_detailed, 0);
+        assert_eq!(mip_levels, 2);
+
+        // Entirely dropped view (requesting levels 0..=1 with drop 2) clamps to at least 1.
+        let mut most_detailed = 0;
+        let mut mip_levels = 2;
+        adjust_mips(&mut most_detailed, &mut mip_levels, 2, 5);
+        assert_eq!(most_detailed, 0);
+        assert_eq!(mip_levels, 1);
+
+        // Surviving view (requesting levels 3..=4 with drop 2)
+        let mut most_detailed = 3;
+        let mut mip_levels = 2;
+        adjust_mips(&mut most_detailed, &mut mip_levels, 2, 5);
+        assert_eq!(most_detailed, 1);
+        assert_eq!(mip_levels, 2);
+
+        // Unbounded view (u32::MAX)
+        let mut most_detailed = 1;
+        let mut mip_levels = u32::MAX;
+        adjust_mips(&mut most_detailed, &mut mip_levels, 2, 5);
+        assert_eq!(most_detailed, 0);
+        assert_eq!(mip_levels, u32::MAX);
     }
 }
