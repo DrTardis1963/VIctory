@@ -6,8 +6,9 @@ together. It is **not an official release**. The maintainer has not
 reviewed or merged any of these PRs, and each may still change or be
 turned down upstream.
 
-- Base: upstream `main` at `d2a4bae` (Marvisak/VIctory, "Merge pull request
-  #129").
+- Base: upstream `main` at `ffe310e` since update 7 (merged in as one
+  commit; before that `d2a4bae`). Mentions of `d2a4bae` below describe
+  runs and merges made on the old base.
 - Every PR comes in as its own merge commit (`git log --first-parent`), so
   you can find, revert or leave out each one.
 - Before inclusion, every PR was built and tested on one Windows 11
@@ -23,8 +24,37 @@ turned down upstream.
 - Update 5 adds #453 (pixel barycentrics), with one fix commit after it.
 - Update 6 adds #587 (mesh output bounds) with tests, and the switch
   `VICTORY_HEAP_GUARD=0`. **On AMD cards read "Known problem on AMD"
-  below before running this tree.** The base is still `main` `d2a4bae`;
-  upstream is at `ffe310e` and has merged #566 since.
+  below before running this tree.**
+- Update 7 takes upstream `main` `ffe310e` in (116 commits, #566 among
+  them, which is no longer a PR this tree adds), and adds
+  r4tedx/VIctory#10 (`VICTORY_PRESENT_1440P`) and a fix for
+  level-of-detail queries of array textures. **Fewer programs translate
+  than at update 5, on purpose: see "What update 7 costs" below.**
+
+## What update 7 costs
+
+Counted offline over the title's shaders (`victory translate --host-lanes
+32-32 --validate --list`, 25,889 programs, program by program): 24,746
+validated at update 5 and 24,533 at update 7. 221 that validated stop
+now, and 8 are new (the 3 pixel programs of the level-of-detail fix, 5
+compute programs through `main`'s rule for SGPRs the hardware does not
+initialize).
+
+All 221 come from one commit of `main` (`3dd467c`, "a phi that only
+another read phi consumes is live too"): with that rule alone switched
+off in an experimental build, the same count loses none. Before it, a
+value with no host form (a lane mask read as data, a descriptor word, the
+first half of an interpolation) that reached a read through two joins was
+taken for dead and replaced by zero; now the program is refused with that
+value's reason. So these programs did translate, with a zero where the
+console has a value, and how many of them drew right is not known. None
+of the 221 validates on plain `main` either. By reason: `a lane mask
+read as data` 108, `a structured buffer of unknown stride` 57, `the
+first half of an interpolation` 20, `a program the console structure
+cannot hold` 17, others 19.
+
+If a run at update 7 shows less than one at update 5 or 6, this is the
+first thing to suspect, and it is worth reporting.
 
 ## Known problem on AMD (update 3 and later)
 
@@ -41,12 +71,15 @@ sits.
 
 - **To run on AMD:** `git revert -m 1 7ef2c41` (it reverts cleanly at
   update 5, per that report).
-- **To help find it:** one run with `VICTORY_HEAP_GUARD=0` and nothing
-  reverted. The shaders are the same; the host passes `u32::MAX` as the
-  guard, so no index is redirected. A crash that stays points at the
-  shaders' shape (the driver's compiler); one that goes points at reads
-  of the guard slot. The name of the Direct3D call in the crash's stack
-  says the same thing from the other side.
+- **What is known since (nullmarsh, update 6):** the fault is in
+  `CreateComputePipelineState`, so it is AMD's compiler on the shaders
+  this merge changes, not a read of the guard slot. `VICTORY_HEAP_GUARD=0`
+  does not help, as expected for a fault at pipeline creation. It moves
+  to another compute program when one is left out (three were named).
+  An RX 6750 XT ran update 5 for 10 minutes without it (mpDom, issue
+  #841), so it is not every AMD card or driver.
+- `VICTORY_HEAP_GUARD=0` stays as a switch: the same shaders, with
+  `u32::MAX` passed as the guard, so no index is redirected.
 
 ## Reports from the title
 
@@ -203,7 +236,13 @@ and the name is its author's GitHub login.
 - #307 (AntoninMichelq), head `6285e19`: waterfall loops over per-lane
   descriptors, and descriptors chosen by `s_cselect`. Its last two
   commits (`077ec8b`, `6285e19`) came in with #566.
-- #566 (r4tedx), head `6c63dea`: per-lane descriptors chosen by control
+- r4tedx/VIctory#10 (mpDom), head `d6897fa`: with
+  `VICTORY_PRESENT_1440P` set (diagnostics builds), the last 2560x1440
+  colour target the frame wrote is presented in place of the title's own
+  output, which stays black in the world while those targets hold the
+  scene (issue #841). Not run in the title here.
+- #566 (r4tedx), merged upstream since (in `main` from update 7 on;
+  listed for the history), head `6c63dea`: per-lane descriptors chosen by control
   flow (an if/else whose arms each set the descriptor, traced on the
   paths the accessing lanes take), and a waterfall loop is proven on the
   lane masks before the first lane's descriptor is taken as each lane's
@@ -318,6 +357,9 @@ machines with newer drivers did not show it.
   it, `cargo test` sometimes never finishes, with several GPU tests stuck
   together. On the integration machine, before #433, 4 of 12 runs of the
   shader tests hung; with it, 0 of 12 did.
+- At update 7, one run of the same command after `main` was merged in:
+  487 passed, 0 failed, 7 ignored; and one more at the update's head
+  (see the commit that adds this line for its numbers).
 - At update 6, one run of the same command with other threads' builds
   on the CPU (85% load): 442 passed, 2 failed, 5 ignored. The two are
   `frame::tests::waits_end_on_ticks_and_count_frames` (a timing test)
@@ -515,6 +557,20 @@ is described in its merge or fix commit.
   lane reaches mode 9), with a test-only record of a module's `dx.op`
   calls.
 - **`VICTORY_HEAP_GUARD=0`** (`draw.rs`): see "Known problem on AMD".
+- **The merge of `main` `ffe310e` (update 7):** conflicts in seven files;
+  the merge commit's message lists each. In short: both sides in
+  `list.rs`, `native.rs` and `emit/shader.rs`; in `emit/lower.rs` the
+  tree's IsNaN compares with `main`'s `olt | ogt` for `v_cmp_lg`, #160's
+  sample forms in place of `main`'s list of sample names and of its
+  immediate-offset block, and `main`'s zero for an SGPR the hardware
+  does not initialize beside the tree's barycentric inputs; the test
+  files merged item by item with all of both sides' tests.
+- **A level-of-detail query passes its spatial coordinates only**
+  (`emit/lower.rs`; the fix is MichaelSmithAI's, from #453's
+  discussion): `image_get_lod` of an array texture passed the slice as a
+  coordinate and `dxil.dll` refused the module. A test for a 1D-array
+  and a 2D-array query fails without it. The 3 pixel programs of the
+  title that hit it validate now.
 
 ## Left out on purpose
 
