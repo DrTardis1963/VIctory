@@ -70,3 +70,60 @@ static FUNCTIONS: Table<24> = {
     f[7] = object::parent_device as *const (); // 0x38
     Table(f)
 };
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::object::{E_NOINTERFACE, S_FALSE, S_OK, slot};
+
+    type QueryInterface = extern "system" fn(This, *const Iid, *mut This) -> HRESULT;
+    type AddRef = extern "system" fn(This) -> u32;
+    type Release = extern "system" fn(This) -> u32;
+
+    #[test]
+    fn query_heap_validates_desc_and_supports_com_lifecycle() {
+        let null = std::ptr::null();
+        let mut out = null;
+        assert_eq!(
+            create(null, std::ptr::null(), &HEAP_IIDS[0], &mut out),
+            E_INVALIDARG
+        );
+
+        let desc = Desc {
+            kind: 2,
+            count: 64,
+            nodes: 0,
+        };
+        let mut rejected = std::ptr::without_provenance::<Object>(1);
+        assert_eq!(create(null, &desc, &[0; 16], &mut rejected), E_NOINTERFACE);
+        assert!(rejected.is_null());
+
+        assert_eq!(
+            create(null, &desc, &HEAP_IIDS[0], std::ptr::null_mut()),
+            S_FALSE
+        );
+
+        let mut heap = null;
+        assert_eq!(create(null, &desc, &HEAP_IIDS[0], &mut heap), S_OK);
+        let qi = slot::<QueryInterface>(heap, 0x00);
+        let add = slot::<AddRef>(heap, 0x08);
+        let rel = slot::<Release>(heap, 0x10);
+        for iid in &HEAP_IIDS {
+            let mut iface = null;
+            assert_eq!(qi(heap, iid, &mut iface), S_OK);
+            assert_eq!(iface, heap);
+            assert_eq!(add(heap), 3);
+            assert_eq!(rel(heap), 2);
+            assert_eq!(rel(heap), 1);
+        }
+
+        let mut dev = null;
+        assert_eq!(
+            slot::<QueryInterface>(heap, 0x38)(heap, &crate::device::IID, &mut dev),
+            S_OK
+        );
+        assert_eq!(dev, crate::device::device());
+
+        assert_eq!(rel(heap), 0);
+    }
+}

@@ -92,3 +92,92 @@ static FUNCTIONS: Table<24> = {
     f[7] = object::parent_device as *const (); // 0x38
     Table(f)
 };
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::object::{E_NOINTERFACE, S_FALSE, S_OK, slot};
+
+    type QueryInterface = extern "system" fn(This, *const Iid, *mut This) -> HRESULT;
+    type AddRef = extern "system" fn(This) -> u32;
+    type Release = extern "system" fn(This) -> u32;
+
+    #[test]
+    fn command_signature_validates_desc_exposes_layout_and_releases() {
+        let null = std::ptr::null();
+        let mut out = null;
+        assert_eq!(
+            create(null, std::ptr::null(), null, &SIGNATURE_IIDS[0], &mut out),
+            E_INVALIDARG
+        );
+
+        let null_args_nonzero = Desc {
+            stride: 16,
+            count: 1,
+            arguments: std::ptr::null(),
+            nodes: 0,
+        };
+        assert_eq!(
+            create(null, &null_args_nonzero, null, &SIGNATURE_IIDS[0], &mut out),
+            E_INVALIDARG
+        );
+
+        let empty_desc = Desc {
+            stride: 16,
+            count: 0,
+            arguments: std::ptr::null(),
+            nodes: 0,
+        };
+        assert_eq!(
+            create(null, &empty_desc, null, &SIGNATURE_IIDS[0], &mut out),
+            S_OK
+        );
+        assert_eq!(layout(out), Some((16, &[][..])));
+        assert_eq!(slot::<Release>(out, 0x10)(out), 0);
+
+        let args = [[0u32, 0, 0, 0], [5, 1, 2, 3]];
+        let desc = Desc {
+            stride: 24,
+            count: args.len() as u32,
+            arguments: args.as_ptr(),
+            nodes: 0,
+        };
+        assert_eq!(
+            create(null, &desc, null, &SIGNATURE_IIDS[0], std::ptr::null_mut()),
+            S_FALSE
+        );
+
+        let mut sig = null;
+        assert_eq!(
+            create(null, &desc, null, &SIGNATURE_IIDS[0], &mut sig),
+            S_OK
+        );
+        assert_eq!(layout(sig), Some((24, &args[..])));
+        assert_eq!(layout(null), None);
+
+        let qi = slot::<QueryInterface>(sig, 0x00);
+        let add = slot::<AddRef>(sig, 0x08);
+        let rel = slot::<Release>(sig, 0x10);
+        for iid in &SIGNATURE_IIDS {
+            let mut iface = null;
+            assert_eq!(qi(sig, iid, &mut iface), S_OK);
+            assert_eq!(iface, sig);
+            assert_eq!(add(sig), 3);
+            assert_eq!(rel(sig), 2);
+            assert_eq!(rel(sig), 1);
+        }
+
+        let mut dev = null;
+        assert_eq!(
+            slot::<QueryInterface>(sig, 0x38)(sig, &crate::device::IID, &mut dev),
+            S_OK
+        );
+        assert_eq!(dev, crate::device::device());
+
+        let mut bad = sig;
+        assert_eq!(qi(sig, &[0; 16], &mut bad), E_NOINTERFACE);
+        assert!(bad.is_null());
+
+        assert_eq!(rel(sig), 0);
+    }
+}
