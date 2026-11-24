@@ -1574,6 +1574,79 @@ pub(crate) fn census() -> [u64; 10] {
     count
 }
 
+/// For the line of the card's memory by kind: of the host copies of
+/// targets, depth and unordered access textures, the bytes (twins included)
+/// of those another such copy shares title memory with, of those at the
+/// address of another with the same description, and the title memory the
+/// overlapping ones span (what they would take if the host aliased them as
+/// the console does); how many have a host copy larger than their title
+/// memory; and the copies let go since the start because the title
+/// unmapped their memory, with their bytes ([`TARGETS_GONE`]).
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn target_census() -> [u64; 6] {
+    use std::sync::atomic::Ordering::Relaxed;
+    // (title start, title end, host bytes, description words)
+    let mut made: Vec<(u64, u64, u64, [u32; 14])> = Vec::new();
+    for &at in textures().iter() {
+        // SAFETY: as in `let_go_idle`.
+        let r = unsafe { &*(at as *const Resource) };
+        if fills(&r.desc) {
+            continue;
+        }
+        let lock = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
+        let Some((host, twin)) = lock.as_ref() else { continue };
+        let start = r.data() as u64;
+        let size = footprint(&r.desc).map_or(0, |f| f.size).max(1);
+        // SAFETY: 56 bytes in the description's layout.
+        let words = unsafe { std::ptr::from_ref(&r.desc).cast::<[u32; 14]>().read_unaligned() };
+        made.push((start, start + size, host.bytes + twin.as_ref().map_or(0, |t| t.colour.bytes), words));
+    }
+    target_overlap(&mut made, [0, 1].map(|i| TARGETS_GONE[i].load(Relaxed)))
+}
+
+/// [`target_census`]'s sums over `made` (sorted here).
+#[cfg(any(test, all(windows, feature = "diagnostics")))]
+fn target_overlap(made: &mut [(u64, u64, u64, [u32; 14])], gone: [u64; 2]) -> [u64; 6] {
+    made.sort_unstable_by_key(|m| (m.0, m.3));
+    let mut out = [0, 0, 0, 0, gone[0], gone[1]];
+    let mut i = 0;
+    while i < made.len() {
+        // A run of copies whose title ranges chain into one another.
+        let (first, mut end) = (made[i].0, made[i].1);
+        let mut j = i + 1;
+        while j < made.len() && made[j].0 < end {
+            end = end.max(made[j].1);
+            j += 1;
+        }
+        if j - i > 1 {
+            out[0] += made[i..j].iter().map(|m| m.2).sum::<u64>();
+            out[2] += end - first;
+        }
+        for k in i + 1..j {
+            if made[k].0 == made[k - 1].0 && made[k].3 == made[k - 1].3 {
+                out[1] += made[k].2;
+            }
+        }
+        i = j;
+    }
+    out[3] = made.iter().filter(|m| m.2 > m.1 - m.0).count() as u64;
+    out
+}
+
+#[cfg(test)]
+mod target_overlap_tests {
+    #[test]
+    fn overlapping_runs_and_duplicates() {
+        let a = [1u32; 14];
+        let b = [2u32; 14];
+        // Two at one address with one description, one overlapping them,
+        // and one alone further on.
+        let mut made = vec![(0, 100, 90, a), (0, 100, 90, a), (50, 200, 140, b), (300, 400, 120, b)];
+        let out = super::target_overlap(&mut made, [3, 7]);
+        assert_eq!(out, [320, 90, 200, 1, 3, 7]);
+    }
+}
+
 /// Host textures alive (the title's and the twins) and the bytes the host
 /// gives them, for the memory line.
 #[cfg(windows)]

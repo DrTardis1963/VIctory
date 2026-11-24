@@ -739,6 +739,38 @@ fn log_memory() {
         mb(card[0]),
         mb(card[3]),
     );
+    // The card's memory by kind, and what of the PC's memory shaders read.
+    let targets = crate::resource::target_census();
+    let on_card = crate::shadow::card_bytes();
+    let known = census[1] + census[5] + on_card.iter().sum::<u64>();
+    tracing::info!(
+        "the card's memory by kind: {:.0} MB in use of a budget of {:.0} MB: render targets, \
+         depth and unordered access textures {:.0} MB (twins {:.0} MB; {:.0} MB of them share \
+         title memory with another, which spans {:.0} MB; {:.0} MB at the address of another \
+         with the same description; {} larger than their title memory; {} let go as their \
+         title memory was unmapped, {:.0} MB, since the start), textures the title fills \
+         {:.0} MB, title buffers {:.0} MB (and {:.0} MB before-twins), windows {:.0} MB, the rest \
+         (lists, views, scratch, the swap chain, the driver) {:.0} MB; the PC's memory the card \
+         reads: {:.0} MB in use, of it windows {:.0} MB and title buffers' copies {:.0} MB",
+        mb(card[1]),
+        mb(card[0]),
+        mb(census[1]),
+        mb(census[7]),
+        mb(targets[0]),
+        mb(targets[2]),
+        mb(targets[1]),
+        targets[3],
+        targets[4],
+        mb(targets[5]),
+        mb(census[5]),
+        mb(on_card[0]),
+        mb(on_card[1]),
+        mb(on_card[2]),
+        mb(card[1].saturating_sub(known)),
+        mb(card[3]),
+        mb(copies[3]),
+        mb(copies[1].saturating_sub(copies[3])),
+    );
     tracing::info!(
         "memory let go since the start: {} windows outside buffers {:.0} MB, {} staging buffers \
          {:.0} MB; of the windows alive, {:.0} MB lie between the lowest and highest address \

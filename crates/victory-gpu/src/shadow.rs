@@ -252,6 +252,17 @@ fn window_card_most() -> u64 {
 /// Bytes alive of windows' card sides ([`window_card_most`]).
 static WINDOW_CARD_BYTES: AtomicU64 = AtomicU64::new(0);
 
+/// For the line of the card's memory by kind: bytes alive of title buffers'
+/// card sides, of their "before" twins, and of windows' card sides.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn card_bytes() -> [u64; 3] {
+    [
+        CARD_BYTES[0].load(Ordering::Relaxed),
+        CARD_BYTES[1].load(Ordering::Relaxed),
+        WINDOW_CARD_BYTES.load(Ordering::Relaxed),
+    ]
+}
+
 /// A buffer in the card's memory for a window of `size` bytes, if it is to
 /// be there ([`window_card_most`]).
 fn window_card_for(size: u64) -> Option<ID3D12Resource> {
