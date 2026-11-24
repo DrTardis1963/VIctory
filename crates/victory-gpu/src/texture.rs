@@ -596,7 +596,7 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
     if staging.uploaded.load(Relaxed) && !staging.dirty.load(Relaxed) {
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexSkipped, 1);
-        list.defer_texture(staging);
+        list.defer_texture(staging, false);
         return;
     }
     #[cfg(feature = "diagnostics")]
@@ -663,7 +663,7 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
         });
     }
     // Once per submission however many of its lists sample the texture.
-    list.defer_texture(staging);
+    list.defer_texture(staging, true);
 }
 
 impl Staging {
