@@ -204,6 +204,14 @@ struct Lower<'a> {
     samplers: Vec<[u32; 4]>,
     descriptors: HashMap<(Site, bool), &'a Source>,
     scalar: HashMap<Site, Address>,
+    /// Per scalar load, the resource descriptors that hold its dwords, in
+    /// [`Resources::descriptors`] order: the descriptor's place there, its
+    /// site and the first dword its first leaf of that load takes
+    /// ([`Self::descriptor_data`] asks this for every load it meets).
+    loaded_by: HashMap<Site, Vec<(usize, Site, u8)>>,
+    /// The instructions that read each value, in program order: made when
+    /// [`Self::computed_with`] first asks.
+    readers: std::cell::OnceCell<HashMap<Value, Vec<&'a Inst>>>,
     exports: HashMap<Site, &'a Export>,
     interps: HashMap<Site, &'a Interp>,
     handles: HashMap<(usize, Site, u8, bool, (u32, u32)), V>,
@@ -1575,6 +1583,25 @@ impl<'a> Lower<'a> {
                 .map(|d| ((d.site, d.role == Role::Sampler), &d.source))
                 .collect(),
             scalar: x.res.scalar.iter().copied().collect(),
+            loaded_by: {
+                let mut by: HashMap<Site, Vec<(usize, Site, u8)>> = HashMap::new();
+                for (n, d) in x.res.descriptors.iter().enumerate() {
+                    if d.role != Role::Resource {
+                        continue;
+                    }
+                    for l in d.source.leaves() {
+                        if let Source::Loaded { load, first } = *l {
+                            let uses = by.entry(load).or_default();
+                            // (a descriptor counts once per load, by its first leaf of it)
+                            if uses.last().is_none_or(|u| u.0 != n) {
+                                uses.push((n, d.site, first));
+                            }
+                        }
+                    }
+                }
+                by
+            },
+            readers: std::cell::OnceCell::new(),
             exports: x.io.exports.iter().map(|e| (e.site, e)).collect(),
             interps: x.io.interps.iter().map(|(s, i)| (*s, i)).collect(),
             handles: HashMap::new(),
@@ -2629,10 +2656,21 @@ impl<'a> Lower<'a> {
     /// waterfall loop keeps a descriptor's dwords per lane, reads the first
     /// lane's back and compares the lanes' with them.
     fn computed_with(&self, v: Value, depth: u32) -> bool {
-        self.x.p.blocks.iter().flat_map(|b| &b.insts).any(|i| {
-            if !i.reads.iter().any(|r| r.1 == v) {
-                return false;
+        // (asked for two dwords of every buffer descriptor read as data, and again for
+        // every move of them: not a walk of the whole program each time)
+        let readers = self.readers.get_or_init(|| {
+            let mut by: HashMap<Value, Vec<&'a Inst>> = HashMap::new();
+            for i in self.x.p.blocks.iter().flat_map(|b| &b.insts) {
+                for r in &i.reads {
+                    let of = by.entry(r.1).or_default();
+                    if !of.last().is_some_and(|&last| std::ptr::eq(last, i)) {
+                        of.push(i);
+                    }
+                }
             }
+            by
+        });
+        readers.get(&v).into_iter().flatten().any(|i| {
             let name = i.name();
             let moves = matches!(
                 name,
@@ -5633,18 +5671,8 @@ impl<'a> Lower<'a> {
         // How the program uses the descriptor tells the view's kind: an image or buffer
         // instruction before a scalar buffer load, which reads any buffer.
         let x = self.x;
-        let uses = |of: Site| {
-            x.res
-                .descriptors
-                .iter()
-                .filter(|d| d.role == Role::Resource)
-                .filter_map(move |d| {
-                    d.source.leaves().into_iter().find_map(|l| match *l {
-                        Source::Loaded { load, first } if load == of => Some((d.site, first)),
-                        _ => None,
-                    })
-                })
-        };
+        let loaded_by = &self.loaded_by;
+        let uses = |of: Site| loaded_by.get(&of).into_iter().flatten().map(|&(_, at, first)| (at, first));
         let by_scalar_load = |u: &(Site, u8)| {
             matches!(x.p.blocks[u.0.0].insts[u.0.1].fields, Fields::Smem { .. })
         };

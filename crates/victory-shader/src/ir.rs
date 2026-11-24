@@ -479,12 +479,7 @@ fn unspill(
     }
     let code_of = |reg: u8, lane: u32| codes.iter().find(|c| c.0 == (reg, lane)).map(|c| c.1);
     let put = |list: &mut [gfx10::Instruction], i: usize, encoding, opcode: u16, word: u32| {
-        list[i] = gfx10::Instruction {
-            offset: list[i].offset,
-            encoding,
-            opcode,
-            words: vec![word],
-        };
+        list[i] = gfx10::Instruction::single_word(list[i].offset, encoding, opcode, word);
     };
     // `s_mov_b32` / `s_mov_b64 dst, src` (SOP1, opcodes 3 and 4); `s_nop`. A code
     // from `PARKED` up does not fit the word: s0 stands in for it there.
@@ -1588,12 +1583,16 @@ fn effects(
     if vector {
         r.extend(mask(EXEC));
     }
-    let mut seen = Vec::with_capacity(r.len());
-    r.retain(|reg| {
-        let new = !seen.contains(reg);
-        seen.push(*reg);
-        new
-    });
+    // Keep the unique prefix in operand order without a second allocation.
+    let mut unique = 0;
+    for read in 0..r.len() {
+        let reg = r[read];
+        if !r[..unique].contains(&reg) {
+            r[unique] = reg;
+            unique += 1;
+        }
+    }
+    r.truncate(unique);
     Ok(Some((r, w)))
 }
 
