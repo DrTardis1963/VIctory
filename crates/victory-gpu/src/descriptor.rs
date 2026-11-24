@@ -500,15 +500,23 @@ pub(crate) extern "system" fn create_sampler_x(_: This, desc: *const [u32; 27], 
 
 /// Device method: `count` descriptors of `kind` from `src` to `dst`.
 pub(crate) extern "system" fn copy_simple(_: This, count: u32, dst: u64, src: u64, kind: u32) {
-    let step = u64::from(increment(kind).unwrap_or(0));
+    let Some(step) = increment(kind).map(u64::from) else {
+        return;
+    };
     let len = u64::from(count) * step;
-    if dst != 0 && src != 0 {
-        // SAFETY: both ranges are descriptor slots the title owns.
-        unsafe { std::ptr::copy(src as *const u8, dst as *mut u8, len as usize) };
-        #[cfg(windows)]
-        for i in 0..u64::from(count) {
-            mirror(dst + i * step);
-        }
+    if count == 0
+        || dst == 0
+        || src == 0
+        || dst.checked_add(len).is_none()
+        || src.checked_add(len).is_none()
+    {
+        return;
+    }
+    // SAFETY: both ranges are descriptor slots the title owns.
+    unsafe { std::ptr::copy(src as *const u8, dst as *mut u8, len as usize) };
+    #[cfg(windows)]
+    for i in 0..u64::from(count) {
+        mirror(dst + i * step);
     }
 }
 
@@ -556,9 +564,13 @@ pub(crate) extern "system" fn copy(
                 (to, room) = next;
             }
             let n = left.min(room);
-            copy_simple(std::ptr::null(), n, to, from, kind);
             let bytes = u64::from(n) * u64::from(step);
-            (to, from, room, left) = (to + bytes, from + bytes, room - n, left - n);
+            let (Some(next_to), Some(next_from)) = (to.checked_add(bytes), from.checked_add(bytes))
+            else {
+                return;
+            };
+            copy_simple(std::ptr::null(), n, to, from, kind);
+            (to, from, room, left) = (next_to, next_from, room - n, left - n);
         }
     }
 }
@@ -607,12 +619,18 @@ pub(crate) extern "system" fn create_heap(
     let placed = placement.address != 0 && placement.size == size;
     tracing::debug!(?desc, placed, "descriptor heap");
     let (start, memory) = if placed {
+        if placement.address.checked_add(size).is_none() {
+            return E_INVALIDARG;
+        }
         (placement.address, None)
     } else {
         match Memory::zeroed(size, 64) {
             Ok(memory) => (memory.address(), Some(memory)),
             Err(hr) => return hr,
         }
+    };
+    let Some(end) = start.checked_add(size) else {
+        return E_INVALIDARG;
     };
     let visible = desc.flags & SHADER_VISIBLE != 0 && matches!(desc.kind, VIEWS_KIND | SAMPLERS);
     let heap = Box::new(Heap {
@@ -629,10 +647,10 @@ pub(crate) extern "system" fn create_heap(
     if visible {
         let at = std::ptr::from_ref::<Heap>(&heap) as usize;
         let mut heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
-        heaps.push((start, start + size, at));
+        heaps.push((start, end, at));
     }
     #[cfg(not(windows))]
-    let _ = visible;
+    let _ = (visible, end);
     object::hand_out(DESCRIPTOR_HEAP, heap, iid, &HEAP_IIDS, out)
 }
 
@@ -789,5 +807,47 @@ mod tests {
         // A size that does not match the count is not a placement.
         assert_eq!(create(desc, Placement { address, size: 7 }, &mut h), S_OK);
         assert_ne!(slot::<extern "system" fn(This) -> u64>(h, 0x48)(h), address);
+    }
+
+    #[test]
+    fn placed_heaps_and_copies_reject_overflowing_ranges() {
+        let desc = HeapDesc {
+            kind: 0,
+            count: 64,
+            flags: 1,
+            nodes: 1,
+        };
+        let mut h = std::ptr::null();
+        assert_eq!(
+            create(
+                desc,
+                Placement {
+                    address: u64::MAX - 16,
+                    size: 64 * 32,
+                },
+                &mut h,
+            ),
+            E_INVALIDARG
+        );
+
+        let slots = [0u64; 4];
+        let valid = slots.as_ptr() as u64;
+        copy_simple(std::ptr::null(), 100_000, valid, valid, 9);
+        copy_simple(std::ptr::null(), 0, valid, valid, 0);
+        copy_simple(std::ptr::null(), 1, u64::MAX - 8, valid, 0);
+        copy_simple(std::ptr::null(), 1, valid, u64::MAX - 8, 0);
+
+        let (dst_starts, dst_sizes, src_starts, src_sizes) =
+            ([u64::MAX - 8], [1u32], [valid], [1u32]);
+        copy(
+            std::ptr::null(),
+            1,
+            dst_starts.as_ptr(),
+            dst_sizes.as_ptr(),
+            1,
+            src_starts.as_ptr(),
+            src_sizes.as_ptr(),
+            0,
+        );
     }
 }
