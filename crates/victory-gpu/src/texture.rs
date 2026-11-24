@@ -433,6 +433,40 @@ pub(crate) fn committed(at: *const u8, len: usize) -> bool {
     true
 }
 
+/// Committed regions already found, for checking many addresses at once:
+/// one `VirtualQuery` per region instead of one per address (a query walks
+/// its region's pages to size it, ~90 µs in a multi-GB title region).
+#[derive(Default)]
+pub(crate) struct CommittedRegions(std::collections::BTreeMap<usize, usize>);
+
+impl CommittedRegions {
+    /// Whether all of `[at, at + len)` is committed, as [`committed`].
+    pub(crate) fn has(&mut self, at: usize, len: usize) -> bool {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQuery};
+        let end = at.saturating_add(len);
+        let mut p = at;
+        while p < end {
+            if let Some((_, &region_end)) = self.0.range(..=p).next_back()
+                && region_end > p
+            {
+                p = region_end;
+                continue;
+            }
+            // SAFETY: plain data filled in by the query.
+            let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+            // SAFETY: a valid out pointer of the right size.
+            let n = unsafe { VirtualQuery(p as *const _, &mut info, size_of_val(&info)) };
+            if n == 0 || info.State != MEM_COMMIT {
+                return false;
+            }
+            let base = info.BaseAddress as usize;
+            self.0.insert(base, base + info.RegionSize);
+            p = base + info.RegionSize;
+        }
+        true
+    }
+}
+
 /// The staging state of a title texture, made on first use.
 fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
@@ -511,6 +545,18 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
 mod tests {
     use super::*;
     use victory_formats::texture::{Dimension, Swizzle, Texture, TextureDesc};
+
+    #[test]
+    fn committed_regions_answer_as_a_query_and_remember_the_region() {
+        let data = vec![1u8; 1 << 20];
+        let mut regions = CommittedRegions::default();
+        let at = data.as_ptr() as usize;
+        assert!(regions.has(at, data.len()));
+        assert!(!regions.0.is_empty());
+        assert!(regions.has(at + 4096, 1), "a later address in a known region");
+        assert!(!regions.has(0x10, 1), "the null page is never committed");
+        assert_eq!(regions.has(at, data.len()), committed(data.as_ptr(), data.len()));
+    }
 
     #[test]
     fn written_runs_join_neighbouring_pages_and_cut_to_the_memory() {

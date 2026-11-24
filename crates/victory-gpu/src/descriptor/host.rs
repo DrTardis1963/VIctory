@@ -773,7 +773,7 @@ impl HostHeap {
         let host = host()?;
         let aligned = capped.next_multiple_of(256);
         if address.is_multiple_of(256)
-            && let Some(shadow) = crate::shadow::find(address, u64::from(capped))
+            && let Some(shadow) = timed_find(address, u64::from(capped))
             && shadow.gpu(address).is_multiple_of(256)
         {
             let bounce_active = self
@@ -945,6 +945,15 @@ impl HostHeap {
             if b.slots.is_empty() {
                 return None;
             }
+            #[cfg(feature = "diagnostics")]
+            {
+                use crate::copystat::{C, add};
+                add(C::Plans, 1);
+                add(C::PlanSlots, b.slots.len() as u64);
+                if b.plan.as_ref().is_none_or(|p| p.key.0 != key.0) {
+                    add(C::PlansForSlots, 1);
+                }
+            }
             b.slots.iter().map(|(&idx, &v)| (idx, v)).collect()
         };
         let plan = Arc::new(self.make_plan(key, entries));
@@ -959,6 +968,7 @@ impl HostHeap {
         let (mut reads, mut writes, mut bounces) = (Vec::new(), Vec::new(), Vec::new());
         let mut retained = Vec::new();
         let mut stale = Vec::new();
+        let mut regions = crate::texture::CommittedRegions::default();
         for (index, (vi, generation)) in entries {
             let Some(view) = view_at(vi, generation) else {
                 self.clear_stale_slot(index);
@@ -973,7 +983,7 @@ impl HostHeap {
             match &view {
                 &View::Constant(address, size) => {
                     let capped = size.min(65_536);
-                    if !valid_title_address(address, u64::from(capped)) {
+                    if !timed_valid_title_address(&mut regions, address, u64::from(capped)) {
                         self.set_unmapped_null(index, &view);
                         continue;
                     }
@@ -991,7 +1001,7 @@ impl HostHeap {
                 }
                 View::Placed(false, resource, desc) if resource[0] != 1 => {
                     let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
-                    if !valid_title_address(address, 1) {
+                    if !timed_valid_title_address(&mut regions, address, 1) {
                         self.set_unmapped_null(index, &view);
                         continue;
                     }
@@ -1010,14 +1020,14 @@ impl HostHeap {
                         self.set_unmapped_null(index, &view);
                         continue;
                     };
-                    if !valid_title_address(address, len) {
+                    if !timed_valid_title_address(&mut regions, address, len) {
                         self.set_unmapped_null(index, &view);
                         continue;
                     }
                     if let Some(r) = self.ensure_buffer_slot(index, key, &view) {
                         retained.push(r);
                     }
-                    if let Some(shadow) = crate::shadow::find(address, len) {
+                    if let Some(shadow) = timed_find(address, len) {
                         let clamped = len.min(shadow.left(address)) as usize;
                         if clamped > 0 {
                             reads.push((shadow.clone(), address as usize, clamped));
@@ -1081,13 +1091,42 @@ impl HostHeap {
     }
 }
 
+/// [`valid_title_address`] with the regions a plan already found, its time
+/// counted for the plan diagnostics.
+fn timed_valid_title_address(
+    regions: &mut crate::texture::CommittedRegions,
+    address: u64,
+    len: u64,
+) -> bool {
+    #[cfg(feature = "diagnostics")]
+    let started = std::time::Instant::now();
+    let valid = title_bounds(address, len) && regions.has(address as usize, 1);
+    #[cfg(feature = "diagnostics")]
+    crate::copystat::add(crate::copystat::C::PlanQueryUs, crate::copystat::since(started));
+    valid
+}
+
+/// `crate::shadow::find`, its time counted for the plan diagnostics.
+fn timed_find(address: u64, len: u64) -> Option<Arc<crate::shadow::Shadow>> {
+    #[cfg(feature = "diagnostics")]
+    let started = std::time::Instant::now();
+    let found = crate::shadow::find(address, len);
+    #[cfg(feature = "diagnostics")]
+    crate::copystat::add(crate::copystat::C::PlanFindUs, crate::copystat::since(started));
+    found
+}
+
 fn valid_title_address(address: u64, len: u64) -> bool {
+    title_bounds(address, len) && crate::texture::committed(address as *const u8, 1)
+}
+
+/// Whether `[address, address + len)` lies where title memory can.
+fn title_bounds(address: u64, len: u64) -> bool {
     address >= 0x10000
         && len > 0
         && address
             .checked_add(len)
             .is_some_and(|end| end <= (1u64 << 48))
-        && crate::texture::committed(address as *const u8, 1)
 }
 
 /// Logs `what` the first time it happens.
