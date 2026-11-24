@@ -52,10 +52,7 @@ pub extern "system" fn GetModuleFileNameW(module: *mut c_void, out: *mut u16, si
         return host::get_module_file_name_w(module, out, size);
     };
     let wide: Vec<u16> = path.encode_utf16().collect();
-    // SAFETY: the title passes a buffer of `size` characters.
-    copy_truncated(&wide, unsafe {
-        std::slice::from_raw_parts_mut(out, size as usize)
-    })
+    copy_module_path(&wide, out, size)
 }
 
 /// See [`GetModuleFileNameW`].
@@ -63,10 +60,7 @@ pub extern "system" fn GetModuleFileNameA(module: *mut c_void, out: *mut u8, siz
     let Some(path) = title_path(module) else {
         return host::get_module_file_name_a(module, out, size);
     };
-    // SAFETY: the title passes a buffer of `size` bytes.
-    copy_truncated(path.as_bytes(), unsafe {
-        std::slice::from_raw_parts_mut(out, size as usize)
-    })
+    copy_module_path(path.as_bytes(), out, size)
 }
 
 fn title_path(module: *mut c_void) -> Option<String> {
@@ -76,6 +70,21 @@ fn title_path(module: *mut c_void) -> Option<String> {
         module as usize
     };
     Some(runtime::image_path(base)?.to_string_lossy().into_owned())
+}
+
+fn copy_module_path<T: Copy + Default>(text: &[T], out: *mut T, size: u32) -> u32 {
+    if size == 0 {
+        host::set_last_error(ERROR_INSUFFICIENT_BUFFER);
+        return 0;
+    }
+    if out.is_null() {
+        host::set_last_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    // SAFETY: `out` is non-null and the title passes a buffer of `size` elements.
+    copy_truncated(text, unsafe {
+        std::slice::from_raw_parts_mut(out, size as usize)
+    })
 }
 
 /// `GetModuleFileName`'s contract: copy with a NUL; if it does not fit,
@@ -96,6 +105,7 @@ fn copy_truncated<T: Copy + Default>(text: &[T], out: &mut [T]) -> u32 {
     n as u32
 }
 
+const ERROR_INVALID_PARAMETER: u32 = 87;
 const ERROR_INSUFFICIENT_BUFFER: u32 = 122;
 
 /// Console-only DLLs we implement load as a pseudo handle (titles load
@@ -683,5 +693,62 @@ mod tests {
         let runtime = LoadLibraryA(c"xgameruntime.dll".as_ptr().cast());
         assert!(!runtime.is_null());
         assert_eq!(GetModuleHandleW(w("XGameRuntime.dll").as_ptr()), runtime);
+    }
+
+    #[test]
+    fn get_module_file_name_rejects_null_or_zero_buffer() {
+        let base = 0x7300_0000_0000usize;
+        runtime::set_image_path(base, std::path::Path::new(r"C:\title\nulltest.exe"));
+        let module = base as *mut c_void;
+
+        assert_eq!(GetModuleFileNameW(module, std::ptr::null_mut(), 0), 0);
+        #[cfg(windows)]
+        assert_eq!(
+            // SAFETY: reads this thread's last error.
+            unsafe { windows_sys::Win32::Foundation::GetLastError() },
+            ERROR_INSUFFICIENT_BUFFER
+        );
+
+        assert_eq!(GetModuleFileNameA(module, std::ptr::null_mut(), 0), 0);
+        #[cfg(windows)]
+        assert_eq!(
+            // SAFETY: reads this thread's last error.
+            unsafe { windows_sys::Win32::Foundation::GetLastError() },
+            ERROR_INSUFFICIENT_BUFFER
+        );
+
+        assert_eq!(GetModuleFileNameW(module, std::ptr::null_mut(), 16), 0);
+        #[cfg(windows)]
+        assert_eq!(
+            // SAFETY: reads this thread's last error.
+            unsafe { windows_sys::Win32::Foundation::GetLastError() },
+            ERROR_INVALID_PARAMETER
+        );
+
+        assert_eq!(GetModuleFileNameA(module, std::ptr::null_mut(), 16), 0);
+        #[cfg(windows)]
+        assert_eq!(
+            // SAFETY: reads this thread's last error.
+            unsafe { windows_sys::Win32::Foundation::GetLastError() },
+            ERROR_INVALID_PARAMETER
+        );
+
+        let mut wide = [0xFFFFu16; 1];
+        assert_eq!(GetModuleFileNameW(module, wide.as_mut_ptr(), 0), 0);
+        #[cfg(windows)]
+        assert_eq!(
+            // SAFETY: reads this thread's last error.
+            unsafe { windows_sys::Win32::Foundation::GetLastError() },
+            ERROR_INSUFFICIENT_BUFFER
+        );
+
+        let mut narrow = [0xFFu8; 1];
+        assert_eq!(GetModuleFileNameA(module, narrow.as_mut_ptr(), 0), 0);
+        #[cfg(windows)]
+        assert_eq!(
+            // SAFETY: reads this thread's last error.
+            unsafe { windows_sys::Win32::Foundation::GetLastError() },
+            ERROR_INSUFFICIENT_BUFFER
+        );
     }
 }
