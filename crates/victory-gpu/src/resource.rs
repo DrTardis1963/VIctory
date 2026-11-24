@@ -1185,6 +1185,13 @@ struct Hosted {
 pub(crate) static KINDS: [std::sync::atomic::AtomicU64; 7] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 7];
 
+/// Host copies of targets, depth and unordered access textures let go since
+/// the start because the title unmapped their memory, and their bytes
+/// (twins included), for the memory line.
+#[cfg(windows)]
+pub(crate) static TARGETS_GONE: [std::sync::atomic::AtomicU64; 2] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
 /// Every title texture alive (not buffers), by address: for the sweep and
 /// the memory line. A texture leaves the table before it is freed.
 #[cfg(windows)]
@@ -1348,7 +1355,7 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             KINDS[0].fetch_add(1, Relaxed);
             KINDS[1].fetch_add(host.bytes, Relaxed);
         }
-        if r.host.gone.load(Relaxed) {
+        if host.filled && r.host.gone.load(Relaxed) {
             KINDS[4].fetch_add(1, Relaxed);
             KINDS[5].fetch_add(host.bytes, Relaxed);
         }
@@ -1446,15 +1453,33 @@ pub(crate) fn let_go_idle() {
         // SAFETY: a texture leaves the table before it is freed, under the
         // lock held here (`Drop for Resource`).
         let r = unsafe { &*(at as *const Resource) };
-        if !fills(&r.desc) || crate::texture::host_wrote(at) {
+        // A target, depth or unordered access texture holds what the host
+        // drew; it goes only once the title has unmapped the memory under it
+        // (what was drawn there is gone on the console too). Port of
+        // fxceless #194, for textures at title addresses as well as views.
+        let title_filled = fills(&r.desc) && !crate::texture::host_wrote(at);
+        let unmapped = |r: &Resource| {
+            !matches!(r.backing, Backing::Committed(_))
+                && !crate::texture::committed(r.data().cast_const(), 1)
+        };
+        if !title_filled && fills(&r.desc) {
             continue;
         }
         let gone = {
             let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
-            let idle = made.as_ref().is_some_and(|(host, _)| {
+            let alone = |t: &std::sync::Arc<HostTexture>| {
+                std::sync::Arc::strong_count(t) == 1 && crate::host::references(&t.texture) == 1
+            };
+            // Cheap checks first: the memory question last.
+            let idle = made.as_ref().is_some_and(|(host, twin)| {
                 crate::host::long_ago(r.host.used.load(Relaxed), IDLE_MS, IDLE_FRAMES)
-                    && std::sync::Arc::strong_count(host) == 1
-                    && crate::host::references(&host.texture) == 1
+                    && alone(host)
+                    && twin.as_ref().is_none_or(|t| {
+                        std::sync::Arc::strong_count(t) == 1
+                            && alone(&t.colour)
+                            && t.plane.as_ref().is_none_or(alone)
+                    })
+                    && (title_filled || unmapped(r))
             });
             if idle {
                 // Under the lock: the next use must not find the staging
@@ -1465,16 +1490,24 @@ pub(crate) fn let_go_idle() {
                 None
             }
         };
-        if let Some((host, _)) = gone {
+        if let Some((host, twin)) = gone {
             r.host.gone.store(true, Relaxed);
-            KINDS[2].fetch_add(1, Relaxed);
-            KINDS[3].fetch_add(host.bytes, Relaxed);
+            if title_filled {
+                KINDS[2].fetch_add(1, Relaxed);
+                KINDS[3].fetch_add(host.bytes, Relaxed);
+            } else {
+                TARGETS_GONE[0].fetch_add(1, Relaxed);
+                TARGETS_GONE[1].fetch_add(host.bytes + twin.as_ref().map_or(0, |t| t.colour.bytes), Relaxed);
+            }
             went += 1;
-            bytes += host.bytes;
+            bytes += host.bytes + twin.as_ref().map_or(0, |t| t.colour.bytes);
             if first.is_none() {
                 first = Some(at);
             }
             crate::host::retire(host);
+            if let Some(twin) = twin {
+                crate::host::retire(twin);
+            }
         }
     }
     if went > 0 {
@@ -1539,6 +1572,79 @@ pub(crate) fn census() -> [u64; 10] {
         }
     }
     count
+}
+
+/// For the line of the card's memory by kind: of the host copies of
+/// targets, depth and unordered access textures, the bytes (twins included)
+/// of those another such copy shares title memory with, of those at the
+/// address of another with the same description, and the title memory the
+/// overlapping ones span (what they would take if the host aliased them as
+/// the console does); how many have a host copy larger than their title
+/// memory; and the copies let go since the start because the title
+/// unmapped their memory, with their bytes ([`TARGETS_GONE`]).
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn target_census() -> [u64; 6] {
+    use std::sync::atomic::Ordering::Relaxed;
+    // (title start, title end, host bytes, description words)
+    let mut made: Vec<(u64, u64, u64, [u32; 14])> = Vec::new();
+    for &at in textures().iter() {
+        // SAFETY: as in `let_go_idle`.
+        let r = unsafe { &*(at as *const Resource) };
+        if fills(&r.desc) {
+            continue;
+        }
+        let lock = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
+        let Some((host, twin)) = lock.as_ref() else { continue };
+        let start = r.data() as u64;
+        let size = footprint(&r.desc).map_or(0, |f| f.size).max(1);
+        // SAFETY: 56 bytes in the description's layout.
+        let words = unsafe { std::ptr::from_ref(&r.desc).cast::<[u32; 14]>().read_unaligned() };
+        made.push((start, start + size, host.bytes + twin.as_ref().map_or(0, |t| t.colour.bytes), words));
+    }
+    target_overlap(&mut made, [0, 1].map(|i| TARGETS_GONE[i].load(Relaxed)))
+}
+
+/// [`target_census`]'s sums over `made` (sorted here).
+#[cfg(any(test, all(windows, feature = "diagnostics")))]
+fn target_overlap(made: &mut [(u64, u64, u64, [u32; 14])], gone: [u64; 2]) -> [u64; 6] {
+    made.sort_unstable_by_key(|m| (m.0, m.3));
+    let mut out = [0, 0, 0, 0, gone[0], gone[1]];
+    let mut i = 0;
+    while i < made.len() {
+        // A run of copies whose title ranges chain into one another.
+        let (first, mut end) = (made[i].0, made[i].1);
+        let mut j = i + 1;
+        while j < made.len() && made[j].0 < end {
+            end = end.max(made[j].1);
+            j += 1;
+        }
+        if j - i > 1 {
+            out[0] += made[i..j].iter().map(|m| m.2).sum::<u64>();
+            out[2] += end - first;
+        }
+        for k in i + 1..j {
+            if made[k].0 == made[k - 1].0 && made[k].3 == made[k - 1].3 {
+                out[1] += made[k].2;
+            }
+        }
+        i = j;
+    }
+    out[3] = made.iter().filter(|m| m.2 > m.1 - m.0).count() as u64;
+    out
+}
+
+#[cfg(test)]
+mod target_overlap_tests {
+    #[test]
+    fn overlapping_runs_and_duplicates() {
+        let a = [1u32; 14];
+        let b = [2u32; 14];
+        // Two at one address with one description, one overlapping them,
+        // and one alone further on.
+        let mut made = vec![(0, 100, 90, a), (0, 100, 90, a), (50, 200, 140, b), (300, 400, 120, b)];
+        let out = super::target_overlap(&mut made, [3, 7]);
+        assert_eq!(out, [320, 90, 200, 1, 3, 7]);
+    }
 }
 
 /// Host textures alive (the title's and the twins) and the bytes the host
