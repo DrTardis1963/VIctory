@@ -9,12 +9,18 @@
 //!
 //! A first use queues the pipeline and waits for it within a budget per
 //! frame, so the cheap ones (menus, one-off passes such as a colour-grading
-//! bake) are there at once as before; past the budget a draw or dispatch
-//! whose pipeline is not ready is dropped, as an untranslated one is.
+//! bake) are there at once as before; past the budget a draw whose pipeline
+//! is not ready is dropped, as an untranslated one is.
+//!
+//! A dispatch is not dropped that way: what a compute pass writes is read
+//! later (by draws, other passes, the CPU), and a dropped one leaves that
+//! memory never written. Its first use waits until the pipeline is made
+//! (as xcl does), making it on the waiting thread if no worker has taken
+//! it yet, for at most [`COMPUTE_BOUND`].
 //!
 //! shortcut: the budget (half a second of waiting per title frame) is a
-//! guess; a pass the title runs only once and whose pipeline takes longer
-//! is lost.
+//! guess; a draw pass the title runs only once and whose pipeline takes
+//! longer is lost.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
@@ -28,6 +34,8 @@ pub(crate) struct Pending {
     shaders: Vec<Arc<Shader>>,
     pub(crate) graphics: Option<Box<GraphicsState>>,
     queued: AtomicBool,
+    /// A worker or a waiting thread is making it.
+    taken: AtomicBool,
     made: OnceLock<Option<HostPipeline>>,
     /// What identifies it across runs (shader containers and state), and
     /// whether a draw has used it yet.
@@ -53,18 +61,30 @@ impl Pending {
             shaders,
             graphics,
             queued: AtomicBool::new(false),
+            taken: AtomicBool::new(false),
             made: OnceLock::new(),
             key: key.finalize().to_hex()[..32].to_owned(),
             used: AtomicBool::new(false),
         }
     }
 
-    fn make(&self) {
+    /// Makes the pipeline unless a worker or waiting thread took it first;
+    /// whether this call made it.
+    fn make(&self) -> bool {
+        if self.taken.swap(true, Ordering::Relaxed) {
+            return false;
+        }
         self.made
             .get_or_init(|| HostPipeline::new(&self.shaders, self.graphics.as_deref()));
+        WAITING.fetch_sub(1, Ordering::Relaxed);
         let (lock, done) = &DONE;
         let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
         done.notify_all();
+        true
+    }
+
+    fn compute(&self) -> bool {
+        matches!(self.shaders.as_slice(), [cs] if cs.stage == "compute")
     }
 }
 
@@ -94,8 +114,13 @@ pub(crate) fn missing(p: &Pending) -> Option<String> {
 /// Signalled whenever a worker has made a pipeline.
 static DONE: (Mutex<()>, Condvar) = (Mutex::new(()), Condvar::new());
 
-/// Waiting allowed per title frame, over all threads.
+/// Waiting allowed per title frame, over all threads, for graphics.
 const BUDGET: Duration = Duration::from_millis(500);
+
+/// Waiting allowed for one compute pipeline at its first use: beyond the
+/// slowest driver compiles seen (3.4 s), and below what a hung worker
+/// would cost.
+const COMPUTE_BOUND: Duration = Duration::from_secs(20);
 
 /// Pipelines queued and not made yet.
 static WAITING: AtomicU64 = AtomicU64::new(0);
@@ -105,12 +130,16 @@ pub(crate) fn waiting() -> u64 {
     WAITING.load(Ordering::Relaxed)
 }
 
-/// The host pipeline if it is made (or is made within the frame's budget);
-/// queues it on first use.
+/// The host pipeline if it is made (or is made within the frame's budget,
+/// or for compute, at all); queues it on first use.
 pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     if p.made.get().is_none() {
         start(p);
-        wait(p, crate::frame::current());
+        if p.compute() {
+            wait_compute(p);
+        } else {
+            wait(p, crate::frame::current());
+        }
     }
     let made = p.made.get()?.as_ref();
     if made.is_some() && !p.used.swap(true, Ordering::Relaxed) {
@@ -157,6 +186,29 @@ fn wait(p: &Pending, frame: u64) {
     WAITED_US.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
 }
 
+/// Makes `p` here if no worker has taken it, else waits for it up to
+/// [`COMPUTE_BOUND`]; outside the graphics budget.
+fn wait_compute(p: &Pending) {
+    if p.make() {
+        return;
+    }
+    let started = Instant::now();
+    let (lock, done) = &DONE;
+    let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
+    while p.made.get().is_none() {
+        let rest = COMPUTE_BOUND.saturating_sub(started.elapsed());
+        if rest.is_zero() {
+            tracing::warn!(
+                shaders = ?p.shaders,
+                "a compute pipeline was not made within {} s: its dispatches are dropped until it is",
+                COMPUTE_BOUND.as_secs()
+            );
+            return;
+        }
+        held = done.wait_timeout(held, rest).unwrap_or_else(|e| e.into_inner()).0;
+    }
+}
+
 /// Hands `p` to the workers (half the logical processors, 2 to 8), started
 /// on first use.
 fn queue(p: Arc<Pending>) {
@@ -179,8 +231,10 @@ fn queue(p: Arc<Pending>) {
                     loop {
                         let next = receiver.lock().unwrap_or_else(|e| e.into_inner()).recv();
                         let Ok(p) = next else { return };
-                        p.make();
-                        if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
+                        if !p.make() {
+                            continue;
+                        }
+                        if WAITING.load(Ordering::Relaxed) == 0 {
                             drained();
                         } else {
                             super::library::save(false);
@@ -196,7 +250,6 @@ fn queue(p: Arc<Pending>) {
     if let Err(e) = sender.send(p) {
         // No worker: made here instead.
         e.0.make();
-        WAITING.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -221,6 +274,16 @@ fn drained() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A pipeline taken by one maker is not made again by another.
+    #[test]
+    fn a_pipeline_is_made_once() {
+        let p = Pending::new(Vec::new(), None);
+        WAITING.fetch_add(1, Ordering::Relaxed);
+        assert!(p.make());
+        assert!(matches!(p.made.get(), Some(None)));
+        assert!(!p.make());
+    }
 
     /// A first use queues the pipeline and, within the budget, gets the
     /// worker's answer (here: no host pipeline for no shaders).
