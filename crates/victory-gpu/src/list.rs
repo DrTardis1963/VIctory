@@ -853,6 +853,19 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             if unlike(dst, src) {
                 return;
             }
+            let host_dst = crate::resource::host_copy(dst);
+            let host_src = crate::resource::host_copy(src);
+            if let (Some(hd), Some(hs)) = (host_dst.as_ref(), host_src.as_ref())
+                && hd.mip_drop != hs.mip_drop
+            {
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| {
+                    tracing::warn!(
+                        "copy_resource between textures with different mip_drop skipped"
+                    );
+                });
+                return;
+            }
             // A source the title fills itself is uploaded first (upstream
             // PR #671): a copy read whatever the host texture held.
             if crate::texture::title_written(from) {
@@ -955,7 +968,28 @@ extern "system" fn copy_texture_region(
         if unlike(dst.resource, src.resource) {
             return;
         }
+        let mut to_sub = dst.footprint.offset as u32;
+        if dst.kind != FOOTPRINT
+            && let Some(host_dst) = crate::resource::host_copy(dst.resource)
+        {
+            let Some(host_sub) = host_dst.host_subresource(to_sub) else {
+                return;
+            };
+            to_sub = host_sub;
+        }
+        let mut from_sub = src.footprint.offset as u32;
+        if src.kind != FOOTPRINT
+            && let Some(host_src) = crate::resource::host_copy(src.resource)
+        {
+            let Some(host_sub) = host_src.host_subresource(from_sub) else {
+                return;
+            };
+            from_sub = host_sub;
+        }
         let mut from = src;
+        if src.kind != FOOTPRINT {
+            from.footprint.offset = u64::from(from_sub);
+        }
         let _upload; // keeps the source alive while this call records it
         #[cfg(feature = "diagnostics")]
         let mut read = None;
@@ -998,6 +1032,9 @@ extern "system" fn copy_texture_region(
         crate::texture::host_written(dst.resource);
         let mut to_location = dst;
         to_location.resource = to.as_raw().cast_const().cast();
+        if dst.kind != FOOTPRINT {
+            to_location.footprint.offset = u64::from(to_sub);
+        }
         let host_box = (!source_box.is_null()).then(|| source_box.cast::<D3D12_BOX>());
         #[cfg(feature = "diagnostics")]
         {
@@ -1133,6 +1170,22 @@ extern "system" fn resolve(
             crate::resource::host_resource(src),
         )
     {
+        let dst_sub = if let Some(hd) = crate::resource::host_copy(dst) {
+            let Some(mapped) = hd.host_subresource(dst_sub) else {
+                return;
+            };
+            mapped
+        } else {
+            dst_sub
+        };
+        let src_sub = if let Some(hs) = crate::resource::host_copy(src) {
+            let Some(mapped) = hs.host_subresource(src_sub) else {
+                return;
+            };
+            mapped
+        } else {
+            src_sub
+        };
         use windows::Win32::Foundation::RECT;
         use windows::Win32::Graphics::Direct3D12::{
             D3D12_RESOLVE_MODE_AVERAGE, ID3D12GraphicsCommandList1,
@@ -1156,7 +1209,15 @@ extern "system" fn resolve(
         unsafe {
             let (a, b) = (to.GetDesc(), from.GetDesc());
             let format = if crate::resource::stands_in(dst) { a.Format } else { DXGI_FORMAT(format as i32) };
-            if (a.Width, a.Height) == (b.Width, b.Height) {
+            let dst_mips = u32::from(a.MipLevels).max(1);
+            let src_mips = u32::from(b.MipLevels).max(1);
+            let dst_mip = dst_sub % dst_mips;
+            let src_mip = src_sub % src_mips;
+            let dst_w = (a.Width >> dst_mip).max(1);
+            let dst_h = (u64::from(a.Height) >> dst_mip).max(1);
+            let src_w = (b.Width >> src_mip).max(1);
+            let src_h = (u64::from(b.Height) >> src_mip).max(1);
+            if (dst_w, dst_h) == (src_w, src_h) {
                 list.list
                     .ResolveSubresource(to, dst_sub, from, src_sub, format);
             } else if let Ok(list1) = list.list.cast::<ID3D12GraphicsCommandList1>() {
@@ -1164,8 +1225,8 @@ extern "system" fn resolve(
                 let rect = RECT {
                     left: 0,
                     top: 0,
-                    right: a.Width.min(b.Width) as i32,
-                    bottom: a.Height.min(b.Height) as i32,
+                    right: dst_w.min(src_w) as i32,
+                    bottom: dst_h.min(src_h) as i32,
                 };
                 list1.ResolveSubresourceRegion(
                     to,

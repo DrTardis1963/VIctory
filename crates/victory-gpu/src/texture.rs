@@ -19,6 +19,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use windows::Win32::Graphics::Direct3D12::*;
+use windows::Win32::Graphics::Dxgi::*;
 
 use crate::host::{HostList, host};
 use crate::object::This;
@@ -28,6 +29,75 @@ macro_rules! once {
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(|| tracing::warn!($($arg)*));
     }};
+}
+
+/// Query the primary discrete GPU's dedicated video memory in bytes via DXGI.
+fn query_adapter_vram_bytes() -> Option<u64> {
+    // SAFETY: plain DXGI adapter queries to inspect video memory.
+    unsafe {
+        let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;
+        let mut max_vram = 0u64;
+        let mut i = 0u32;
+        while let Ok(adapter) = factory.EnumAdapters1(i) {
+            i += 1;
+            if let Ok(desc) = adapter.GetDesc1()
+                && (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 == 0)
+            {
+                max_vram = max_vram.max(desc.DedicatedVideoMemory as u64);
+            }
+        }
+        (max_vram > 0).then_some(max_vram)
+    }
+}
+
+/// The number of most detailed mips to drop for sampled host textures.
+/// 0: keep original resolution.
+/// 1: drop 1 mip (halves dimensions, ~75% VRAM savings).
+/// 2: drop 2 mips (quarters dimensions, ~93.75% VRAM savings).
+/// 3: drop 3 mips (eighths dimensions, ~98.4% VRAM savings).
+///
+/// When `VICTORY_TEXTURE_MIP_DROP` is not explicitly set in the environment,
+/// this automatically defaults to 1 on adapters with <= 8 GB dedicated VRAM
+/// to prevent host driver committed out-of-memory crashes on 6 GB and 8 GB GPUs.
+pub(crate) fn texture_mip_drop() -> u32 {
+    static DROP: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *DROP.get_or_init(|| {
+        if let Some(v) = std::env::var("VICTORY_TEXTURE_MIP_DROP")
+            .ok()
+            .and_then(|val| val.parse::<u32>().ok())
+        {
+            return v.min(3);
+        }
+        // Auto-detect based on adapter DedicatedVideoMemory.
+        // Threshold: 8.5 GiB comfortably covers 4 GB, 6 GB, and 8 GB GPUs
+        // (which report up to ~8192 MiB), while leaving >= 10 GB GPUs at full resolution (0).
+        if let Some(vram) = query_adapter_vram_bytes() {
+            const EIGHT_GB_THRESHOLD: u64 = 8 * 1024 * 1024 * 1024 + 512 * 1024 * 1024;
+            if vram <= EIGHT_GB_THRESHOLD {
+                tracing::info!(
+                    vram_mb = vram / (1024 * 1024),
+                    "auto-enabling VICTORY_TEXTURE_MIP_DROP=1 for <= 8 GB GPU"
+                );
+                return 1;
+            }
+        }
+        0
+    })
+}
+
+/// The minimum texture dimension (both width and height) eligible for mip-dropping.
+/// Defaults to 2048 (the title's sampled 1920x1080 loading artwork turned flat
+/// colour below that). Textures smaller than this on either axis are preserved
+/// at full resolution. Configurable via `VICTORY_TEXTURE_MIP_DROP_MIN_SIZE`.
+pub(crate) fn texture_mip_drop_min_size() -> u64 {
+    static MIN_SIZE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MIN_SIZE.get_or_init(|| {
+        std::env::var("VICTORY_TEXTURE_MIP_DROP_MIN_SIZE")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(2048)
+    })
 }
 
 /// A texture's upload state: the staging buffer laid out as the host
@@ -45,6 +115,8 @@ pub(crate) struct Staging {
     mips: u32,
     /// The staging buffer's bytes (counted in `STAGED` while it lives).
     bytes: u64,
+    /// Dropped mips count (offset into console mips for detiling).
+    pub(crate) mip_drop: u32,
     memory: *const u8,
     last: Mutex<Last>,
     /// Whether the staging buffer was detiled since a submitted list last
@@ -782,7 +854,8 @@ impl Staging {
             );
         }
         for (i, (footprint, &rows)) in self.footprints.iter().zip(&self.rows).enumerate() {
-            let (mip, slice) = (i as u32 % self.mips, i as u32 / self.mips);
+            let (host_mip, slice) = (i as u32 % self.mips, i as u32 / self.mips);
+            let console_mip = host_mip + self.mip_drop;
             let f = footprint.Footprint;
             let pitch = f.RowPitch as usize;
             let len = pitch * rows as usize * f.Depth as usize;
@@ -792,9 +865,9 @@ impl Staging {
             };
             if let Err(e) =
                 self.layout
-                    .detile(tiled, mip, slice, linear, pitch, pitch * rows as usize)
+                    .detile(tiled, console_mip, slice, linear, pitch, pitch * rows as usize)
             {
-                tracing::warn!(?e, mip, slice, "texture not detiled");
+                tracing::warn!(?e, console_mip, slice, "texture not detiled");
                 return;
             }
         }
@@ -1004,6 +1077,7 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     let host = host()?;
     // SAFETY: a live resource.
     let d = unsafe { texture.GetDesc() };
+    let mip_drop = u32::from(desc.mip_levels).saturating_sub(u32::from(d.MipLevels));
     let count = if d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D {
         u32::from(d.MipLevels)
     } else {
@@ -1032,7 +1106,7 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
             d.Width, d.Height, d.DepthOrArraySize, d.Format.0
         )
     });
-    tracing::debug!(?desc, total, "texture contents uploaded from title memory");
+    tracing::debug!(?desc, total, mip_drop, "texture contents uploaded from title memory");
     STAGED[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     STAGED[1].fetch_add(total, std::sync::atomic::Ordering::Relaxed);
     let s = Arc::new(Staging {
@@ -1045,6 +1119,7 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         layout,
         mips: u32::from(d.MipLevels),
         bytes: total,
+        mip_drop,
         memory,
         last: Mutex::default(),
         dirty: std::sync::atomic::AtomicBool::new(true),
@@ -1162,6 +1237,18 @@ mod title_memory_tests {
                     .expect("the staging buffer's bytes are enough");
                 assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn adapter_vram_query_does_not_panic() {
+        if let Some(bytes) = query_adapter_vram_bytes() {
+            assert!(bytes > 0);
         }
     }
 }
