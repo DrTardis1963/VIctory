@@ -1732,6 +1732,10 @@ struct Deferred {
     backs: Vec<(ID3D12Resource, usize, [usize; 3])>,
     /// Whether a step zeroes the indirect-work budget.
     budget_zeroed: bool,
+    /// Textures the list samples without recording their upload (their
+    /// host copies held what their staging buffers held): what the check
+    /// at submission finds changed, the prelude uploads.
+    late_uploads: Vec<(std::sync::Arc<crate::texture::Staging>, std::sync::Arc<crate::resource::HostTexture>)>,
 }
 
 impl Deferred {
@@ -2715,11 +2719,8 @@ mod late_tests {
         assert!(!touches(&[], 0, usize::MAX));
     }
 
-    /// A texture staging buffer marked in flight for submission N blocks
-    /// later flights until `FINISHED` reaches N.
-    #[test]
-    fn staging_in_flight_tracks_submission_completion() {
-        let Some(host) = super::host() else { return };
+    /// A 16x16 title texture in title memory (a committed resource).
+    fn title_texture() -> crate::object::This {
         let heap_words: [u32; 5] = [1, 0, 0, 1, 1];
         let desc_words: [u32; 14] = [3, 0, 0, 0, 16, 0, 4, 65537, 28, 1, 0, 256, 0, 0];
         // SAFETY: plain repr(C) structs matching D3D12 layouts.
@@ -2749,6 +2750,22 @@ mod late_tests {
             ),
             crate::object::S_OK
         );
+        resource
+    }
+
+    fn release(resource: crate::object::This) {
+        let release = crate::object::slot::<extern "system" fn(crate::object::This) -> u32>(
+            resource, 0x10,
+        );
+        assert_eq!(release(resource), 0);
+    }
+
+    /// A texture staging buffer marked in flight for submission N blocks
+    /// later flights until `FINISHED` reaches N.
+    #[test]
+    fn staging_in_flight_tracks_submission_completion() {
+        let Some(host) = super::host() else { return };
+        let resource = title_texture();
         let tex = crate::resource::host_resource(resource).expect("host texture");
         let list = host.new_list().expect("host list");
         crate::texture::upload(&list, resource, tex);
@@ -2763,10 +2780,51 @@ mod late_tests {
         assert!(!super::staging_in_flight_at(&[&list], 11));
         list.close();
         drop(list);
-        let release = crate::object::slot::<extern "system" fn(crate::object::This) -> u32>(
-            resource, 0x10,
-        );
-        assert_eq!(release(resource), 0);
+        release(resource);
+    }
+
+    /// A list that samples a texture whose host copy was up to date when
+    /// it was recorded uploads in its prelude what the check at submission
+    /// found changed, and takes the change: a list that recorded nothing
+    /// sampled the old contents (the boot video showed older frames).
+    #[test]
+    fn prelude_uploads_what_the_check_found_changed() {
+        let Some(host) = super::host() else { return };
+        let resource = title_texture();
+        let tex = crate::resource::host_resource(resource).expect("host texture");
+        // The first list records the upload; at its submission it is noted.
+        let first = host.new_list().expect("host list");
+        crate::texture::upload(&first, resource, tex);
+        let staging = first
+            .deferred()
+            .copies
+            .iter()
+            .find_map(|step| match step {
+                super::Step::Texture(staging) => Some(staging.clone()),
+                _ => None,
+            })
+            .expect("a texture step");
+        for step in &first.deferred().copies {
+            if let super::Step::Host(work) = step {
+                work();
+            }
+        }
+        assert!(first.deferred().late_uploads.is_empty());
+        // The next list finds the host copy up to date and records nothing.
+        let next = host.new_list().expect("host list");
+        crate::texture::upload(&next, resource, tex);
+        assert_eq!(next.deferred().late_uploads.len(), 1);
+        next.close();
+        // Nothing changed: no prelude for it.
+        assert!(next.prelude().is_none());
+        // The check at submission detiles the changed memory.
+        staging.refresh();
+        assert!(next.prelude().is_some());
+        // Taken: a later prelude does not upload it again.
+        assert!(!staging.take_change());
+        first.close();
+        drop((first, next, staging));
+        release(resource);
     }
 }
 
@@ -4903,6 +4961,16 @@ impl HostList {
         const COPY_DEST: u32 = 0x400;
         const COPY_SOURCE: u32 = 0x800;
         let host_state = |state: u32| D3D12_RESOURCE_STATES(state as i32);
+        // Textures the list samples whose staging buffers the check at
+        // submission (run just before) found changed: uploaded here, in the
+        // queue's order, so the list samples what the title wrote.
+        let uploads: Vec<_> = self
+            .deferred()
+            .late_uploads
+            .iter()
+            .filter(|(staging, _)| staging.take_change())
+            .cloned()
+            .collect();
         let states = self.states.lock().unwrap_or_else(|e| e.into_inner());
         // The copies (depth texture, twin, whether into the twin); the
         // sides are then as this list leaves them.
@@ -4928,29 +4996,33 @@ impl HostList {
         let mut to_copy = Vec::new();
         let mut barriers = Vec::new();
         let mut copying = std::collections::HashMap::new();
-        for (depth, twin, colour) in &syncs {
-            let (from, to) = if *colour {
-                (depth, &twin.colour)
-            } else {
-                (&twin.colour, depth)
-            };
-            for (texture, state) in [(from, COPY_SOURCE), (to, COPY_DEST)] {
-                let key = std::sync::Arc::as_ptr(texture) as usize;
-                let real = texture.state.load(Ordering::Relaxed);
-                copying.insert(key, state);
-                if real != state {
-                    to_copy.push(transition(
+        let moves = syncs
+            .iter()
+            .flat_map(|(depth, twin, colour)| {
+                let (from, to) = if *colour {
+                    (depth, &twin.colour)
+                } else {
+                    (&twin.colour, depth)
+                };
+                [(from, COPY_SOURCE), (to, COPY_DEST)]
+            })
+            .chain(uploads.iter().map(|(_, copy)| (copy, COPY_DEST)));
+        for (texture, state) in moves {
+            let key = std::sync::Arc::as_ptr(texture) as usize;
+            let real = texture.state.load(Ordering::Relaxed);
+            copying.insert(key, state);
+            if real != state {
+                to_copy.push(transition(
+                    &texture.texture,
+                    host_state(real),
+                    host_state(state),
+                ));
+                if !states.contains_key(&key) {
+                    barriers.push(transition(
                         &texture.texture,
-                        host_state(real),
                         host_state(state),
+                        host_state(real),
                     ));
-                    if !states.contains_key(&key) {
-                        barriers.push(transition(
-                            &texture.texture,
-                            host_state(state),
-                            host_state(real),
-                        ));
-                    }
                 }
             }
         }
@@ -4960,7 +5032,7 @@ impl HostList {
             (real != *first)
                 .then(|| transition(&copy.texture, host_state(real), host_state(*first)))
         }));
-        if barriers.is_empty() && syncs.is_empty() {
+        if barriers.is_empty() && syncs.is_empty() && uploads.is_empty() {
             return None;
         }
         let Some((allocator, list)) = self
@@ -4980,6 +5052,9 @@ impl HostList {
                 }
                 for (depth, twin, colour) in &syncs {
                     record_twin_copy(list, &depth.texture, twin, *colour);
+                }
+                for (staging, copy) in &uploads {
+                    staging.record_copy(list, &copy.texture);
                 }
                 if !barriers.is_empty() {
                     list.ResourceBarrier(&barriers);
@@ -5292,6 +5367,16 @@ impl HostList {
     /// As [`HostList::defer`], for work that writes only host memory.
     pub(crate) fn defer_host(&self, work: impl Fn() + Send + 'static) {
         self.deferred().copies.push(Step::Host(Box::new(work)));
+    }
+
+    /// Uploads a texture's staging buffer into its host copy `copy` in
+    /// the list's prelude if the check at submission finds it changed.
+    pub(crate) fn defer_upload(
+        &self,
+        staging: std::sync::Arc<crate::texture::Staging>,
+        copy: std::sync::Arc<crate::resource::HostTexture>,
+    ) {
+        self.deferred().late_uploads.push((staging, copy));
     }
 
     /// Brings a texture's staging buffer up to date when the list is
