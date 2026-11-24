@@ -95,6 +95,8 @@ mod spin;
 pub mod validator;
 #[cfg(all(test, windows))]
 mod valu_tests;
+#[cfg(all(test, windows))]
+mod waterfall_tests;
 mod wave;
 
 use crate::dxbc::{Container, FourCC};
@@ -285,9 +287,12 @@ pub fn translate_for(container: &[u8], target: Target) -> Result<HostShader, Sha
             .iter()
             .all(|r| native.stage.user_sgpr(r.user_data) >= 16);
     let p = ir::build_with(&native.patched_code(), native.wave64, native.vgprs, spilled)?;
-    let res = resource::track(&p, &native.layout, native.stage)?;
+    // Structurisation first: tracing per-lane descriptors needs it (its
+    // failure is reported after the earlier stages').
+    let st = structure::structure(&p);
+    let res = resource::track(&p, &native.layout, native.stage, st.as_ref().ok())?;
     let io = io::raise(&p, &native)?;
-    let st = structure::structure(&p)?;
+    let st = st?;
     emit(&c, &native, &p, &st, &io, &res, target)
 }
 
@@ -340,6 +345,13 @@ pub fn emit(
             } else {
                 m
             };
+        }
+    }
+    // With a conservative depth output (SV_DepthLessEqual, GreaterEqual) DXIL
+    // wants the position centroid (or per sample), as DXC declares it then.
+    if pixel && outputs.iter().any(|e| matches!(e.kind, 18 | 19)) {
+        for e in inputs.iter_mut().filter(|e| e.kind == 3) {
+            e.interp = 5;
         }
     }
     // Per-primitive outputs are constant. The console never exports a
@@ -682,9 +694,9 @@ mod tests {
         let bytes = crate::dxbc::build(&[(FourCC::OSG1, &osg1)]);
         let c = Container::parse(&bytes).unwrap();
         let p = ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
-        let res = resource::track(&p, &native.layout, native.stage).unwrap();
-        let io = io::raise(&p, &native).unwrap();
         let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
         let out = emit(&c, &native, &p, &st, &io, &res, crate::emit::Target::ANY).unwrap();
         // dxil.dll, where there is one, checks the flags against the module.
         #[cfg(windows)]
@@ -724,9 +736,9 @@ mod tests {
             code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
         };
         let p = ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
-        let res = resource::track(&p, &native.layout, native.stage).unwrap();
-        let io = io::raise(&p, &native).unwrap();
         let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
         let container = crate::dxbc::build(&[]);
         let c = Container::parse(&container).unwrap();
         if let Err(e) = emit(&c, &native, &p, &st, &io, &res, Target::ANY) {
@@ -756,9 +768,9 @@ mod tests {
         };
         let refusal = |native: &NativeProgram| {
             let p = ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
-            let res = resource::track(&p, &native.layout, native.stage).unwrap();
-            let io = io::raise(&p, native).unwrap();
             let st = structure::structure(&p).unwrap();
+            let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+            let io = io::raise(&p, native).unwrap();
             let container = crate::dxbc::build(&[]);
             let c = Container::parse(&container).unwrap();
             emit(&c, native, &p, &st, &io, &res, crate::emit::Target::ANY)
@@ -796,6 +808,7 @@ mod tests {
     }
 
     /// A pixel shader writing a constant colour.
+    #[cfg(windows)]
     fn constant_color() -> Vec<u8> {
         let mut s = Shader::new(true);
         s.outputs.push(SigElement {
@@ -944,9 +957,10 @@ mod tests {
                 crate::dxbc::build(&[(super::FourCC::ISG1, &isg1), (super::FourCC::OSG1, &osg1)]);
             let c = super::Container::parse(&bytes).unwrap();
             let p = crate::ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
-            let res = crate::resource::track(&p, &native.layout, native.stage).unwrap();
-            let io = crate::io::raise(&p, &native).unwrap();
             let st = crate::structure::structure(&p).unwrap();
+            let res =
+                crate::resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+            let io = crate::io::raise(&p, &native).unwrap();
             let out = super::emit(&c, &native, &p, &st, &io, &res, crate::emit::Target::ANY).unwrap();
             // dxil.dll, where there is one, checks PSV0 against the module.
             #[cfg(windows)]
@@ -1013,9 +1027,9 @@ mod tests {
         let bytes = crate::dxbc::build(&[(super::FourCC::ISG1, &isg1)]);
         let c = super::Container::parse(&bytes).unwrap();
         let p = crate::ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
-        let res = crate::resource::track(&p, &native.layout, native.stage).unwrap();
-        let io = crate::io::raise(&p, &native).unwrap();
         let st = crate::structure::structure(&p).unwrap();
+        let res = crate::resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = crate::io::raise(&p, &native).unwrap();
         // Translated or refused with a reason; it must not panic.
         let _ = super::emit(&c, &native, &p, &st, &io, &res, Target::ANY);
     }
@@ -1052,9 +1066,9 @@ mod tests {
             parts: vec![],
         };
         let p = crate::ir::build(&native.code, native.wave64, native.vgprs)?;
-        let res = crate::resource::track(&p, &native.layout, native.stage)?;
-        let io = crate::io::raise(&p, native)?;
         let st = crate::structure::structure(&p)?;
+        let res = crate::resource::track(&p, &native.layout, native.stage, Some(&st))?;
+        let io = crate::io::raise(&p, native)?;
         super::emit(&c, native, &p, &st, &io, &res, target)
     }
 
@@ -1244,9 +1258,9 @@ mod tests {
             code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
         };
         let p = crate::ir::build(&native.code, native.wave64, native.vgprs).unwrap();
-        let res = crate::resource::track(&p, &native.layout, native.stage).unwrap();
-        let io = crate::io::raise(&p, &native).unwrap();
         let st = crate::structure::structure(&p).unwrap();
+        let res = crate::resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = crate::io::raise(&p, &native).unwrap();
         let l = super::lower::lower(&super::lower::Parts { target: crate::emit::Target::ANY, console_cf: false, per_lane_only: false,
             native: &native,
             p: &p,
@@ -1380,9 +1394,9 @@ mod tests {
             code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
         };
         let p = crate::ir::build(&native.code, native.wave64, native.vgprs).unwrap();
-        let res = crate::resource::track(&p, &native.layout, native.stage).unwrap();
-        let io = crate::io::raise(&p, &native).unwrap();
         let st = crate::structure::structure(&p).unwrap();
+        let res = crate::resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = crate::io::raise(&p, &native).unwrap();
         let l = super::lower::lower(&super::lower::Parts { target: crate::emit::Target::ANY, console_cf: false, per_lane_only: false,
             native: &native,
             p: &p,
@@ -1524,9 +1538,9 @@ mod tests {
             code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
         };
         let p = crate::ir::build(&native.code, native.wave64, native.vgprs).unwrap();
-        let res = crate::resource::track(&p, &native.layout, native.stage).unwrap();
-        let io = crate::io::raise(&p, &native).unwrap();
         let st = crate::structure::structure(&p).unwrap();
+        let res = crate::resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = crate::io::raise(&p, &native).unwrap();
         let l = super::lower::lower(&super::lower::Parts { target: crate::emit::Target::ANY, console_cf: false, per_lane_only: false,
             native: &native,
             p: &p,
@@ -1667,9 +1681,9 @@ mod tests {
             code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
         };
         let p = crate::ir::build(&native.code, native.wave64, native.vgprs).unwrap();
-        let res = crate::resource::track(&p, &native.layout, native.stage).unwrap();
-        let io = crate::io::raise(&p, &native).unwrap();
         let st = crate::structure::structure(&p).unwrap();
+        let res = crate::resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = crate::io::raise(&p, &native).unwrap();
         let l = super::lower::lower(&super::lower::Parts { target: crate::emit::Target::ANY, console_cf: false, per_lane_only: false,
             native: &native,
             p: &p,

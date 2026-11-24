@@ -10,7 +10,7 @@
 //! that does not decode cleanly is translated again.
 //!
 //! The entry is our own encoding of [`HostShader`]: a field added to it
-//! must be added to [`encode`] and [`decode`] and [`CACHE_SCHEMA_VERSION`]
+//! must be added to `encode` and `decode` and `CACHE_SCHEMA_VERSION`
 //! bumped.
 
 use std::path::PathBuf;

@@ -678,6 +678,37 @@ mod tests {
     }
 
     #[test]
+    fn empty_test_titles_env_is_ignored() {
+        let file = FilePaths {
+            test_titles: vec!["from-file".into()],
+            ..Default::default()
+        };
+        let env = |k: &str| match k {
+            "VICTORY_TEST_TITLES" => Some(OsString::new()),
+            "HOME" => Some(abs("home")),
+            _ => None,
+        };
+        let cfg = Config::resolve(file, None, env).unwrap();
+        assert_eq!(cfg.test_titles, vec![PathBuf::from("from-file")]);
+    }
+
+    #[test]
+    fn test_titles_env_splits_paths() {
+        let value = std::env::join_paths(["first", "second"]).unwrap();
+        let file = FilePaths::default();
+        let env = |k: &str| match k {
+            "VICTORY_TEST_TITLES" => Some(value.clone()),
+            "HOME" => Some(abs("home")),
+            _ => None,
+        };
+        let cfg = Config::resolve(file, None, env).unwrap();
+        assert_eq!(
+            cfg.test_titles,
+            vec![PathBuf::from("first"), PathBuf::from("second")]
+        );
+    }
+
+    #[test]
     fn example_config_parses() {
         let text = include_str!("../../../victory.example.toml");
         let parsed: FileConfig = toml::from_str(text).unwrap();
@@ -701,5 +732,15 @@ mod tests {
         } else {
             format!("/{p}").into()
         }
+    }
+
+    #[test]
+    fn data_inside_repo_is_refused() {
+        let inside = Path::new(env!("CARGO_MANIFEST_DIR")).join("data");
+        let cfg = Config {
+            data_dir: inside,
+            ..Default::default()
+        };
+        assert!(cfg.data_subdir("x").is_err());
     }
 }
