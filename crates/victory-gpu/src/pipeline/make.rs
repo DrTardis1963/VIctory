@@ -12,8 +12,18 @@
 //! bake) are there at once as before; past the budget a draw or dispatch
 //! whose pipeline is not ready is dropped, as an untranslated one is.
 //!
-//! The default budget is half a second per title frame. A pass the title
-//! runs only once and whose pipeline takes longer is lost.
+//! The default budget is half a second per title frame for the first
+//! [`WARMUP_FRAMES`] (boot and one-shot init passes compile reliably), then
+//! [`STEADY_MS`]: half a second in every frame that met a new pipeline made
+//! the intro and menus stutter while a cold library was filled. A pass the
+//! title runs only once and whose pipeline takes longer is lost.
+//!
+//! A dispatch is not dropped that way: what a compute pass writes is read
+//! later (by draws, other passes, the CPU), and a dropped one leaves that
+//! memory never written. Its first use waits until the pipeline is made,
+//! making it on the waiting thread if no worker has taken it yet, for at
+//! most [`COMPUTE_BOUND`]. Every compute pipeline is started when the title
+//! creates it, so the workers have usually made it by then.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
@@ -66,6 +76,10 @@ impl Pending {
         let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
         done.notify_all();
     }
+
+    fn compute(&self) -> bool {
+        matches!(self.shaders.as_slice(), [cs] if cs.stage == "compute")
+    }
 }
 
 /// Why a pipeline has no host pipeline (diagnostics): its shaders that do
@@ -94,17 +108,24 @@ pub(crate) fn missing(p: &Pending) -> Option<String> {
 /// Signalled whenever a worker has made a pipeline.
 static DONE: (Mutex<()>, Condvar) = (Mutex::new(()), Condvar::new());
 
-/// Waiting allowed per title frame, over all threads.
-fn wait_budget() -> Duration {
-    static BUDGET: OnceLock<Duration> = OnceLock::new();
-    *BUDGET.get_or_init(|| {
+/// Title frames that get [`WARMUP_MS`] of waiting.
+const WARMUP_FRAMES: u64 = 60;
+const WARMUP_MS: u64 = 500;
+/// Waiting per frame after the warm-up frames.
+const STEADY_MS: u64 = 8;
+
+/// Waiting allowed in title frame `frame`, over all threads;
+/// `VICTORY_PIPELINE_WAIT_MS` sets it for every frame.
+fn wait_budget(frame: u64) -> Duration {
+    static BUDGET: OnceLock<Option<Duration>> = OnceLock::new();
+    let set = *BUDGET.get_or_init(|| {
         let millis = std::env::var("VICTORY_PIPELINE_WAIT_MS")
             .ok()
-            .and_then(|value| value.trim().parse::<u64>().ok())
-            .unwrap_or(500);
-        tracing::info!(millis, "host pipeline wait budget per frame");
-        Duration::from_millis(millis)
-    })
+            .and_then(|value| value.trim().parse::<u64>().ok());
+        tracing::info!(?millis, "host pipeline wait budget per frame (none: {WARMUP_MS} ms, then {STEADY_MS} ms)");
+        millis.map(Duration::from_millis)
+    });
+    set.unwrap_or(Duration::from_millis(if frame < WARMUP_FRAMES { WARMUP_MS } else { STEADY_MS }))
 }
 
 /// Pipelines queued and not made yet.
@@ -124,10 +145,63 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
         super::library::note_used(&p.key);
     }
     if p.made.get().is_none() {
-        start(p, REQUESTED);
-        wait(p, crate::frame::current());
+        if p.compute() {
+            wait_compute(p);
+        } else {
+            start(p, REQUESTED);
+            wait(p, crate::frame::current());
+        }
     }
     p.made.get()?.as_ref()
+}
+
+/// Waiting allowed for one compute pipeline at its first use: beyond the
+/// slowest driver compiles seen (3.4 s), and below what a hung worker
+/// would cost.
+const COMPUTE_BOUND: Duration = Duration::from_secs(20);
+
+/// Makes `p` here if no worker has taken it, else waits for it up to
+/// [`COMPUTE_BOUND`]; outside the graphics budget.
+fn wait_compute(p: &Pending) {
+    let started = Instant::now();
+    let here = {
+        // Under the queue's lock, so a worker cannot claim it meanwhile.
+        let _queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+        match p.queue_state.swap(MAKING, Ordering::Relaxed) {
+            MAKING => false,
+            // Its early entry is now skipped by the workers: not counted.
+            EARLY => {
+                WAITING.fetch_sub(1, Ordering::Relaxed);
+                true
+            }
+            // Not queued, or queued as requested (a worker pops and counts
+            // that entry; making it again is a no-op).
+            _ => true,
+        }
+    };
+    if here {
+        p.make();
+    } else {
+        let (lock, done) = &DONE;
+        let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
+        while p.made.get().is_none() {
+            let rest = COMPUTE_BOUND.saturating_sub(started.elapsed());
+            if rest.is_zero() {
+                tracing::warn!(
+                    shaders = ?p.shaders,
+                    "a compute pipeline was not made within {} s: its dispatches are dropped until it is",
+                    COMPUTE_BOUND.as_secs()
+                );
+                break;
+            }
+            held = done.wait_timeout(held, rest).unwrap_or_else(|e| e.into_inner()).0;
+        }
+    }
+    #[cfg(feature = "diagnostics")]
+    crate::copystat::add(
+        crate::copystat::C::PipelineWaitUs,
+        started.elapsed().as_micros() as u64,
+    );
 }
 
 /// Makes `p` on this thread if it is not made yet (waiting for a worker
@@ -138,9 +212,11 @@ pub(crate) fn now(p: &Arc<Pending>) -> bool {
 }
 
 /// At the title's creation of a pipeline: starts it at once if an earlier
-/// run drew with it (during loading, so the world's first frames find it).
+/// run drew with it (during loading, so the world's first frames find it),
+/// and every compute pipeline: its first dispatch waits for it, and a frame
+/// that first dispatches hundreds of them (the world's) waited minutes.
 pub(crate) fn early(p: &Arc<Pending>) {
-    if !p.shaders.is_empty() && super::library::wanted_early(&p.key) {
+    if !p.shaders.is_empty() && (p.compute() || super::library::wanted_early(&p.key)) {
         super::library::EARLY.fetch_add(1, Ordering::Relaxed);
         start(p, EARLY);
     }
@@ -161,7 +237,7 @@ fn shared_budget() -> bool {
 
 /// Waits for `p` while frame `frame` has budget left.
 fn wait(p: &Pending, frame: u64) {
-    let budget = wait_budget();
+    let budget = wait_budget(frame);
     if budget.is_zero() {
         return;
     }
@@ -361,6 +437,23 @@ mod tests {
             std::thread::yield_now();
         }
         assert!(matches!(p.made.get(), Some(None)));
+    }
+
+    /// A compute pipeline is started at its creation, and its first dispatch
+    /// gets an answer instead of being dropped past the frame's budget.
+    #[test]
+    fn a_compute_pipeline_starts_early_and_its_dispatch_waits() {
+        let cs = Arc::new(super::super::Shader {
+            stage: "compute",
+            hash: "c0c0c0c0c0c0c0c0".to_owned(),
+            container: Vec::new(),
+            translated: OnceLock::new(),
+        });
+        let p = Arc::new(Pending::new(vec![cs], None));
+        early(&p);
+        assert_ne!(p.queue_state.load(Ordering::Relaxed), NOT_QUEUED);
+        assert!(ready(&p).is_none());
+        assert!(matches!(p.made.get(), Some(None)), "made, here or by a worker");
     }
 
     #[test]
