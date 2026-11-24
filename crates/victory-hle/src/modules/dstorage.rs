@@ -814,7 +814,7 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
             return Err(fail(E_INVALIDARG, "source larger than destination"));
         }
         let size = request.source_size as usize;
-        return into_destination(request, size, |out| read_into(request, out).map(|()| size))
+        return into_destination(request, size, |out| copy_into(request, out).map(|()| size))
             .map_err(|hr| fail(hr, "copying"));
     }
     let tables = if bc != 0 { Some(bcpack_tables()?) } else { None };
@@ -936,6 +936,35 @@ fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
     };
     READING.fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
     result
+}
+
+/// `HRESULT_FROM_WIN32` of `ERROR_NOACCESS` and `ERROR_INVALID_USER_BUFFER`:
+/// the kernel's read met a page it could not write.
+const NO_ACCESS: HRESULT = 0x8007_03E6_u32 as i32;
+const INVALID_USER_BUFFER: HRESULT = 0x8007_06F8_u32 as i32;
+
+/// [`read_into`] for an uncompressed request, straight into the
+/// destination. The destination was opened for the kernel
+/// (`victory_gpu::kernel_will_write`), but a texture check on another
+/// thread may guard it again before the read lands, and the kernel's write
+/// then fails (`ERROR_INVALID_USER_BUFFER`) where the title's own would
+/// fault into the guard; the title takes a failed request for a fatal one
+/// (an int3, run of 24/11). So such a read is done again into our memory
+/// and copied in by us, which the guard sees like the title's write.
+fn copy_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
+    match read_into(request, out) {
+        Err(NO_ACCESS | INVALID_USER_BUFFER) => {
+            let mut staged = vec![0; out.len()];
+            read_into(request, &mut staged)?;
+            if victory_gpu::write_title_memory(out.as_mut_ptr(), &staged) {
+                tracing::debug!(len = out.len(), "dstorage: a guarded destination, copied in");
+                Ok(())
+            } else {
+                Err(NO_ACCESS)
+            }
+        }
+        result => result,
+    }
 }
 
 /// Runs `fill` on the destination's first `len` bytes; `fill` returns how
@@ -1187,6 +1216,31 @@ mod tests {
         assert_eq!(raw, plain[5000..6000]);
         assert_eq!(inflated, plain);
         void(queue, 0x40);
+    }
+
+    /// A raw read the kernel cannot land is done again and copied in by us;
+    /// where that cannot write either (read-only memory no guard of ours
+    /// holds), the request fails with the host's error, no fault.
+    #[test]
+    fn raw_reads_into_read_only_memory_fail_cleanly() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READONLY, VirtualAlloc, VirtualFree,
+        };
+        let plain = pattern(6576);
+        let (_dir, file) = file_with(&plain);
+        // SAFETY: a fresh read-only allocation, freed at the end.
+        let at = unsafe { VirtualAlloc(std::ptr::null(), 8192, MEM_RESERVE | MEM_COMMIT, PAGE_READONLY) };
+        assert!(!at.is_null());
+        let (queue, array) = (new_queue(0), status_array(1));
+        enqueue(queue, &request(0, at, plain.len(), file, 0, plain.len()));
+        enqueue_status(queue, array, 0);
+        void(queue, 0x30);
+        assert!(matches!(wait(array, 0), NO_ACCESS | INVALID_USER_BUFFER));
+        // SAFETY: our readable allocation.
+        assert!(unsafe { std::slice::from_raw_parts(at.cast::<u8>(), 8192) }.iter().all(|&b| b == 0));
+        void(queue, 0x40);
+        // SAFETY: our allocation.
+        unsafe { VirtualFree(at, 0, MEM_RELEASE) };
     }
 
     #[test]
