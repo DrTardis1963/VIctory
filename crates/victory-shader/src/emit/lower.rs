@@ -209,6 +209,9 @@ struct Lower<'a> {
     /// site and the first dword its first leaf of that load takes
     /// ([`Self::descriptor_data`] asks this for every load it meets).
     loaded_by: HashMap<Site, Vec<(usize, Site, u8)>>,
+    /// The instructions that read each value, in program order: made when
+    /// [`Self::computed_with`] first asks.
+    readers: std::cell::OnceCell<HashMap<Value, Vec<&'a Inst>>>,
     exports: HashMap<Site, &'a Export>,
     interps: HashMap<Site, &'a Interp>,
     handles: HashMap<(usize, Site, u8, bool, (u32, u32)), V>,
@@ -1513,6 +1516,7 @@ impl<'a> Lower<'a> {
                 }
                 by
             },
+            readers: std::cell::OnceCell::new(),
             exports: x.io.exports.iter().map(|e| (e.site, e)).collect(),
             interps: x.io.interps.iter().map(|(s, i)| (*s, i)).collect(),
             handles: HashMap::new(),
@@ -2567,10 +2571,21 @@ impl<'a> Lower<'a> {
     /// waterfall loop keeps a descriptor's dwords per lane, reads the first
     /// lane's back and compares the lanes' with them.
     fn computed_with(&self, v: Value, depth: u32) -> bool {
-        self.x.p.blocks.iter().flat_map(|b| &b.insts).any(|i| {
-            if !i.reads.iter().any(|r| r.1 == v) {
-                return false;
+        // (asked for two dwords of every buffer descriptor read as data, and again for
+        // every move of them: not a walk of the whole program each time)
+        let readers = self.readers.get_or_init(|| {
+            let mut by: HashMap<Value, Vec<&'a Inst>> = HashMap::new();
+            for i in self.x.p.blocks.iter().flat_map(|b| &b.insts) {
+                for r in &i.reads {
+                    let of = by.entry(r.1).or_default();
+                    if !of.last().is_some_and(|&last| std::ptr::eq(last, i)) {
+                        of.push(i);
+                    }
+                }
             }
+            by
+        });
+        readers.get(&v).into_iter().flatten().any(|i| {
             let name = i.name();
             let moves = matches!(
                 name,
