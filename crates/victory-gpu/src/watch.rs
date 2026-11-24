@@ -88,12 +88,23 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
             &mut granularity,
         )
     } != 0;
+    #[cfg(feature = "diagnostics")]
+    {
+        use crate::copystat::{C, add};
+        add(C::WatchKernelUs, started.elapsed().as_micros() as u64);
+        add(C::WatchPages, (last - first) as u64);
+    }
     let guarded = if failed {
         count = 0;
         if !guarded {
             return None;
         }
-        guard(first * PAGE, last * PAGE)?
+        #[cfg(feature = "diagnostics")]
+        let guarding = std::time::Instant::now();
+        let pages = guard(first * PAGE, last * PAGE);
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::WatchGuardUs, crate::copystat::since(guarding));
+        pages?
     } else {
         Vec::new()
     };

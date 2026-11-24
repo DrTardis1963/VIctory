@@ -75,8 +75,13 @@ pub(crate) enum C {
     /// Plans made again because a slot was written (else memory or placed
     /// textures changed).
     PlansForSlots,
+    /// Of the write-watch time, microseconds in the kernel's answer and in
+    /// guarding view memory, and the 64 KiB pages asked about.
+    WatchKernelUs,
+    WatchGuardUs,
+    WatchPages,
 }
-const COUNTERS: usize = 44;
+const COUNTERS: usize = 47;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -197,6 +202,12 @@ pub(crate) fn log(frames: f64) {
         c[C::PlanSlots as usize],
         ms(c[C::PlanQueryUs as usize]),
         ms(c[C::PlanFindUs as usize]),
+    );
+    tracing::info!(
+        "write watch per frame: kernel {:.1} ms, view guards {:.1} ms, {:.0} pages asked",
+        ms(c[C::WatchKernelUs as usize]),
+        ms(c[C::WatchGuardUs as usize]),
+        c[C::WatchPages as usize],
     );
     tracing::info!(
         "texture uploads per frame: {:.0} copied {:.1} MB, {:.0} skipped unchanged {:.1} MB",
