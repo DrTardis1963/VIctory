@@ -125,7 +125,10 @@ impl Shadow {
     fn inside(&self, address: usize, len: usize) -> (usize, usize) {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let from = address.clamp(start, end);
-        (from - start, (address + len).clamp(from, end) - start)
+        (
+            from - start,
+            address.saturating_add(len).clamp(from, end) - start,
+        )
     }
 
     /// Shaders of `list` may write `[address, address + len)` of the copy
@@ -152,7 +155,7 @@ impl Shadow {
         self.pending
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .push((address, address + len));
+            .push((address, address.saturating_add(len)));
         let (from, to) = self.inside(address, len);
         // SAFETY: inside the mapping.
         let host = |a: usize, b: usize| unsafe { std::slice::from_raw_parts(self.data.add(a), b - a) };
@@ -250,7 +253,7 @@ impl Shadow {
         // Every submitted step that declared the range is done with it (one
         // submission runs at a time), and the snapshot with the last range.
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
-        pending.retain(|&r| r != (address, address + len));
+        pending.retain(|&r| r != (address, address.saturating_add(len)));
         if pending.is_empty()
             && let Some((_, bytes)) = snapshot.take()
         {
@@ -264,7 +267,7 @@ impl Shadow {
     /// write-watched). Returns the bytes copied.
     pub(crate) fn update(&self, address: usize, len: usize) -> usize {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
-        let (from, to) = (address.max(start), (address + len).min(end));
+        let (from, to) = (address.max(start), address.saturating_add(len).min(end));
         if from >= to {
             return 0;
         }
@@ -382,7 +385,7 @@ pub(crate) fn register(resource: usize, start: u64, len: u64) {
     buffers().insert(
         (start, resource),
         Entry {
-            end: start + len,
+            end: start.saturating_add(len),
             shadow: None,
         },
     );
@@ -413,7 +416,8 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
         let len = entry.end - key.0;
         // Rounded up so that views ending in the buffer's last 256 bytes fit.
         // Shaders write some buffers (unordered access), so not upload memory.
-        let (buffer, data) = host()?.shared_buffer(len.next_multiple_of(1 << 16))?;
+        let rounded = len.checked_next_multiple_of(1 << 16)?;
+        let (buffer, data) = host()?.shared_buffer(rounded)?;
         crate::host::name(&buffer, || format!("title buffer {:#x}+{len:#x}", key.0));
         // SAFETY: a live buffer.
         let gpu = unsafe { buffer.GetGPUVirtualAddress() };
@@ -447,7 +451,7 @@ static LOOSE: Mutex<BTreeMap<(u64, u64), Arc<Shadow>>> = Mutex::new(BTreeMap::ne
 
 fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
     let start = address & !(WINDOW - 1);
-    let len = end.next_multiple_of(WINDOW) - start;
+    let len = end.checked_next_multiple_of(WINDOW)?.checked_sub(start)?;
     let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(shadow) = map.get(&(start, len)) {
         return Some(shadow.clone());
@@ -496,4 +500,26 @@ pub(crate) fn near(va: u64) -> String {
         ));
     }
     text
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn loose_near_u64_max_returns_none_instead_of_panicking() {
+        assert!(find(u64::MAX - 0x100, 0x10).is_none());
+    }
+
+    #[test]
+    fn shadow_range_clamping_saturates_overflowing_lengths() {
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let (buffer, data) = host.shared_buffer(4096).expect("host shared buffer");
+        // SAFETY: a live buffer from `shared_buffer`.
+        let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+        let shadow = Shadow::new(buffer, data, gpu, 0x1_0000_0000, 4096);
+        assert_eq!(shadow.inside(0x1_0000_0010, usize::MAX), (0x10, 4096));
+    }
 }
