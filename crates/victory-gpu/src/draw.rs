@@ -19,10 +19,7 @@ use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
 use windows::core::Interface;
 
-use crate::host::{
-    BUFFER_INDEX, BUFFER_SHADER_RESOURCE, BUFFER_UAV, BUFFER_VERTEX_CONSTANT,
-    HostList,
-};
+use crate::host::HostList;
 use crate::object::This;
 use crate::pipeline::host::HostPipeline;
 
@@ -195,12 +192,6 @@ fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
     let gpu = shadow.gpu(address);
     if srv || gpu % 256 == 0 {
         shadow.refresh(list, address, len);
-        // Read by the draw or dispatch: the copy must be in a state it can
-        // be, not the one an earlier pass that wrote it left it in.
-        list.want_buffer(
-            &shadow,
-            if srv { BUFFER_SHADER_RESOURCE } else { BUFFER_VERTEX_CONSTANT },
-        );
         return Some(gpu);
     }
     let (gpu, to) = list.scratch(len)?;
@@ -550,10 +541,6 @@ impl State {
                 continue;
             };
             shadow.refresh(list, v.address, u64::from(v.size));
-            // Vertex data a compute pass wrote is in unordered access: the
-            // copy is moved before the list binds it (a bound buffer in a
-            // state that is not a vertex buffer's removes the device).
-            list.buffer_state(&shadow, BUFFER_VERTEX_CONSTANT);
             *view = D3D12_VERTEX_BUFFER_VIEW {
                 BufferLocation: shadow.gpu(v.address),
                 SizeInBytes: v.size,
@@ -572,7 +559,6 @@ impl State {
                 return false;
             };
             shadow.refresh(list, v.address, u64::from(v.size));
-            list.buffer_state(&shadow, BUFFER_INDEX);
             let view = D3D12_INDEX_BUFFER_VIEW {
                 BufferLocation: shadow.gpu(v.address),
                 SizeInBytes: v.size,
@@ -735,9 +721,6 @@ impl State {
                 }
             }
         }
-        // Every buffer copy the stages read or write, each in the one state
-        // its uses allow together.
-        list.settle_buffers();
         true
     }
 
@@ -1296,14 +1279,6 @@ impl State {
             s.refresh(list, *at, 4);
         }
         let count_buffer = counter.as_ref().map(|(s, _)| &s.buffer);
-        // Indirect code takes its buffers in the common state and leaves
-        // them there (`indirect::done`).
-        // shortcut: a pass that also reads its own arguments' copy sees it
-        // tracked as common; track the indirect states if that shows up.
-        list.buffer_common(&args);
-        if let Some((s, _)) = &counter {
-            list.buffer_common(s);
-        }
         // Bounded first: the clamp binds a compute pipeline of its own.
         if !crate::indirect::bound(
             list,
@@ -1447,12 +1422,6 @@ fn readable(list: &HostList, u: &UsedResource, view: &View) {
         shadow.refresh(list, address, len);
         if u.kind == ResourceType::Uav {
             shadow.gpu_writes(list, address, len);
-        }
-        match u.kind {
-            ResourceType::Uav => list.want_buffer(&shadow, BUFFER_UAV),
-            ResourceType::Srv => list.want_buffer(&shadow, BUFFER_SHADER_RESOURCE),
-            ResourceType::Cbv => list.want_buffer(&shadow, BUFFER_VERTEX_CONSTANT),
-            _ => {}
         }
     }
     match (view, u.kind) {
