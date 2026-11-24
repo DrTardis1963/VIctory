@@ -6724,6 +6724,72 @@ mod tests {
     }
 
     #[test]
+    fn lds_subdword_reads_and_writes_lower() {
+        // Allocate 128 dwords (512 bytes) of LDS via COMPUTE_PGM_RSRC2[23:15] = 1.
+        let ds = |op: u32, off: u32, addr: u32, data0: u32, dst: u32| -> [u32; 2] {
+            [
+                0xD800_0000 | (op << 18) | (off & 0xFFFF),
+                (dst << 24) | (data0 << 8) | addr,
+            ]
+        };
+        let mut words = vec![
+            0x7E00_0280, // v_mov_b32 v0, 0  (base address)
+            0x7E02_0281, // v_mov_b32 v1, 1  (value)
+        ];
+        // Writes at odd byte and 2-byte offsets, then all sub-dword read forms
+        // (including _d16 / _d16_hi which preserve the untouched half of vdst).
+        for inst in [
+            ds(0x01e, 1, 0, 1, 0), // ds_write_b8 v0, v1 offset:1
+            ds(0x01f, 2, 0, 1, 0), // ds_write_b16 v0, v1 offset:2
+            ds(0x0a0, 3, 0, 1, 0), // ds_write_b8_d16_hi v0, v1 offset:3
+            ds(0x0a1, 4, 0, 1, 0), // ds_write_b16_d16_hi v0, v1 offset:4
+            ds(0x039, 1, 0, 0, 2), // ds_read_i8 v2, v0 offset:1
+            ds(0x03a, 1, 0, 0, 2), // ds_read_u8 v2, v0 offset:1
+            ds(0x03b, 2, 0, 0, 2), // ds_read_i16 v2, v0 offset:2
+            ds(0x03c, 2, 0, 0, 2), // ds_read_u16 v2, v0 offset:2
+            ds(0x0a2, 1, 0, 0, 2), // ds_read_u8_d16 v2, v0 offset:1
+            ds(0x0a3, 1, 0, 0, 2), // ds_read_u8_d16_hi v2, v0 offset:1
+            ds(0x0a4, 1, 0, 0, 2), // ds_read_i8_d16 v2, v0 offset:1
+            ds(0x0a5, 1, 0, 0, 2), // ds_read_i8_d16_hi v2, v0 offset:1
+            ds(0x0a6, 2, 0, 0, 2), // ds_read_u16_d16 v2, v0 offset:2
+            ds(0x0a7, 2, 0, 0, 2), // ds_read_u16_d16_hi v2, v0 offset:2
+            ds(0x00d, 8, 0, 2, 0), // ds_write_b32 v0, v2 offset:8 (keep reads live)
+        ] {
+            words.extend_from_slice(&inst);
+        }
+        words.push(S_ENDPGM);
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 256,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 1 << 15,
+                threads: [1, 1, 1],
+            }),
+            code,
+        };
+        let p = ir::build(&native.code, false, 256).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let st = structure::structure(&p).unwrap();
+        lower(&Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: vec![],
+            outputs: vec![],
+            prims: vec![],
+            mesh_stride: 0,
+        })
+        .unwrap();
+    }
+
+    #[test]
     fn buffer_formats_by_number() {
         // The numbers the disassembler names 8_8_8_8_UNORM, 16_16_SNORM,
         // 2_10_10_10_UNORM, 16_FLOAT, 32_32_32_32_FLOAT.
