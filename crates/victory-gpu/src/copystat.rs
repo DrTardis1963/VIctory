@@ -748,7 +748,8 @@ fn log_memory() {
          depth and unordered access textures {:.0} MB (twins {:.0} MB; {:.0} MB of them share \
          title memory with another, which spans {:.0} MB; {:.0} MB at the address of another \
          with the same description; {} larger than their title memory; {} let go as their \
-         title memory was unmapped, {:.0} MB, since the start), textures the title fills \
+         title memory was unmapped, {:.0} MB, and {} taken from a texture at the same \
+         address with the same description, since the start), textures the title fills \
          {:.0} MB, title buffers {:.0} MB (and {:.0} MB before-twins), windows {:.0} MB, the rest \
          (lists, views, scratch, the swap chain, the driver) {:.0} MB; the PC's memory the card \
          reads: {:.0} MB in use, of it windows {:.0} MB and title buffers' copies {:.0} MB",
@@ -762,6 +763,7 @@ fn log_memory() {
         targets[3],
         targets[4],
         mb(targets[5]),
+        crate::resource::SHARED_TARGETS.load(Relaxed),
         mb(census[5]),
         mb(on_card[0]),
         mb(on_card[1]),
