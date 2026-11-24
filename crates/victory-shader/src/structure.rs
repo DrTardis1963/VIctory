@@ -446,6 +446,13 @@ impl Structured {
     }
 }
 
+/// `inst` is `name` with no input or output modifiers.
+fn plain_lane_op(inst: &Inst, name: &str) -> bool {
+    inst.name() == name
+        && matches!(&inst.fields, Fields::Valu(v)
+            if v.abs == 0 && v.neg == 0 && v.opsel == 0 && v.sdwa.is_none() && v.dpp.is_none())
+}
+
 /// Builds the per-lane form of `program`.
 pub fn structure(program: &Program) -> Result<Structured, ShaderError> {
     run(Lanes::new(program, false)?)
@@ -509,6 +516,8 @@ struct Lanes<'a> {
     when: Vec<Option<Bool>>,
     /// See [`Structured::active`].
     active: HashSet<Value>,
+    /// Immediate dominator per block.
+    idom: Vec<usize>,
 }
 
 /// A mask join taken as `value` in every lane that reaches `block`: each
@@ -556,9 +565,11 @@ impl<'a> Lanes<'a> {
                 }
             }
         }
+        let idom = crate::ir::idoms(blocks, &order, &index);
         Ok(Lanes {
             p,
             console,
+            idom,
             order,
             index,
             incoming,
@@ -729,7 +740,11 @@ impl<'a> Lanes<'a> {
                 .filter(|(lo, hi)| lo != hi)
                 .map(|&(lo, hi)| (hi, lo))
                 .collect(),
-            paired_masks: if self.p.wave64 { self.masks } else { Map::default() },
+            paired_masks: if self.p.wave64 {
+                self.masks
+            } else {
+                Map::default()
+            },
             active: self.active,
             bools: self.b,
             exits,
@@ -772,6 +787,10 @@ impl<'a> Lanes<'a> {
         }
         if let Some(&m) = self.other.get(&k) {
             return (m, false);
+        }
+        if let Some(m) = self.restored(k) {
+            self.masks.insert(k, m);
+            return (m, true);
         }
         let p = self.p;
         let (m, derived) = match self.join(k) {
@@ -971,6 +990,103 @@ impl<'a> Lanes<'a> {
         })
     }
 
+    /// A mask the compiler spilled to VGPR lanes (`v_writelane_b32`, one
+    /// lane per dword) and `k` reads back (`v_readlane_b32` of the same
+    /// lanes): each lane's bit is the one it had when spilled.
+    fn restored(&self, k: Key) -> Option<Bool> {
+        let lo = self.spilled(k.0)?;
+        let hi = if self.p.wave64 {
+            self.spilled(k.1)?
+        } else {
+            lo
+        };
+        self.masks.get(&(lo, hi)).copied()
+    }
+
+    /// The scalar value a `v_readlane_b32` of a constant lane reads back
+    /// from a `v_writelane_b32` of that lane, where it dominates the read.
+    fn spilled(&self, v: Value) -> Option<Value> {
+        let &(b, i) = self.defs.get(&v)?;
+        let inst = &self.p.blocks[b].insts[i];
+        let Fields::Valu(r) = &inst.fields else {
+            return None;
+        };
+        let (true, [Operand::Vector { reg, .. }, at]) =
+            (plain_lane_op(inst, "v_readlane_b32"), &r.src[..])
+        else {
+            return None;
+        };
+        let lane = self.const_lane(*at)?;
+        let s = self
+            .lane_write(inst.read(Reg::V(*reg))?, lane, &mut Vec::new())
+            .ok()??;
+        let born = self.defs.get(&s).map_or(self.order[0], |d| d.0);
+        self.dominates(born, b).then_some(s)
+    }
+
+    /// The scalar value written to `lane` of the VGPR value `v`, through
+    /// writes of other lanes and joins that agree on it (none on a cycle).
+    fn lane_write(&self, v: Value, lane: u32, seen: &mut Vec<Value>) -> Result<Option<Value>, ()> {
+        if let Some(&(b, i)) = self.phis.get(&v) {
+            if seen.contains(&v) {
+                return Ok(None);
+            }
+            seen.push(v);
+            let mut found = None;
+            for &arg in &self.p.blocks[b].phis[i].args {
+                if let Some(s) = self.lane_write(arg, lane, seen)? {
+                    if found.is_some_and(|f| f != s) {
+                        return Err(());
+                    }
+                    found = Some(s);
+                }
+            }
+            return Ok(found);
+        }
+        let &(b, i) = self.defs.get(&v).ok_or(())?;
+        let inst = &self.p.blocks[b].insts[i];
+        let Fields::Valu(w) = &inst.fields else {
+            return Err(());
+        };
+        let (true, Some(Operand::Vector { reg, .. }), [value, at]) =
+            (plain_lane_op(inst, "v_writelane_b32"), w.dst, &w.src[..])
+        else {
+            return Err(());
+        };
+        if self.const_lane(*at).ok_or(())? != lane {
+            return self.lane_write(inst.read(Reg::V(reg)).ok_or(())?, lane, seen);
+        }
+        match *value {
+            Operand::Scalar { code, .. } if code != NULL => {
+                inst.read(Reg::S(code)).map(Some).ok_or(())
+            }
+            _ => Err(()),
+        }
+    }
+
+    fn const_lane(&self, op: Operand) -> Option<u32> {
+        let raw = match op {
+            Operand::Const(c) => crate::resource::inline(c)?,
+            Operand::Literal(x) => x,
+            _ => return None,
+        };
+        Some(raw & if self.p.wave64 { 63 } else { 31 })
+    }
+
+    fn dominates(&self, a: usize, mut b: usize) -> bool {
+        if self.index[a] == usize::MAX || self.index[b] == usize::MAX {
+            return false;
+        }
+        while b != a {
+            let d = self.idom[b];
+            if d == b || d == usize::MAX {
+                return false;
+            }
+            b = d;
+        }
+        true
+    }
+
     fn combine(&mut self, f: &str, a: Bool, c: Bool) -> Option<Bool> {
         let b = &mut self.b;
         Some(match f {
@@ -1021,7 +1137,9 @@ impl<'a> Lanes<'a> {
                         && let Some(k) = self.key(|r| inst.read(r), code)
                     {
                         let phi = self.phis.contains_key(&k.0) || self.phis.contains_key(&k.1);
-                        takes_mask |= self.masks.contains_key(&k) || phi && self.mask(k).1;
+                        takes_mask |= self.masks.contains_key(&k)
+                            || phi && self.mask(k).1
+                            || self.restored(k).is_some();
                     }
                 }
                 let touches_exec =
@@ -1262,6 +1380,33 @@ mod tests {
         assert_eq!(s.guards[0][0], None, "the compare runs in every lane");
         let g = s.guards[0][1].expect("guard");
         assert!(matches!(s.bools.support(g)[..], [Atom::Lane(_)]));
+    }
+
+    #[test]
+    fn a_mask_spilled_to_vgpr_lanes_reads_back_as_itself() {
+        let words = [
+            0x7D84_0080, // v_cmp_eq_u32 vcc, 0, v0
+            0xD761_0001, // v_writelane_b32 v1, vcc_lo, 0
+            0x0001_006A,
+            0xD761_0001, // v_writelane_b32 v1, vcc_hi, 1
+            0x0001_026B,
+            0xD760_0004, // v_readlane_b32 s4, v1, 0
+            0x0001_0101,
+            0xD760_0005, // v_readlane_b32 s5, v1, 1
+            0x0001_0301,
+            0xBE86_2404, // s_and_saveexec_b64 s[6:7], s[4:5]
+            0x7E04_0280, // v_mov_b32 v2, 0
+            S_ENDPGM,
+        ];
+        let s = structure(&build(&words, true)).unwrap();
+        let g = s.guards[0][6].expect("guard");
+        assert!(matches!(s.bools.support(g)[..], [Atom::Lane(_)]));
+        // Reading back lanes the spill did not write stays opaque.
+        let mut other = words;
+        other[8] = 0x0001_0501; // v_readlane_b32 s5, v1, 2
+        let s = structure(&build(&other, true)).unwrap();
+        let g = s.guards[0][6].expect("guard");
+        assert!(!matches!(s.bools.support(g)[..], [Atom::Lane(_)]));
     }
 
     #[test]
