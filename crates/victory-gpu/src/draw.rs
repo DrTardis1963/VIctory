@@ -2014,6 +2014,9 @@ impl State {
                             host.make_null_constant(index);
                             continue;
                         };
+                        // Only what a shader can index is copied (#1640).
+                        let size = size.min(crate::descriptor::host::CONSTANT_MOST);
+                        let padded = padded.min(crate::descriptor::host::CONSTANT_MOST);
                         let Some((gpu, to)) = list.scratch(u64::from(padded)) else {
                             host.make_null_constant(index);
                             continue;

@@ -1234,7 +1234,7 @@ impl HostHeap {
         let Some(host) = host() else { return };
         let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
             BufferLocation: gpu,
-            SizeInBytes: padded,
+            SizeInBytes: constant_bytes(padded),
         };
         // SAFETY: a slot of our heap; the memory is the caller's.
         unsafe {
@@ -1906,6 +1906,17 @@ fn adjust_srv_for_dropped_mips(
     }
 }
 
+/// The most bytes a constant buffer view covers: the 64 KiB a shader can
+/// index. The host removes the device for a larger view, and the title's
+/// heap holds such sizes in slots it does not use (port of PR #1640).
+pub(crate) const CONSTANT_MOST: u32 = 64 << 10;
+
+/// The bytes of the host's constant buffer view for a title's of `size`:
+/// whole 256s, and at most [`CONSTANT_MOST`].
+fn constant_bytes(size: u32) -> u32 {
+    size.min(CONSTANT_MOST).next_multiple_of(256)
+}
+
 /// Makes the host descriptor for `view` at `at`: the host resource it
 /// views, or `None` if it cannot.
 fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
@@ -1921,7 +1932,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                 return None;
             }
             let padded = size.checked_next_multiple_of(256)?;
-            let shadow = crate::shadow::find(address, u64::from(size))?;
+            let shadow = crate::shadow::find(address, u64::from(size.min(CONSTANT_MOST)))?;
             let gpu = shadow.gpu(address);
             if gpu % 256 != 0 {
                 once!(
@@ -1932,7 +1943,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             }
             let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
                 BufferLocation: gpu,
-                SizeInBytes: padded,
+                SizeInBytes: constant_bytes(padded),
             };
             // SAFETY: a slot of our heap; the range lies in the host copy.
             unsafe { device.CreateConstantBufferView(Some(&desc), at) };
@@ -2365,6 +2376,26 @@ mod tests {
         null_for(&view, heap.cpu(0));
         // SAFETY: a plain device query.
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+    }
+
+    /// A constant buffer view larger than the host takes is cut to what it
+    /// takes: the device, which such a view removes, stays.
+    #[test]
+    fn an_oversized_constant_buffer_view_leaves_the_device_alive() {
+        let Some(host) = host() else {
+            return; // no host GPU
+        };
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return;
+        };
+        let (buffer, _) = host.upload_buffer(1 << 20).expect("an upload buffer");
+        // SAFETY: a live upload buffer.
+        heap.constant_at(1, unsafe { buffer.GetGPUVirtualAddress() }, 969_472);
+        // SAFETY: a plain device query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+        assert_eq!(constant_bytes(480), 512);
+        assert_eq!(constant_bytes(64 << 10), 64 << 10);
+        assert_eq!(constant_bytes(u32::MAX), 64 << 10);
     }
 
     #[test]
