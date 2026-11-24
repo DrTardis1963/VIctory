@@ -12,14 +12,20 @@
 //! bake) are there at once as before; past the budget a draw or dispatch
 //! whose pipeline is not ready is dropped, as an untranslated one is.
 //!
-//! The default budget is half a second per title frame. A pass the title
-//! runs only once and whose pipeline takes longer is lost. Passes over the
+//! The default budget is half a second per title frame for the first
+//! [`WARMUP_FRAMES`] (boot and one-shot init passes compile reliably), then
+//! [`STEADY_MS`]: half a second in every frame that met a new pipeline made
+//! the intro and menus stutter while a cold library was filled. A pass the
+//! title runs only once and whose pipeline takes longer is lost.
+//! Passes over the
 //! screen (no vertex input, no depth) have workers and a longer budget of
 //! their own ([`screen_budget`]): the title fills its lighting tables with
 //! such draws once, at the world's first frame, and behind a world's worth of
 //! pipelines they were dropped; that run had no lamps and no diffuse light to
 //! its end (run textures-d2, the first after a new translation; Belobug
 //! 18e57db8 found the same).
+//! Every compute pipeline is started when the title creates it, so the
+//! workers have usually made it by its first dispatch.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
@@ -120,17 +126,24 @@ pub(crate) fn hashes(p: &Pending) -> String {
 /// Signalled whenever a worker has made a pipeline.
 static DONE: (Mutex<()>, Condvar) = (Mutex::new(()), Condvar::new());
 
-/// Waiting allowed per title frame, over all threads.
-fn wait_budget() -> Duration {
-    static BUDGET: OnceLock<Duration> = OnceLock::new();
-    *BUDGET.get_or_init(|| {
+/// Title frames that get [`WARMUP_MS`] of waiting.
+const WARMUP_FRAMES: u64 = 60;
+const WARMUP_MS: u64 = 500;
+/// Waiting per frame after the warm-up frames.
+const STEADY_MS: u64 = 8;
+
+/// Waiting allowed in title frame `frame`, over all threads;
+/// `VICTORY_PIPELINE_WAIT_MS` sets it for every frame.
+fn wait_budget(frame: u64) -> Duration {
+    static BUDGET: OnceLock<Option<Duration>> = OnceLock::new();
+    let set = *BUDGET.get_or_init(|| {
         let millis = std::env::var("VICTORY_PIPELINE_WAIT_MS")
             .ok()
-            .and_then(|value| value.trim().parse::<u64>().ok())
-            .unwrap_or(500);
-        tracing::info!(millis, "host pipeline wait budget per frame");
-        Duration::from_millis(millis)
-    })
+            .and_then(|value| value.trim().parse::<u64>().ok());
+        tracing::info!(?millis, "host pipeline wait budget per frame (none: {WARMUP_MS} ms, then {STEADY_MS} ms)");
+        millis.map(Duration::from_millis)
+    });
+    set.unwrap_or(Duration::from_millis(if frame < WARMUP_FRAMES { WARMUP_MS } else { STEADY_MS }))
 }
 
 /// As [`wait_budget`], for passes over the screen (`VICTORY_SCREEN_WAIT_MS`,
@@ -205,7 +218,7 @@ fn shared_budget() -> bool {
 /// Waits for `p` while frame `frame` has budget left.
 fn wait(p: &Pending, frame: u64) {
     let screen = p.screen && screens_first();
-    let budget = if screen { screen_budget() } else { wait_budget() };
+    let budget = if screen { screen_budget() } else { wait_budget(frame) };
     if budget.is_zero() {
         return;
     }
