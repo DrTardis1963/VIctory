@@ -6222,6 +6222,8 @@ mod direct_copy {
 /// fail there instead). False if a page of `dst` is not writable for any
 /// other reason; the bytes before it may have landed.
 #[cfg(target_arch = "x86_64")]
+// A fault at `dst` is caught and reported as false, so the call is safe.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub fn write_title_memory(dst: *mut u8, src: &[u8]) -> bool {
     // SAFETY: `src` is the caller's; faults at `dst` are caught by `try_copy`.
     unsafe { direct_copy::try_copy(dst, src.as_ptr(), src.len()) }
