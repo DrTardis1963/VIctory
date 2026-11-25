@@ -113,9 +113,9 @@ pub use sampler::StaticSampler;
 pub use lower::{host_max_wave, host_rovs, set_host_max_wave, set_host_rovs};
 pub use rect::rect_list_gs;
 pub use shader::{
-    MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_ADDRESSES, SLOT_FAULTS, SLOT_HEAP_USED,
+    MEMORY_DIRTY_DWORDS, MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_ADDRESSES, SLOT_FAULTS, SLOT_HEAP_USED,
     SLOT_MEMORY, SLOT_STRIDES, SLOT_STRIDES_COUNT, SLOT_TABLE_DWORDS, USER_DATA_SPACE, USER_MEMORY_BASE,
-    USER_VIEW_ADDRESS, USER_VIEW_BIAS, heap_usage_marks, set_view_heap_limit, view_heap_limit,
+    USER_THREAD_LIMIT, USER_VIEW_ADDRESS, USER_VIEW_BIAS, heap_usage_marks, set_view_heap_limit, view_heap_limit,
 };
 
 /// The loop limit without an override: 2^20.
@@ -291,7 +291,7 @@ fn translate_plain(container: &[u8]) -> Result<HostShader, ShaderError> {
     let dxil = c
         .part(FourCC::DXIL)
         .ok_or(ShaderError::Malformed("no DXIL part"))?;
-    let native = crate::native_programs(dxil.data)?
+    let mut native = crate::native_programs(dxil.data)?
         .into_iter()
         .find(|p| {
             matches!(
@@ -303,6 +303,7 @@ fn translate_plain(container: &[u8]) -> Result<HostShader, ShaderError> {
             offset: 0,
             what: "a container without a vertex, pixel, compute or mesh program",
         })?;
+    crate::spill::limit_threads(&mut native);
     let p = crate::spill::build(&native)?;
     // Structurisation first: tracing per-lane descriptors needs it (its
     // failure is reported after the earlier stages').

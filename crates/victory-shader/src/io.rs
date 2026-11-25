@@ -66,6 +66,9 @@ pub enum Input {
     ThreadIdInGroup(u8),
     /// Compute: the thread-group info SGPR (wave index and count).
     GroupInfo,
+    /// Compute: the threads of this group along x that the dispatch
+    /// launches ([`crate::spill::limit_threads`]).
+    ThreadLimit,
     /// Mesh: v5, the group id times the group size (read as uniform).
     MeshGroup,
     /// Mesh: s3, the wave's index in the group in bits 24-27.
@@ -240,6 +243,7 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
                 }
             }
             loaded.extend(info.map(|s| (Reg::S(s), Input::GroupInfo)));
+            loaded.extend(crate::spill::thread_limit(native).map(|s| (Reg::S(s), Input::ThreadLimit)));
             (loaded, &[][..], &[][..])
         }
         (StageIo::Ms(ms), HwStage::Ms) => {

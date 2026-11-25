@@ -259,6 +259,9 @@ pub(crate) struct State {
     depth_bounds: Option<[f32; 2]>,
     /// Active indirect argument windows clamped in this list ([`windows`]).
     windows: Vec<Window>,
+    /// The threads along x of the dispatch by thread count being bound
+    /// (`victory_shader::emit::USER_THREAD_LIMIT`).
+    thread_limit: u32,
     /// What the host list has: pipeline, root signature, heaps.
     host_pipeline: usize,
     /// Graphics, compute.
@@ -912,9 +915,12 @@ impl State {
         dword: u32,
         memory: Option<&crate::memory::Ready>,
     ) -> u32 {
-        use victory_shader::emit::{USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS};
+        use victory_shader::emit::{USER_MEMORY_BASE, USER_THREAD_LIMIT, USER_VIEW_ADDRESS, USER_VIEW_BIAS};
         if kind == USER_MEMORY_BASE {
             return memory.map_or(0, |m| m.base);
+        }
+        if kind == USER_THREAD_LIMIT {
+            return self.thread_limit;
         }
         if kind == USER_VIEW_BIAS {
             // The view begins on 16 bytes of the copy the address finds
@@ -953,20 +959,23 @@ impl State {
     /// For a shader that reads title memory by address
     /// ([`crate::memory`]): its directory, fault notes and view slots,
     /// with the pages of the root views the list has set made ready.
-    fn memory_ready(&self, list: &HostList, compute: bool, writes: bool) -> Option<crate::memory::Ready> {
+    fn memory_ready(&self, list: &HostList, uavs: &[(u8, u32)], compute: bool, writes: bool) -> Option<crate::memory::Ready> {
         let heap = match self.heaps[0] {
             0 => None,
             h => crate::descriptor::heap(h as This).host(),
         }?;
-        let (mut addresses, mut constants) = (Vec::new(), Vec::new());
-        for root in self.roots_ref(compute) {
+        // The root views the shader stores through (`uavs`: its root
+        // UAVs' slots), the others, and the constants.
+        let (mut read, mut written, mut constants) = (Vec::new(), Vec::new(), Vec::new());
+        for (slot, root) in self.roots_ref(compute).iter().enumerate() {
             match root {
-                Root::View(address) => addresses.push(*address),
+                Root::View(address) if uavs.iter().any(|&(s, _)| usize::from(s) == slot) => written.push(*address),
+                Root::View(address) => read.push(*address),
                 Root::Constants(values) => constants.extend_from_slice(values),
                 _ => {}
             }
         }
-        crate::memory::ready(list, heap, &addresses, &constants, writes)
+        crate::memory::ready(list, heap, &read, &written, &constants, writes)
     }
 
     /// The bound heap holding `handle`.
@@ -1156,7 +1165,7 @@ impl State {
                 && !crate::pipeline::builder_quarantined(self.pipeline as This);
             // Title memory by address: what the shader finds it by.
             let memory = if t.host.root_srvs.contains(&victory_shader::emit::SLOT_MEMORY) {
-                let Some(ready) = self.memory_ready(list, compute, writes) else {
+                let Some(ready) = self.memory_ready(list, &stage.root_uavs, compute, writes) else {
                     once!("a shader that reads title memory by address without a view heap to hold its views: the draw is dropped");
                     return false;
                 };
@@ -2238,8 +2247,9 @@ impl State {
         });
     }
 
-    /// Runs a dispatch on the host.
-    pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
+    /// Runs a dispatch on the host. `threads`: `x`, `y` and `z` count
+    /// threads, not groups (the console's thread-dimensions flag).
+    pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32, threads: bool) {
         // It may write the arguments active windows hold clamped.
         self.windows.clear();
         #[cfg(feature = "diagnostics")]
@@ -2287,6 +2297,30 @@ impl State {
             once!("a dispatch with a graphics pipeline");
             return;
         }
+        // By thread count, the console's last group is partial. The host
+        // runs whole groups; the program leaves out the threads past the
+        // count along x if it was translated for that
+        // (`victory_shader::spill::limit_threads`).
+        self.thread_limit = u32::MAX;
+        let [x, y, z] = if threads {
+            let t = p.stages[0].translated();
+            let limited = t
+                .host
+                .user_data
+                .iter()
+                .any(|u| u.root == RootType::Other(victory_shader::emit::USER_THREAD_LIMIT));
+            let [nx, ny, nz] = t.threads.map(|n| n.max(1));
+            if !(limited || x.is_multiple_of(nx)) || !y.is_multiple_of(ny) || !z.is_multiple_of(nz) {
+                once!(
+                    pipeline = format_args!("{:#x}", self.pipeline),
+                    "a dispatch by thread count ends in a partial group: the host runs all of its threads"
+                );
+            }
+            self.thread_limit = x;
+            [x.div_ceil(nx), y.div_ceil(ny), z.div_ceil(nz)]
+        } else {
+            [x, y, z]
+        };
         if !self.bind(list, p, true) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             // A stage of the structure builder that cannot be bound is a
