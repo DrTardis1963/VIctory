@@ -395,14 +395,15 @@ impl<'a> Lower<'a> {
             let leave = self.binary(36, far[0], far[1]);
             let leave = self.binary(36, leave, far[2]);
             let from = self.binary(35, enter, fzero);
-            // Ordered compares: a NaN anywhere is a miss.
+            // Ordered compares: a NaN anywhere is a miss, and so is an
+            // empty box, its minimum above its maximum (`bvh::boxes`).
             let through = self.s.m.cmp(c, pred::OGE, leave, from);
             let before = self.s.m.cmp(c, pred::OLT, enter, ray.extent);
-            let off = self.is_nan_f32(bx[0]);
-            let on = self.s.m.bool(true);
-            let on = self.s.m.bin(c, Bin::Xor, off, on);
-            let hit = self.s.m.bin(c, Bin::And, through, before);
-            let hit = self.s.m.bin(c, Bin::And, hit, on);
+            let mut hit = self.s.m.bin(c, Bin::And, through, before);
+            for a in 0..3 {
+                let ordered = self.s.m.cmp(c, pred::OLE, bx[a], bx[3 + a]);
+                hit = self.s.m.bin(c, Bin::And, hit, ordered);
+            }
             // A child that is not there is a miss, whatever bytes its box
             // holds: it must not sort before a child that is.
             let there = self.s.m.cmp(c, pred::IULT, children[n], none);

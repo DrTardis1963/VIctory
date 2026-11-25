@@ -199,8 +199,12 @@ pub fn boxes(children: &[u32; 4], boxes: &[[f32; 6]; 4], ray: &Ray, sort: bool) 
         let enter = near[0].max(near[1]).max(near[2]);
         let leave = far[0].min(far[1]).min(far[2]);
         // A child that is not there is a miss, whatever bytes its box
-        // holds; a box whose minimum x is NaN is switched off.
-        let there = children[n] != NONE && !b[0].is_nan();
+        // holds, and so is a box that is empty (a minimum above its
+        // maximum: +inf..-inf, or +65504..-65504 in 16-bit floats, what a
+        // builder leaves for no box) or holds a NaN: ordered compares say
+        // no to both, where the minimum and maximum above would take an
+        // inverted box for the box between its planes.
+        let there = children[n] != NONE && b[0] <= b[3] && b[1] <= b[4] && b[2] <= b[5];
         if there && leave >= enter.max(0.0) && enter < ray.extent {
             ids[n] = children[n];
             distances[n] = enter;
@@ -513,6 +517,31 @@ pub(crate) mod tests {
             );
             // Not sorted: child order.
             assert_eq!(intersect(&node, kind, &ray, false), children, "kind {kind}");
+        }
+    }
+
+    /// (Port of the test of fxceless/victory-fork #814.)
+    #[test]
+    fn a_box_with_a_nan_or_a_minimum_above_its_maximum_is_a_miss() {
+        let ray = Ray::new([-5.0, 0.0, 0.0], [1.0, 0.0, 0.0], 100.0);
+        for coord in 0..6 {
+            let mut bad = UNIT;
+            bad[coord] = f32::NAN;
+            let boxes = [bad, OFF, OFF, OFF];
+            assert_eq!(intersect(&box32([8, 16, 24, 32], boxes), 5, &ray, true), [NONE; 4], "32-bit, coordinate {coord}");
+            assert_eq!(intersect(&box16([8, 16, 24, 32], boxes), 4, &ray, true), [NONE; 4], "16-bit, coordinate {coord}");
+        }
+        let (inf, big) = (f32::INFINITY, 65504.0);
+        let boxes = [
+            [inf, inf, inf, -inf, -inf, -inf],
+            [-1.0, 1.0, -1.0, 1.0, -1.0, 1.0],
+            [big, big, big, -big, -big, -big],
+            // No thickness is still a box.
+            [0.0, -1.0, -1.0, 0.0, 1.0, 1.0],
+        ];
+        for (node, kind) in [(box32([8, 16, 24, 32], boxes), 5), (box16([8, 16, 24, 32], boxes), 4)] {
+            assert_eq!(intersect(&node, kind, &ray, true), [32, NONE, NONE, NONE], "kind {kind}");
+            assert_eq!(intersect(&node, kind, &ray, false), [NONE, NONE, NONE, 32], "kind {kind}");
         }
     }
 
