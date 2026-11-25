@@ -29,6 +29,25 @@ pub use native::{
 /// changes without being wiped by unrelated crate rebuilds.
 pub const SOURCE_HASH: &str = env!("VICTORY_SHADER_SOURCE_HASH");
 
+#[cfg(all(target_os = "windows", target_env = "msvc"))]
+pub mod d3d12_agility {
+    #[repr(transparent)]
+    pub struct SyncPtr(*const u8);
+
+    // SAFETY: `D3D12SDKPath` points to a `'static` NUL-terminated ASCII string.
+    unsafe impl Sync for SyncPtr {}
+
+    #[used]
+    #[allow(non_upper_case_globals)]
+    #[unsafe(no_mangle)]
+    pub static D3D12SDKVersion: u32 = 614;
+
+    #[used]
+    #[allow(non_upper_case_globals)]
+    #[unsafe(no_mangle)]
+    pub static D3D12SDKPath: SyncPtr = SyncPtr(c".\\D3D12\\".as_ptr().cast());
+}
+
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum ShaderError {
     #[error("not a DXBC container")]
