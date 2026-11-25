@@ -3552,7 +3552,7 @@ impl Host {
             }) {
                 whole.push(shadow.clone());
                 if !dirty.iter().any(|(s, _)| Arc::ptr_eq(s, shadow)) {
-                    dirty.push((shadow.clone(), Vec::new()));
+                    dirty.push((shadow.clone(), Default::default()));
                 }
             }
         }
@@ -3581,7 +3581,8 @@ impl Host {
                     let wide = hash_wide();
                     if wide {
                         let mut barriers = Vec::new();
-                        for (shadow, ranges) in &dirty {
+                        for (shadow, updates) in &dirty {
+                            let ranges = &updates.upload;
                             let Some((staging, before, _)) = shadow.card_sides() else {
                                 continue;
                             };
@@ -3598,7 +3599,8 @@ impl Host {
                             list.ResourceBarrier(&barriers);
                         }
                     }
-                    for (shadow, ranges) in &dirty {
+                    for (shadow, updates) in &dirty {
+                        let ranges = &updates.upload;
                         let Some((staging, before, size)) = shadow.card_sides() else {
                             continue;
                         };
@@ -3610,8 +3612,8 @@ impl Host {
                         };
                         // No twin (it cost the card the copy's size again,
                         // 399 MB in run 75): `before` holds a 128-bit hash
-                        // of each 64 KiB piece. The pieces just sent up are
-                        // hashed again, all of them the first time; the
+                        // of each 64 KiB piece. Hash pieces just uploaded or already
+                        // merged from the card, all of them the first time; the
                         // compare after the lists hashes the declared
                         // pieces and flags those whose hash is another.
                         if !wide && !ranges.is_empty() {
@@ -3629,7 +3631,7 @@ impl Host {
                         let runs: Vec<crate::shadow::CardSpan> = if whole.iter().any(|s| Arc::ptr_eq(s, shadow)) {
                             vec![shadow.card_run(0, usize::MAX)]
                         } else {
-                            ranges.iter().map(|&(a, b)| shadow.card_run(a, b)).collect()
+                            updates.hash_ranges().iter().map(|&(a, b)| shadow.card_run(a, b)).collect()
                         };
                         // The same pieces in fewer passes (`rehash_runs`).
                         let runs = if rehash_runs() { crate::shadow::joined_piece_runs(runs) } else { runs };
