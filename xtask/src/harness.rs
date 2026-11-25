@@ -87,6 +87,12 @@ pub enum Profile {
     Baseline1080p,
     #[value(name = "tuned-8gb")]
     Tuned8gb,
+    /// `tuned-8gb` plus windows cut to what is read: a 1 MiB grid for asks
+    /// with a length and tails for root views (`shadow.rs` `window`,
+    /// `tails`). Run 65 had ~1.7 GB of its ~3.5 GB of windows outside any
+    /// asked-for range, all of it in PC memory the card reads over PCIe.
+    #[value(name = "trim-8gb")]
+    Trim8gb,
     #[value(name = "bvh-test")]
     BvhTest,
     #[value(name = "null-magenta")]
@@ -102,6 +108,7 @@ impl Profile {
         match self {
             Self::Baseline1080p => "baseline-1080p",
             Self::Tuned8gb => "tuned-8gb",
+            Self::Trim8gb => "trim-8gb",
             Self::BvhTest => "bvh-test",
             Self::NullMagenta => "null-magenta",
             Self::DredDebug => "dred-debug",
@@ -835,7 +842,7 @@ fn prepare_cmd(
     ];
     match profile {
         Profile::Baseline1080p => {}
-        Profile::Tuned8gb => {
+        Profile::Tuned8gb | Profile::Trim8gb => {
             env_vars.push(("VICTORY_QUEUE_COPIES".to_owned(), "1".to_owned()));
             env_vars.push(("VICTORY_RELAY_COPY_QUEUE".to_owned(), "1".to_owned()));
             env_vars.push(("VICTORY_CARD_BUFFERS_MIN_MB".to_owned(), "1".to_owned()));
@@ -843,6 +850,10 @@ fn prepare_cmd(
             env_vars.push(("VICTORY_JOIN_COPIES".to_owned(), "1".to_owned()));
             env_vars.push(("VICTORY_TEXTURE_MIP_DROP_MIN_SIZE".to_owned(), "1024".to_owned()));
             env_vars.push(("VICTORY_TEXTURE_ROOM_PERCENT".to_owned(), "94".to_owned()));
+            if matches!(profile, Profile::Trim8gb) {
+                env_vars.push(("VICTORY_WINDOW_KB".to_owned(), "1024".to_owned()));
+                env_vars.push(("VICTORY_WINDOW_TAILS".to_owned(), "1".to_owned()));
+            }
         }
         Profile::BvhTest => {
             env_vars.push(("VICTORY_QUEUE_COPIES".to_owned(), "1".to_owned()));
@@ -912,12 +923,25 @@ fn prepare_cmd(
         profile.slug(),
         log_path.display()
     ));
+    // PCIe traffic beside the run (`rxpci` near 10-13 GB/s on PCIe 3 x16
+    // means the card is waiting on memory spilled to the PC), when the
+    // NVIDIA tool is present; stopped when the title exits.
+    let pcie_path = run_dir.join("pcie.log");
     ps1.push_str(&format!(
-        "& \"{}\" run \"{}\" --execute 2>&1 | Tee-Object -FilePath \"{}\"\n",
+        "$dmon = $null\n\
+         if (Get-Command nvidia-smi -ErrorAction SilentlyContinue) {{\n\
+         \x20   $dmon = Start-Process nvidia-smi -ArgumentList 'dmon','-s','t','-d','1' -RedirectStandardOutput \"{}\" -WindowStyle Hidden -PassThru\n\
+         }}\n",
+        pcie_path.display()
+    ));
+    ps1.push_str("try {\n");
+    ps1.push_str(&format!(
+        "    & \"{}\" run \"{}\" --execute 2>&1 | Tee-Object -FilePath \"{}\"\n",
         bin.display(),
         game_exe.display(),
         log_path.display()
     ));
+    ps1.push_str("} finally {\n    if ($dmon) { Stop-Process -Id $dmon.Id -ErrorAction SilentlyContinue }\n}\n");
     let ps1_path = run_dir.join("run.ps1");
     std::fs::write(&ps1_path, ps1)?;
 

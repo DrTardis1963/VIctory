@@ -14,6 +14,7 @@
 | Antigravity | `.worktrees/unified` | `synthesis/unified` | Phase 2 Wave A+B visual/VRAM/CPU fixes merged & verified | `DONE` | 2026-11-25 |
 | Existing local work | `.` (root) | `legal/policy-and-runtime-guards` | Uncommitted local edits (8 files) — **DO NOT TOUCH** | `RESERVED` | 2026-11-25 |
 | Existing local work | `.worktrees/agy` | `fix/loader-tls-redirect-bounds-and-empty-section` | Existing worktree — **DO NOT TOUCH** | `RESERVED` | 2026-11-25 |
+| Claude Code | `.worktrees/claude-window-trim` | `claude/window-trim-profile` | `trim-8gb` harness profile (1 MiB window grid + window tails) and `nvidia-smi dmon` PCIe log in every prepared run; awaiting owner A/B run vs `tuned-8gb` | `IN PROGRESS` | 2026-11-25 |
 
 ---
 
