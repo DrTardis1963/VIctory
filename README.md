@@ -38,6 +38,24 @@ Tested on one machine: Windows 11, Intel i7-14700KF, NVIDIA RTX 4070 12 GB,
 | Frame rate in the world | 2-4 fps: 420-450 ms per frame by default, 240-350 ms with the newer switches (`VICTORY_RELAY=2`, or `VICTORY_LATE_WAIT=3 VICTORY_WIDE_BACK=1 VICTORY_CARD_BUFFERS_MIN_MB=1 VICTORY_CARD_BUFFERS_MB=1024`); it started at 3-6 seconds per frame |
 | Stability | no driver hang or device loss in normal runs (a hang introduced by the wave64 update was found and fixed: its barrier form for 64-lane programs is now off unless `VICTORY_WAVE_WIDE=1`) |
 
+### Progress on an 8 GB card (branch `base/fxceless`, 2026-11-25)
+
+Measured on a second machine: Windows 11, Intel i7-13700K, NVIDIA RTX 4060 Ti
+8 GB, Series X profile, `VICTORY_RELAY=1 VICTORY_WIDE_BACK=1 VICTORY_WIDE_REFRESH=1`.
+The percentages are our own estimates of each stage, not a benchmark.
+
+| Stage | Progress | Notes |
+|-------|---------:|-------|
+| Loads and boots | 100 % | about 10 s to the first frame |
+| Intro and menus | 100 % | steady 30 fps (the title's own limit) |
+| Opening cutscene | 70 % | plays to the end; colour banding in the grading and some characters' faces and clothes black (fix for textures filled after their upload just merged) |
+| Reaching the world | 100 % | 3,998 pipelines from the saved library; no black stall |
+| Playable (input, HUD, menus) | 50 % | pad input, HUD and pause menu work, but at 3 fps |
+| Picture quality | 50 % | no ray-traced light (shadows black), one mip dropped on 8 GB cards, banding |
+| Frame rate in the world | 10 % | about 3 of the 30 fps target: GPU ~165-210 ms, preparing ~90-160 ms, copying back ~110-250 ms per frame |
+| Stability | 90 % | an hour-long run with no hang or device loss |
+| **Overall** | **74 %** | the average of the rows above |
+
 ### What this fork changed (summary)
 
 Rendering:
