@@ -210,6 +210,16 @@ fn windows() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_WINDOW").is_some_and(|v| v == "1")) && !crate::drvwatch::tripped()
 }
 
+/// Whether a single record that would be clamped alone is gathered: given a
+/// slot that the list's prelude fills in one pass with the list's other
+/// such records, in place of a pass of ours in front of its draw
+/// (`crate::indirect::gather`; `VICTORY_INDIRECT_GATHER=1`, after
+/// fxceless/victory-fork 465b94f5). Off by default. Needs [`windows`].
+fn gathers() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_INDIRECT_GATHER").as_deref() == Ok("1"))
+}
+
 /// Only widen to a window if two full padded records fit. The clamp copies
 /// the padding too, so a final record shorter than `step` uses its original
 /// command-signature stride instead.
@@ -1053,6 +1063,11 @@ impl State {
         if !self.bind(list, p, false) {
             return false;
         }
+        if p.stages.iter().any(|s| s.shader.draws_sky)
+            && let Some(&sky) = self.targets.first()
+        {
+            crate::ambient::sky_drawn(sky);
+        }
         let l = &list.list;
         // Vertex buffers the input layout reads.
         let mut views = [D3D12_VERTEX_BUFFER_VIEW::default(); 32];
@@ -1376,6 +1391,9 @@ impl State {
         // that store to no buffer keep them.
         if p.stages.iter().any(|s| s.translated().stores) {
             self.windows.clear();
+            // Arguments of later draws may be written from here on: records
+            // the list's prelude clamps must be read before this.
+            list.gather_close();
         }
         true
     }
@@ -2398,6 +2416,7 @@ impl State {
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32, threads: bool) {
         // It may write the arguments active windows hold clamped.
         self.windows.clear();
+        list.gather_close();
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
@@ -2493,24 +2512,53 @@ impl State {
     /// After a dispatch of `p`: the least indirect light, if it is the
     /// program that resolves that (`crate::ambient`).
     fn ambient(&self, list: &HostList, p: &crate::pipeline::host::HostPipeline) -> bool {
-        let Some(stage) = p.stages.first().filter(|s| s.shader.resolves_light) else {
+        let Some(stage) = p.stages.first().filter(|s| s.shader.resolves_light || s.shader.ends_reflections) else {
             return false;
         };
-        let (slot, offset) = crate::ambient::LIGHT;
-        let light = stage
-            .translated()
-            .used
-            .iter()
-            .find(|u| u.kind == ResourceType::Uav && u.root == RootType::Table && (u.slot, u.table_offset_dwords) == (slot, offset))
-            .and_then(|u| match self.roots_ref(true).get(usize::from(u.slot)) {
-                Some(Root::Table(table)) => crate::descriptor::view(table + u64::from(u.table_offset_dwords) * 4),
-                _ => None,
+        let view = |kind: ResourceType, (slot, offset): (u8, u32)| {
+            stage
+                .translated()
+                .used
+                .iter()
+                .find(|u| u.kind == kind && u.root == RootType::Table && (u.slot, u.table_offset_dwords) == (slot, offset))
+                .and_then(|u| match self.roots_ref(true).get(usize::from(u.slot)) {
+                    Some(Root::Table(table)) => crate::descriptor::view(table + u64::from(u.table_offset_dwords) * 4),
+                    _ => None,
+                })
+        };
+        if !stage.shader.resolves_light {
+            // The reflections, held to the light around (after Belobug 44dcd437):
+            // without rays they are the sky's, unoccluded, on every glossy surface.
+            static LISTED: std::sync::Once = std::sync::Once::new();
+            LISTED.call_once(|| {
+                for u in stage.translated().used.iter() {
+                    let found = (u.root == RootType::Table).then(|| view(u.kind, (u.slot, u.table_offset_dwords))).flatten();
+                    let r = match found {
+                        Some(View::Shader(r, _)) | Some(View::Unordered(r, ..)) => r,
+                        _ => 0,
+                    };
+                    let d = crate::resource::host_resource(r as This).map(|t| {
+                        // SAFETY: a live resource.
+                        let d = unsafe { t.GetDesc() };
+                        (d.Format.0, d.Width, d.Height)
+                    });
+                    tracing::info!(kind = ?u.kind, root = ?u.root, slot = u.slot, offset = u.table_offset_dwords, ?d, "the reflections' last pass uses");
+                }
             });
-        let Some(View::Unordered(light, ..)) = light.filter(|v| matches!(v, View::Unordered(r, ..) if *r != 0)) else {
+            return match view(ResourceType::Uav, crate::ambient::REFLECTIONS) {
+                Some(View::Unordered(r, ..)) if r != 0 => crate::ambient::hold(list, r as This),
+                _ => false,
+            };
+        }
+        let Some(View::Unordered(light, ..)) = view(ResourceType::Uav, crate::ambient::LIGHT).filter(|v| matches!(v, View::Unordered(r, ..) if *r != 0)) else {
             once!("no ambient light: other tables");
             return false;
         };
-        crate::ambient::raise(list, light as This)
+        let depth = match view(ResourceType::Srv, crate::ambient::DEPTH) {
+            Some(View::Shader(r, _)) => Some(r as This),
+            _ => None,
+        };
+        crate::ambient::raise(list, light as This, depth)
     }
 
     /// What a draw or dispatch runs, for the device-removed report
@@ -3449,6 +3497,11 @@ impl State {
         if kind == DISPATCH || max != 1 || count.is_some() || stores || list.first_use(WINDOW_USE) {
             self.windows.clear();
         }
+        if !windowed {
+            // A dispatch, or shaders that store to buffers: arguments may
+            // be written from here on.
+            list.gather_close();
+        }
         let epoch = list.indirect_epoch();
         self.windows.retain(|w| w.epoch == epoch);
         let same = |w: &Window| w.copy == args.id() && w.kind == kind && w.stride == stride;
@@ -3504,64 +3557,83 @@ impl State {
                     }
                     _ => (stride, max),
                 };
-                args.refresh(list, arguments, len.max(u64::from(step) * u64::from(records)));
-                if let Some((s, at)) = &counter {
-                    s.refresh(list, *at, 4);
-                }
-                // Bounded first: the clamp binds a compute pipeline of its
-                // own and copies clamped active records into a non-overlapping
-                // bump slice of the scratch buffer when windowed.
-                let count_arg = counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at)));
-                let bounded = if windowed {
-                    if records > 1 {
-                        crate::indirect::bound_ahead_at(
-                            list,
-                            (&args.buffer, offset),
-                            (kind, step, records),
-                        )
+                // A record clamped alone: a slot the list's prelude fills in
+                // one pass with the list's other such records, if the list
+                // still gathers ([`gathers`]).
+                let gathered = (windowed && records == 1 && gathers())
+                    .then(|| crate::indirect::gather(list, (&args.buffer, args.id()), offset, (kind, stride)))
+                    .flatten();
+                if let Some((scratch, at)) = gathered {
+                    // The record's bytes are up to date when the list is
+                    // submitted, as for a record clamped in the list.
+                    args.refresh(list, arguments, len);
+                    if crate::indirect::window_check()
+                        && crate::indirect::check_hit(list, (&args.buffer, offset), (kind, stride), &scratch, at)
+                    {
+                        self.host_pipeline = 0;
+                        self.host_roots[1] = 0;
+                    }
+                    (scratch, at)
+                } else {
+                    args.refresh(list, arguments, len.max(u64::from(step) * u64::from(records)));
+                    if let Some((s, at)) = &counter {
+                        s.refresh(list, *at, 4);
+                    }
+                    // Bounded first: the clamp binds a compute pipeline of its
+                    // own and copies clamped active records into a non-overlapping
+                    // bump slice of the scratch buffer when windowed.
+                    let count_arg = counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at)));
+                    let bounded = if windowed {
+                        if records > 1 {
+                            crate::indirect::bound_ahead_at(
+                                list,
+                                (&args.buffer, offset),
+                                (kind, step, records),
+                            )
+                        } else {
+                            crate::indirect::bound_at(
+                                list,
+                                (&args.buffer, offset),
+                                count_arg,
+                                (kind, step, records),
+                            )
+                        }
                     } else {
-                        crate::indirect::bound_at(
+                        crate::indirect::bound(
                             list,
                             (&args.buffer, offset),
                             count_arg,
                             (kind, step, records),
                         )
+                        .map(|buf| (buf, 0))
+                    };
+                    let Some((bounded, dst_offset)) = bounded else {
+                        self.windows.clear();
+                        why("not bounded (no clamp, or arguments not 4-byte aligned)");
+                        return false;
+                    };
+                    self.host_pipeline = 0;
+                    self.host_roots[1] = 0;
+                    if windowed {
+                        let new_epoch = list.indirect_epoch();
+                        self.windows.retain(|w| w.epoch == new_epoch);
+                        if self.windows.len() >= 8 {
+                            self.windows.remove(0);
+                        }
+                        self.windows.push(Window {
+                            copy: args.id(),
+                            kind,
+                            stride,
+                            step,
+                            base: offset,
+                            records,
+                            scratch: bounded.clone(),
+                            dst_offset,
+                            epoch: new_epoch,
+                        });
                     }
-                } else {
-                    crate::indirect::bound(
-                        list,
-                        (&args.buffer, offset),
-                        count_arg,
-                        (kind, step, records),
-                    )
-                    .map(|buf| (buf, 0))
-                };
-                let Some((bounded, dst_offset)) = bounded else {
-                    self.windows.clear();
-                    why("not bounded (no clamp, or arguments not 4-byte aligned)");
-                    return false;
-                };
-                self.host_pipeline = 0;
-                self.host_roots[1] = 0;
-                if windowed {
-                    let new_epoch = list.indirect_epoch();
-                    self.windows.retain(|w| w.epoch == new_epoch);
-                    if self.windows.len() >= 8 {
-                        self.windows.remove(0);
-                    }
-                    self.windows.push(Window {
-                        copy: args.id(),
-                        kind,
-                        stride,
-                        step,
-                        base: offset,
-                        records,
-                        scratch: bounded.clone(),
-                        dst_offset,
-                        epoch: new_epoch,
-                    });
+                    (bounded, dst_offset)
                 }
-                (bounded, dst_offset)
             }
         };
         let ran = match kind {
@@ -3601,6 +3673,13 @@ impl State {
         // back (`crate::indirect`).
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
+            // An indirect dispatch may be the light's resolve or the
+            // reflections' last pass too.
+            if self.ambient(list, p) {
+                self.host_pipeline = 0;
+                self.host_roots = [0; 2];
+                self.host_heaps = [0; 2];
+            }
         } else {
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }

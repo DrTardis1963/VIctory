@@ -510,6 +510,8 @@ mod tests {
             translated: OnceLock::new(),
             walks: OnceLock::new(),
             resolves_light: false,
+            draws_sky: false,
+            ends_reflections: false,
             bakes: false,
         });
         let early_one = Arc::new(Pending::new(vec![cs.clone()], None));
