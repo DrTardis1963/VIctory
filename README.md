@@ -30,11 +30,11 @@ benchmark.
 |-------|:--------:|----------:|-------------|
 | Carrega e inicia | ✅ | 100 % | uns 10 s até o primeiro quadro |
 | Vídeo de abertura e menus | ✅ | 100 % | 30 fps estáveis (o limite do próprio título) |
-| Cutscene de abertura | 🟡 | 70 % | vai até o fim; pele e roupa ainda saem pretas e a passagem para os vídeos pisca verde |
+| Cutscene de abertura | 🟡 | 75 % | vai até o fim; rostos, cabelo e roupa com textura e sem flash verde, mas escura sem a luz por ray tracing |
 | Entrada no mundo | ✅ | 100 % | as pipelines vêm da biblioteca salva, sem tela preta |
 | Jogável (controle, HUD, menus) | 🟡 | 50 % | controle, HUD e menu de pausa funcionam, mas devagar |
-| Qualidade da imagem | 🟡 | 50 % | sem a luz por ray tracing (sombras pretas); um nível de mip a menos em placas de 8 GB |
-| Taxa de quadros | 🟡 | 20 % | 4 a 7 fps na cutscene em 1080p (eram 2 a 3 fps a 4K) |
+| Qualidade da imagem | 🟡 | 55 % | texturas em resolução cheia; sem a luz por ray tracing (sombras pretas) |
+| Taxa de quadros | 🟡 | 15 % | 1 a 5 fps na cutscene em 1080p com texturas em resolução cheia |
 | Estabilidade | ✅ | 90 % | sessões de uma hora sem travar a placa nem perder o dispositivo |
 | **Geral** | | **72 %** | média das linhas acima |
 
