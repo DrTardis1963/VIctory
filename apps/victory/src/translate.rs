@@ -423,10 +423,16 @@ pub fn warm(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool) -> Result
             };
             let jobs = sources(&data);
             let next = AtomicUsize::new(0);
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let file_started = std::time::Instant::now();
             std::thread::scope(|s| {
                 for _ in 0..threads.min(jobs.len()) {
                     s.spawn(|| {
                         while let Some(job) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) {
+                            let i = next.load(Ordering::Relaxed).min(jobs.len());
+                            if i.is_multiple_of(500) {
+                                println!("{}", warm_progress(&name, i, jobs.len(), file_started.elapsed(), made.load(Ordering::Relaxed)));
+                            }
                             let Some(bytes) = job.bytes() else { continue };
                             let Ok(container) = Container::parse(&bytes) else { continue };
                             // As the title passes it: no more than the container.
@@ -455,9 +461,6 @@ pub fn warm(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool) -> Result
                                 Some(false) => unmade.fetch_add(1, Ordering::Relaxed),
                                 None => 0,
                             };
-                            if n.is_multiple_of(2000) {
-                                println!("{:6.0} s  {n} shaders", started.elapsed().as_secs_f64());
-                            }
                         }
                     });
                 }
@@ -474,6 +477,19 @@ pub fn warm(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool) -> Result
         started.elapsed().as_secs_f64()
     );
     Ok(())
+}
+
+/// One progress line of `victory warm`: where it is in a file, and about how long is left.
+fn warm_progress(file: &str, done: usize, total: usize, took: std::time::Duration, pipelines: usize) -> String {
+    let pct = 100 * done / total.max(1);
+    let left = took.as_secs_f64() / done.max(1) as f64 * total.saturating_sub(done) as f64;
+    format!("  {file}: {done} / {total} ({pct}%), {pipelines} compute pipelines so far, about {left:.0} s left")
+}
+
+#[test]
+fn warm_progress_tells_what_is_left() {
+    let line = warm_progress("shaders.rpf", 500, 2000, std::time::Duration::from_secs(10), 7);
+    assert_eq!(line, "  shaders.rpf: 500 / 2000 (25%), 7 compute pipelines so far, about 30 s left");
 }
 
 fn translate(
