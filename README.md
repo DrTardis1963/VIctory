@@ -1,4 +1,4 @@
-# VIctory-fork: a versão para placas de 8 GB
+# VI-BR-PORT: a versão para placas de 8 GB
 
 Camada de compatibilidade que roda no Windows, de forma nativa, a versão de
 **Xbox Series X|S** (plataforma *Scarlett*, jogos feitos com o **GDK**) de um
