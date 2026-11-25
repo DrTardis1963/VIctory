@@ -138,6 +138,14 @@ impl Host {
             {
                 super::set_host_max_wave(o1.WaveLaneCountMax);
             }
+            let mut o0 = D3D12_FEATURE_DATA_D3D12_OPTIONS::default();
+            if self
+                .device
+                .CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, (&raw mut o0).cast(), size_of_val(&o0) as u32)
+                .is_ok()
+            {
+                super::set_host_rovs(o0.ROVsSupported.as_bool());
+            }
             let made: windows::core::Result<ID3D12DescriptorHeap> =
                 self.device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
                     Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,

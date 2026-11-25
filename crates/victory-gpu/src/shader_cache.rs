@@ -190,9 +190,10 @@ fn settings() -> Vec<u8> {
     // And which clean-up passes ran over the translated code.
     bytes.extend_from_slice(&victory_shader::emit::shader_opt().to_le_bytes());
     // And what the host GPU told the translator (its widest wave, a capped
-    // view heap): an offline warm-up made without them must not serve a run.
+    // view heap, rasterizer-ordered views): an offline warm-up made without them must not serve a run.
     bytes.extend_from_slice(&victory_shader::emit::host_max_wave().to_le_bytes());
     bytes.extend_from_slice(&victory_shader::emit::view_heap_limit().to_le_bytes());
+    bytes.push(u8::from(victory_shader::emit::host_rovs()));
     bytes
 }
 
