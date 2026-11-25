@@ -3152,8 +3152,17 @@ void main() {
         );
         let heap_start = crate::descriptor::heap(heap_this).start;
 
-        // 32-byte (non-256-aligned) title constant payload.
-        let title_data: [u32; 8] = [
+        // 32-byte title constant payload, 16 bytes past a 256-byte line:
+        // at a 256-aligned address (1 run in ~16 on the stack) the view is
+        // bound in place in its shadow window, which shows the title's own
+        // bytes past the view instead of zeroed scratch padding.
+        #[repr(C, align(256))]
+        struct Lined([u32; 12]);
+        let lined = Lined([
+            0,
+            0,
+            0,
+            0,
             0x1122_0000,
             0x1122_0001,
             0x1122_0002,
@@ -3162,7 +3171,8 @@ void main() {
             0x1122_0005,
             0x1122_0006,
             0x1122_0007,
-        ];
+        ]);
+        let title_data = &lined.0[4..];
         let addr = title_data.as_ptr() as u64;
         let (lo, hi) = (addr as u32, (addr >> 32) as u32);
         let cbvs = [
@@ -3227,7 +3237,7 @@ void main() {
 
         // SAFETY: GPU execution has completed and `out_ptr` holds 80 dwords.
         let got = unsafe { std::slice::from_raw_parts(out_ptr.cast::<u32>(), 80) };
-        assert_eq!(&got[..8], &title_data, "in-bounds CBV bytes must match title memory");
+        assert_eq!(&got[..8], title_data, "in-bounds CBV bytes must match title memory");
         assert!(
             got[8..64].iter().all(|&w| w == 0),
             "CBV padding bytes [32..256) must read as zero, got {:x?}",
