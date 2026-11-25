@@ -1699,6 +1699,8 @@ impl HostHeap {
     }
 
     /// Makes slot `index` a null constant buffer view (reads zeros).
+    /// (Tests only: tables hold raw views of constants, `draw::table_constant`.)
+    #[cfg(test)]
     pub(crate) fn make_null_constant(&self, index: u32) {
         self.keep(index, None);
         let Some(host) = host() else { return };
@@ -1707,7 +1709,8 @@ impl HostHeap {
     }
 
     /// Makes slot `index` (a dynamic one) a constant buffer view of host
-    /// memory (the list's own, which it holds).
+    /// memory (the list's own, which it holds). (Tests only, as above.)
+    #[cfg(test)]
     pub(crate) fn constant_at(&self, index: u32, gpu: u64, size: u32) {
         let Some(padded) = (gpu != 0 && size != 0)
             .then(|| size.checked_next_multiple_of(256))

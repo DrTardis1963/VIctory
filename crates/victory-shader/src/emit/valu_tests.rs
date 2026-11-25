@@ -6,7 +6,7 @@
 //! near `1.0`, turn-range reduction for `v_sin_*`/`v_cos_*`, and the LDS
 //! float atomics `ds_min_f32`/`ds_max_f32`.
 
-use super::host::{Dispatch, Host, Root, View};
+use super::host::{Dispatch, Host, Root, Stride, View};
 use super::{HostShader, lower, validator};
 use crate::native::{
     ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
@@ -2561,4 +2561,132 @@ fn packed_dot_products_and_clamps_execute_cleanly() {
             assert_eq!(got, 32, "{backend}: v_dot2_u32_u16 opsel got {got}, want 32");
         },
     );
+}
+
+/// SMEM `op s[dst..], s[base:base+1], byte_off` (soffset = null).
+const fn smem(op: u8, dst: u8, base: u8, byte_off: u32) -> [u32; 2] {
+    [
+        0x3D << 26 | (op as u32) << 18 | (dst as u32) << 6 | (base as u32 >> 1),
+        125 << 25 | (byte_off & 0x1F_FFFF),
+    ]
+}
+
+/// A constant buffer in a descriptor table is read as raw bytes
+/// (`lower::table_constants`), so the host can put a raw view of the
+/// buffer's copy in its slot (16-byte aligned, as the console's are; a
+/// constant buffer view wants 256) instead of copying it per draw. Scalar
+/// loads of one and of four dwords read the right bytes through a raw view.
+#[test]
+fn table_constant_buffers_are_read_through_raw_views() {
+    const S_BUFFER_LOAD_DWORD: u8 = 0x08;
+    const S_BUFFER_LOAD_DWORDX4: u8 = 0x0A;
+    const S_LOAD_DWORDX4: u8 = 0x02;
+    let mut words = vec![s_mov_b32(1, 0x80)]; // s[0:1]: the table, at heap index 0
+    words.extend_from_slice(&smem(S_LOAD_DWORDX4, 8, 0, 0)); // entry 0: the constants
+    words.extend_from_slice(&smem(S_LOAD_DWORDX4, 12, 0, 32)); // entry 1: the UAV
+    words.extend_from_slice(&smem(S_BUFFER_LOAD_DWORD, 16, 8, 4)); // s16 = dword 1
+    words.extend_from_slice(&smem(S_BUFFER_LOAD_DWORDX4, 20, 8, 16)); // s20..s23 = dwords 4..7
+    for (k, s) in [16u8, 21, 23].into_iter().enumerate() {
+        words.push(vop1(0x001, 0, sgpr(s))); // v_mov_b32 v0, s
+        words.extend_from_slice(&buffer_store_dword(0, 12, 4 * k as u16));
+    }
+    words.push(S_ENDPGM);
+
+    let entry = |kind, table_offset_dwords, lower_bound| UsedResource {
+        kind,
+        root: RootType::Table,
+        table_offset_dwords,
+        lower_bound,
+        stride: 0,
+        dwords: 4,
+        user_data: 0,
+        slot: 0,
+    };
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: false,
+        vgprs: 8,
+        layout: vec![RootParam {
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            sgprs: 1,
+            base_register: 0,
+            user_data: 0,
+            slot: 0,
+        }],
+        used: vec![entry(ResourceType::Cbv, 0, 0), entry(ResourceType::Uav, 8, 1)],
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: 1 << 1, // 1 user SGPR: s0
+            threads: [1, 1, 1],
+        }),
+        code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    };
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    let res =
+        resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
+    let io = io::raise(&p, &native).expect("io::raise");
+    let lowered = lower::lower(&lower::Parts {
+        native: &native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        prims: Vec::new(),
+        mesh_stride: 0,
+    })
+    .expect("lower");
+    let shader = HostShader {
+        stage: HwStage::Cs,
+        dxil: lowered.dxil,
+        user_data: lowered.user_data,
+        samplers: lowered.samplers,
+        static_samplers: Vec::new(),
+        root_cbvs: lowered.root_cbvs,
+        root_srvs: lowered.root_srvs,
+        root_uavs: lowered.root_uavs,
+        root_indexed_views: res.root_indexed_views,
+    };
+    assert!(shader.root_cbvs.is_empty(), "a table's constants are not a root CBV");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        v.validate(&mut shader.dxil.clone()).expect("DXIL validation failed");
+    }
+
+    let constants: Vec<u32> = (100..116).collect();
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let (root, pso) = host
+            .compute_pipeline(&shader)
+            .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
+        let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        let views = [
+            View::Buffer {
+                data: &constants,
+                stride: Stride::Raw,
+            },
+            View::RawUav(3),
+        ];
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(ud))],
+                    views: &views,
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+        assert_eq!(out[0], [101, 105, 107], "{label}");
+        ran += 1;
+    }
+    assert!(ran > 0, "no SM 6.6 device available");
 }

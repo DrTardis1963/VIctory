@@ -34,6 +34,8 @@ All 6 tracked VIctory-family remotes are mirrored as `backup/*` branches on priv
    - Fix compute shader `#f133e35efed2a48a` (`CreateComputePipelineState` `E_INVALIDARG` despite clean `dxil.dll` validation), and reconcile `origin/main` `940d32f`. (Note: `upstream-vitoriabr` `40beb26` LDS bounds is already covered in spine by `fa4a359`.)
 4. **[Wave D — Ray-Traced Shadows & Lighting] Enable & Harden `VICTORY_BVH_BUILDER=1`**:
    - Validate safely with `VICTORY_BVH_QUARANTINE=1` (`cargo xtask harness prepare --profile bvh-test`) once Wave A/B A/B comparison completes.
+5. **[DONE 2026-11-26] Table constant buffers as raw views** (`fix/table-cbv-raw-views`): the idea of upstream `683ad7a9` ("table constants read in place"), ported spine-native because `683ad7a9` rests on upstream `c75fdba3` (heap constants as raw views + change journal), which the spine does not have. Fresh table slots hold a raw view of the shadow copy (16-byte alignment) instead of a per-draw upload copy for buffers off 256 bytes.
+6. **[2026-11-26 all-forks scan]** 1,122 GitHub forks compared with upstream `main`: 79 with own commits, 34 with 10+. Ranked findings (PainDe0Mie staging slabs/reaper, hyphen `f85101b6`/`a2537066`/`0b0074e0`, Belobug guard-hole cache, Machad3x NVIDIA fixes, bodnjenie14 LDS lead for `#f133e35efed2a48a`) in `docs/fork-survey-2026-11-26.md`.
 
 ---
 

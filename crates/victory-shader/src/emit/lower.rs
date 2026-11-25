@@ -5995,7 +5995,9 @@ impl<'a> Lower<'a> {
             }
             return Ok(());
         }
-        if matches!(kind, Some(u) if u.kind == ResourceType::Srv) {
+        // A table's SRV, and a table's constant buffer: raw bytes
+        // ([`table_constants`]).
+        if matches!(kind, Some(u) if u.kind == ResourceType::Srv || table_constants(u)) {
             let h = self.handle(site, src, false, (11, 0))?;
             for k in 0..count {
                 let off = self.s.m.i32(4 * k);
@@ -10992,7 +10994,10 @@ impl<'a> Lower<'a> {
             // A constant buffer read per lane (a dynamically indexed array).
             // shortcut: the console's CBV descriptor is taken to have a 16-byte
             // stride, as the vector loads of whole rows suggest.
-            let h = self.handle(site, src, false, (13, 0x1_0000))?;
+            // A table's constant buffer is raw bytes ([`table_constants`]).
+            let raw = used.is_some_and(table_constants);
+            let props = if raw { (11, 0) } else { (13, 0x1_0000) };
+            let h = self.handle(site, src, false, props)?;
             let byte = match index {
                 Some(i) => {
                     let sixteen = self.s.m.i32(16);
@@ -11007,7 +11012,22 @@ impl<'a> Lower<'a> {
             for k in 0..count {
                 let four = self.s.m.i32(4 * k);
                 let a = self.s.m.bin(c, Bin::Add, byte, four);
-                let x = self.cbuffer_dword(h, a);
+                let x = if raw {
+                    let (mask, al) = (self.s.m.i8(1), self.s.m.i32(4));
+                    let u = self.s.m.undef(self.s.t.i32);
+                    let r = self.s.op(
+                        c,
+                        "rawBufferLoad.f32",
+                        Attr::ReadOnly,
+                        self.s.t.res_ret,
+                        139,
+                        &[h, a, u, mask, al],
+                    );
+                    let x = self.s.m.extract(c, r, 0);
+                    self.as_int(x)
+                } else {
+                    self.cbuffer_dword(h, a)
+                };
                 self.write(inst, Reg::V(reg + k as u8), x, guard);
             }
             return Ok(());
@@ -12010,6 +12030,16 @@ impl<'a> Lower<'a> {
         }
         Ok(())
     }
+}
+
+/// Whether `u` is a constant buffer in a descriptor table, which translated
+/// shaders read as raw bytes. The host makes such tables afresh for each
+/// list, with a raw view of each constant buffer's host copy in its slot
+/// (`victory_gpu::draw`): a raw view needs 16-byte alignment, as the
+/// console's constant buffers have, where a host constant buffer view needs
+/// 256, so the data needs no copy of its own per draw.
+fn table_constants(u: &UsedResource) -> bool {
+    u.kind == ResourceType::Cbv && u.root == RootType::Table
 }
 
 /// The stride a descriptor built around an address ORs into dword 1

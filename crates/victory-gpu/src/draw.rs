@@ -2275,15 +2275,18 @@ impl State {
 
     /// The descriptors a shader reads through tables. Tables holding a
     /// constant buffer are made afresh for the draw in dynamic slots, with
-    /// the constant data copied to upload memory when the list is
-    /// submitted: the host wants constant buffers 256-byte aligned, the
-    /// console only 16. Returns those tables' new byte offsets by root
-    /// parameter; the other tables' slots are made from the title's.
+    /// each constant buffer a raw view of its host copy ([`table_constant`]):
+    /// translated shaders read table constants as raw bytes, since the host
+    /// wants constant buffer views 256-byte aligned and the console only 16.
+    /// Returns those tables' new byte offsets by root parameter (`u32::MAX`:
+    /// one could not be made, and the draw must not run); the other tables'
+    /// slots are made from the title's.
     ///
     /// Within a list, the same table holding the same descriptors is made
-    /// once: its constant data is copied at submission either way, and the
-    /// big tables the world binds would otherwise take hundreds of slots per
-    /// draw, wrapping the dynamic slots onto lists not yet submitted.
+    /// once: its constant data is brought up to date at submission either
+    /// way, and the big tables the world binds would otherwise take hundreds
+    /// of slots per draw, wrapping the dynamic slots onto lists not yet
+    /// submitted.
     pub(crate) fn tables(
         &mut self,
         list: &HostList,
@@ -2336,10 +2339,18 @@ impl State {
                 .filter(tables)
                 .filter(|u| u.slot == slot)
                 .collect();
+            // Shaders read a table's constant buffers as raw views, which
+            // only the slots made here hold (the title's own hold constant
+            // buffer views): a table holding one that cannot be made here
+            // must not run on the title's slots; `bind` drops the draw.
+            let constants = entries.iter().any(|u| u.kind == ResourceType::Cbv);
             let Some(heap) = self.heap_of(table) else {
                 continue;
             };
             if heap.samplers() || (table - heap.start) % 32 != 0 {
+                if constants {
+                    made.push((slot, u32::MAX));
+                }
                 continue;
             }
             let Some(host) = heap.host() else {
@@ -2373,6 +2384,9 @@ impl State {
                 || last.and_then(|handle| heap.index(handle)).is_none()
             {
                 once!(slot, n, "fresh descriptor table exceeds the available span");
+                if constants {
+                    made.push((slot, u32::MAX));
+                }
                 continue;
             }
             // The table and what its entries hold (record words).
@@ -2426,38 +2440,7 @@ impl State {
                 let used = entries.iter().find(|u| u.table_offset_dwords / 8 == k);
                 match crate::descriptor::view(table + u64::from(k) * 32) {
                     Some(View::Constant(address, size)) => {
-                        let Some(padded) = (address != 0 && size != 0)
-                            .then(|| size.checked_next_multiple_of(256))
-                            .flatten()
-                        else {
-                            host.make_null_constant(index);
-                            continue;
-                        };
-                        // Only what a shader can index is copied (#1640).
-                        let size = size.min(crate::descriptor::host::CONSTANT_MOST);
-                        let padded = padded.min(crate::descriptor::host::CONSTANT_MOST);
-                        // A view that lies 256-byte aligned in a shadow copy is
-                        // bound there, as `root_view` does (fxceless #144): no
-                        // upload scratch, no fill waiting on shader writes.
-                        if let Some(shadow) = crate::shadow::find(address, u64::from(padded))
-                            && shadow.gpu(address) % 256 == 0
-                            && shadow.left(address) >= u64::from(padded)
-                        {
-                            shadow.refresh(list, address, u64::from(padded));
-                            host.constant_at(index, shadow.gpu(address), padded);
-                            continue;
-                        }
-                        let Some((gpu, to)) = list.scratch(u64::from(padded)) else {
-                            host.make_null_constant(index);
-                            continue;
-                        };
-                        list.defer_fill_padded(
-                            to,
-                            address as *const u8,
-                            size as usize,
-                            padded as usize,
-                        );
-                        host.constant_at(index, gpu, padded);
+                        table_constant(list, host, index, address, size);
                     }
                     Some(view) => {
                         host.make_at(index, &view);
@@ -2998,6 +2981,50 @@ fn depth_state(texture: &ID3D12Resource, desc: Option<&D3D12_DEPTH_STENCIL_VIEW_
     }
 }
 
+/// Makes dynamic slot `index` the constant buffer of `size` bytes at title
+/// `address` that a table holds, as translated shaders read it: raw bytes
+/// (`victory_shader::emit`, `table_constants`). A raw view of the buffer's
+/// host copy, brought up to date at submission, where the copy holds it on
+/// 16 bytes (the console's alignment), so the data is not copied per draw;
+/// the host's constant buffer views would want 256. Else the data is
+/// copied to upload memory of its own at submission. Only what a shader
+/// can index is viewed (#1640).
+fn table_constant(
+    list: &HostList,
+    host: &crate::descriptor::host::HostHeap,
+    index: u32,
+    address: u64,
+    size: u32,
+) {
+    // Empty, and invalid as a constant buffer view (its size overflows the
+    // host's 256-byte rounding): zeros, as `make` gives such views.
+    if address == 0 || size == 0 || size.checked_next_multiple_of(256).is_none() {
+        host.null_raw_at(index);
+        return;
+    }
+    let size = u64::from(size.min(crate::descriptor::host::CONSTANT_MOST));
+    if let Some(shadow) = crate::shadow::find(address, size) {
+        // SAFETY: a live buffer.
+        let base = unsafe { shadow.buffer.GetGPUVirtualAddress() };
+        let offset = shadow.gpu(address) - base;
+        let len = size.min(shadow.left(address));
+        if offset.is_multiple_of(16) && len > 0 {
+            shadow.refresh(list, address, len);
+            host.raw_at(index, &shadow.buffer, offset, len);
+            return;
+        }
+    }
+    let padded = size.next_multiple_of(16);
+    let made = crate::host::host().and_then(|h| list.upload(h, padded));
+    let Some((buffer, to)) = made else {
+        once!("a table's constant buffer reads zeros: no upload memory");
+        host.null_raw_at(index);
+        return;
+    };
+    list.defer_fill_padded(to, address as *const u8, size as usize, padded as usize);
+    host.raw_at(index, &buffer, 0, padded);
+}
+
 fn readable(list: &HostList, kind: ResourceType, view: &View) {
     const UNORDERED_ACCESS: u32 = 0x8;
     let placed = crate::descriptor::host::placed_texture(view);
@@ -3265,33 +3292,34 @@ mod tests {
         }
     }
 
-    /// A non-256-aligned table CBV zeroes its `[size..padded)` scratch tail
-    /// across list resets (preventing stale scratch reads), while null,
-    /// zero-sized, and overflowing CBVs bind null CBVs without allocating
-    /// scratch.
+    /// A table's constant buffers are raw views (`table_constant`), read as
+    /// translated shaders read them: a 32-byte one off a 256-byte line
+    /// shows the title's bytes and zeros past its size (not stale scratch
+    /// from before a list reset), and null, zero-sized and overflowing ones
+    /// read zeros, all with the device alive.
     #[test]
-    fn table_cbv_zeroes_scratch_padding_and_binds_null_cbvs_on_gpu() {
+    fn table_cbv_is_a_raw_view_and_null_cbvs_read_zeros_on_gpu() {
         let Some(host) = crate::host::host() else {
             return; // no host GPU
         };
         const SOURCE: &str = r#"
-#define RS "DescriptorTable(CBV(b0, numDescriptors=5)), UAV(u0)"
-cbuffer Small : register(b0) { uint4 small_c[16]; };
-cbuffer Null0 : register(b1) { uint4 null0_c[4]; };
-cbuffer Null1 : register(b2) { uint4 null1_c[4]; };
-cbuffer Null2 : register(b3) { uint4 null2_c[4]; };
-cbuffer Null3 : register(b4) { uint4 null3_c[4]; };
+#define RS "DescriptorTable(SRV(t0, numDescriptors=5)), UAV(u0)"
+ByteAddressBuffer small_c : register(t0);
+ByteAddressBuffer null0_c : register(t1);
+ByteAddressBuffer null1_c : register(t2);
+ByteAddressBuffer null2_c : register(t3);
+ByteAddressBuffer null3_c : register(t4);
 RWByteAddressBuffer out_buf : register(u0);
 [RootSignature(RS)]
 [numthreads(1, 1, 1)]
 void main() {
     for (uint i = 0; i < 16; ++i) {
-        out_buf.Store4(i * 16, small_c[i]);
+        out_buf.Store4(i * 16, small_c.Load4(i * 16));
     }
-    out_buf.Store4(256, null0_c[0]);
-    out_buf.Store4(272, null1_c[0]);
-    out_buf.Store4(288, null2_c[0]);
-    out_buf.Store4(304, null3_c[0]);
+    out_buf.Store4(256, null0_c.Load4(0));
+    out_buf.Store4(272, null1_c.Load4(0));
+    out_buf.Store4(288, null2_c.Load4(0));
+    out_buf.Store4(304, null3_c.Load4(0));
 }
 "#;
         let (root, pso) = compile_compute(host, SOURCE);
@@ -3336,10 +3364,8 @@ void main() {
         );
         let heap_start = crate::descriptor::heap(heap_this).start;
 
-        // 32-byte title constant payload, 16 bytes past a 256-byte line:
-        // at a 256-aligned address (1 run in ~16 on the stack) the view is
-        // bound in place in its shadow window, which shows the title's own
-        // bytes past the view instead of zeroed scratch padding.
+        // 32-byte title constant payload, 16 bytes past a 256-byte line: a
+        // host constant buffer view could not be made on it in place.
         #[repr(C, align(256))]
         struct Lined([u32; 12]);
         let lined = Lined([
@@ -3360,7 +3386,7 @@ void main() {
         let addr = title_data.as_ptr() as u64;
         let (lo, hi) = (addr as u32, (addr >> 32) as u32);
         let cbvs = [
-            [lo, hi, 32, 0],           // valid 32-byte CBV (padded to 256)
+            [lo, hi, 32, 0],           // valid 32-byte CBV (a 32-byte raw view)
             [0, 0, 0, 0],              // explicit null CBV
             [lo, hi, 0, 0],            // zero-sized CBV
             [0, 0, 256, 0],            // zero-address CBV
@@ -3424,7 +3450,7 @@ void main() {
         assert_eq!(&got[..8], title_data, "in-bounds CBV bytes must match title memory");
         assert!(
             got[8..64].iter().all(|&w| w == 0),
-            "CBV padding bytes [32..256) must read as zero, got {:x?}",
+            "bytes past the CBV's size [32..256) must read as zero, got {:x?}",
             &got[8..16]
         );
         assert!(
