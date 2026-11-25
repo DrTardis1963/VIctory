@@ -887,20 +887,23 @@ impl State {
     /// For a shader that reads title memory by address
     /// ([`crate::memory`]): its directory, fault notes and view slots,
     /// with the pages of the root views the list has set made ready.
-    fn memory_ready(&self, list: &HostList, compute: bool, writes: bool) -> Option<crate::memory::Ready> {
+    fn memory_ready(&self, list: &HostList, uavs: &[(u8, u32)], compute: bool, writes: bool) -> Option<crate::memory::Ready> {
         let heap = match self.heaps[0] {
             0 => None,
             h => crate::descriptor::heap(h as This).host(),
         }?;
-        let (mut addresses, mut constants) = (Vec::new(), Vec::new());
-        for root in self.roots_ref(compute) {
+        // The root views the shader stores through (`uavs`: its root
+        // UAVs' slots), the others, and the constants.
+        let (mut read, mut written, mut constants) = (Vec::new(), Vec::new(), Vec::new());
+        for (slot, root) in self.roots_ref(compute).iter().enumerate() {
             match root {
-                Root::View(address) => addresses.push(*address),
+                Root::View(address) if uavs.iter().any(|&(s, _)| usize::from(s) == slot) => written.push(*address),
+                Root::View(address) => read.push(*address),
                 Root::Constants(values) => constants.extend_from_slice(values),
                 _ => {}
             }
         }
-        crate::memory::ready(list, heap, &addresses, &constants, writes)
+        crate::memory::ready(list, heap, &read, &written, &constants, writes)
     }
 
     /// The bound heap holding `handle`.
@@ -1087,7 +1090,7 @@ impl State {
                 && !crate::pipeline::builder_quarantined(self.pipeline as This);
             // Title memory by address: what the shader finds it by.
             let memory = if t.host.root_srvs.contains(&victory_shader::emit::SLOT_MEMORY) {
-                let Some(ready) = self.memory_ready(list, compute, writes) else {
+                let Some(ready) = self.memory_ready(list, &stage.root_uavs, compute, writes) else {
                     once!("a shader that reads title memory by address without a view heap to hold its views: the draw is dropped");
                     return false;
                 };

@@ -3419,6 +3419,7 @@ fn read_backs(list: &HostList) {
 /// After the card ran what declared `back`: what shaders wrote there goes
 /// into title memory, and the ranges are done with.
 fn hand_back(back: &[Declared]) {
+    crate::memory::take_dirty();
     if crate::shadow::wide_back() {
         // Every range first (the pieces that differ, found on several
         // threads), then the merges, in order, as below.
@@ -4274,6 +4275,7 @@ impl Host {
                         }
                     }
                 }
+                crate::memory::take_dirty();
                 relay_hand_back(&back);
                 // Only now, and flight by flight: a range another flight
                 // in the air declared too stays closed to refreshes.

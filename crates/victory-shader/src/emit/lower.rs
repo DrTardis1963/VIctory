@@ -3117,6 +3117,13 @@ impl<'a> Lower<'a> {
     /// (and drops writes) through the null view at the first slot, and its
     /// number is left for the host, for lanes that run (`guard`).
     fn memory(&mut self, lo: V, hi: V, guard: Option<V>) -> (V, V) {
+        let (h, byte, _, _) = self.memory_with_page(lo, hi, guard);
+        (h, byte)
+    }
+
+    /// [`Self::memory`], and the page's number and its copy's, for
+    /// [`Self::mark_memory_dirty`].
+    fn memory_with_page(&mut self, lo: V, hi: V, guard: Option<V>) -> (V, V, V, V) {
         use super::shader::{MEMORY_FAULTS, MEMORY_PAGES, SLOT_FAULTS, SLOT_MEMORY, USER_MEMORY_BASE};
         let c = self.cur;
         let (i32t, res) = (self.s.t.i32, self.s.t.res_ret);
@@ -3178,7 +3185,32 @@ impl<'a> Lower<'a> {
         let k64k = k(self, 0xFFFF);
         let within = self.s.m.bin(c, Bin::And, lo, k64k);
         let byte = self.s.m.bin(c, Bin::Add, start, within);
-        (h, byte)
+        (h, byte, page, copy)
+    }
+
+    /// After a store to title memory by address, inside its guard: sets the
+    /// page's bit in the mask behind the fault notes (`shader.rs`
+    /// `MEMORY_DIRTY_DWORDS`), so the host looks for shader writes only in
+    /// pages shaders wrote. A page without a copy (`copy` 0) sets no bit, at
+    /// the sink. Port of fxceless/victory-fork #814.
+    fn mark_memory_dirty(&mut self, page: V, copy: V) {
+        use super::shader::{MEMORY_FAULTS, SLOT_FAULTS};
+        let c = self.cur;
+        let i32t = self.s.t.i32;
+        let iu = self.s.m.undef(i32t);
+        let k = |l: &mut Self, v: u32| l.s.m.i32(v);
+        let (zero, one, or, k5, k31, k2, base) = (k(self, 0), k(self, 1), k(self, 2), k(self, 5), k(self, 31), k(self, 2), k(self, MEMORY_FAULTS));
+        let mapped = self.s.m.cmp(c, pred::NE, copy, zero);
+        let word = self.s.m.bin(c, Bin::LShr, page, k5);
+        let dword = self.s.m.bin(c, Bin::Add, base, word);
+        let at = self.s.m.bin(c, Bin::Shl, dword, k2);
+        let at = self.s.m.select(c, mapped, at, zero);
+        let bit = self.s.m.bin(c, Bin::And, page, k31);
+        let bit = self.s.m.bin(c, Bin::Shl, one, bit);
+        let bit = self.s.m.select(c, mapped, bit, zero);
+        let faults = self.s.root_uav_handle(SLOT_FAULTS);
+        self.s
+            .op(c, "atomicBinOp.i32", Attr::NoUnwind, i32t, 78, &[faults, or, at, iu, iu, bit]);
     }
 
     /// `global_load_*`, `global_store_*` and `global_atomic_*` on title
@@ -3248,7 +3280,7 @@ impl<'a> Lower<'a> {
             let n = count(rest)?;
             let d = data.as_ref().ok_or("global store data")?;
             let vals = self.vgprs(inst, d, n)?;
-            let (h, byte) = self.memory(lo, hi, guard);
+            let (h, byte, page, copy) = self.memory_with_page(lo, hi, guard);
             let mut args = vec![h, byte, iu];
             args.extend(&vals);
             args.resize(3 + 4, iu);
@@ -3257,6 +3289,20 @@ impl<'a> Lower<'a> {
             let at = self.begin_guarded(guard);
             self.s
                 .op(self.cur, "rawBufferStore.i32", Attr::NoUnwind, void, 140, &args);
+            self.mark_memory_dirty(page, copy);
+            if n > 1 {
+                // Several dwords may end in the next page.
+                let c = self.cur;
+                let k = |l: &mut Self, v: u32| l.s.m.i32(v);
+                let (k64k, limit, one, zero) = (k(self, 0xFFFF), k(self, 0x10000 - 4 * u32::from(n)), k(self, 1), k(self, 0));
+                let last = k(self, super::shader::MEMORY_PAGES - 1);
+                let within = self.s.m.bin(c, Bin::And, lo, k64k);
+                let crosses = self.s.m.cmp(c, pred::IUGT, within, limit);
+                let next = self.s.m.bin(c, Bin::Add, page, one);
+                let next = self.s.op(c, "binary.i32", Attr::ReadNone, i32t, 40, &[next, last]);
+                let copy = self.s.m.select(c, crosses, copy, zero);
+                self.mark_memory_dirty(next, copy);
+            }
             self.end_guarded(at, &[]);
             return Ok(());
         }
@@ -3275,7 +3321,7 @@ impl<'a> Lower<'a> {
             Some(x) => self.i32_of(x)?,
             None => self.s.m.i32(0),
         };
-        let (h, byte) = self.memory(lo, hi, guard);
+        let (h, byte, page, copy) = self.memory_with_page(lo, hi, guard);
         // DXIL's atomic operations: add 0, and 1, or 2, xor 3, signed
         // minimum 4 and maximum 5, unsigned 6 and 7, exchange 8.
         let simple = match op {
@@ -3361,6 +3407,7 @@ impl<'a> Lower<'a> {
                 found
             }
         };
+        self.mark_memory_dirty(page, copy);
         let was = self.end_guarded(at, &[(was, old)])[0];
         if let Some(reg) = back {
             self.write(inst, Reg::V(reg), was, None);
@@ -12529,6 +12576,37 @@ mod tests {
             prims: vec![],
             mesh_stride: 0,
         })
+    }
+
+    /// A store to title memory by address also sets its page's bit behind
+    /// the fault notes (`mark_memory_dirty`): the module stays valid.
+    /// (Port of the test of fxceless/victory-fork #814.)
+    #[test]
+    fn a_store_by_address_marks_its_page_for_the_host() {
+        let layout = vec![RootParam {
+            root: RootType::Constants,
+            table_offset_dwords: 0,
+            sgprs: 2,
+            base_register: 0,
+            user_data: 0,
+            slot: 0,
+        }];
+        let words = [
+            0x7E00_0200, // v_mov_b32 v0, s0
+            0x7E02_0201, // v_mov_b32 v1, s1
+            0x7E04_0281, // v_mov_b32 v2, 1
+            0xDC70_8000,
+            0x007D_0200, // global_store_dword v[0:1], v2
+            S_ENDPGM,
+        ];
+        let lowered = lower_with(&words, layout, Vec::new()).expect("a store by address");
+        assert!(lowered.root_srvs.contains(&super::super::shader::SLOT_MEMORY));
+        assert!(lowered.root_uavs.contains(&super::super::shader::SLOT_FAULTS));
+        use crate::emit::validator::Validator;
+        if let Ok(mut v) = Validator::load(Validator::default_path().as_deref()) {
+            let mut copy = lowered.dxil.clone();
+            v.validate(&mut copy).expect("DXIL validation failed");
+        }
     }
 
     /// Root parameter `slot` in user SGPRs from `user_data` on.
