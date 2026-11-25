@@ -19,6 +19,10 @@ This file guides Claude Code and other AI coding agents working in this reposito
   - `cargo xtask harness compare <a/report.json> <b/report.json>` — side-by-side A/B delta table.
   - `cargo xtask harness prepare --profile tuned-8gb ...` — generates isolated launcher + `run_meta.json` outside the repo.
   - `cargo xtask harness shader <hash> --config <toml>` — diagnoses a single refused/dropped shader container.
+- **Power-Loss Durability, Shared Credentials & Dual Backups**:
+  - `.git/config` enforces `core.fsync = all`, `core.fsyncMethod = fsync`, `fetch.fsckObjects = true`, and `transfer.fsckObjects = true` so git metadata survives sudden power loss.
+  - Private-repo authentication (`DrTardis1963/victory-unified`, `DrTardis1963/VIctory`) uses the shared system `credential.helper = manager` (Git Credential Manager); never embed tokens or passwords in `.git/config`, URLs, or CLI commands.
+  - Every synthesis milestone is backed up in two places: `unified` remote `refs/heads/backup/*` branches and offline local git bundles + `.git/config` backup in `%LOCALAPPDATA%\victory-backups\`.
 - **Always run before committing**:
   ```powershell
   $env:PATH = "$env:USERPROFILE\.cargo\bin;$env:PATH"
