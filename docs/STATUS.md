@@ -14,6 +14,7 @@
 | Antigravity | `.worktrees/unified` | `synthesis/unified` | `WillyboPeep/victory-all-forks` security audit & Waves 1–3 synthesis | `DONE` | 2026-11-25 |
 | Existing local work | `.` (root) | `legal/policy-and-runtime-guards` | Uncommitted local edits (8 files) — **DO NOT TOUCH** | `RESERVED` | 2026-11-25 |
 | Existing local work | `.worktrees/agy` | `fix/loader-tls-redirect-bounds-and-empty-section` | Existing worktree — **DO NOT TOUCH** | `RESERVED` | 2026-11-25 |
+| Claude Code | `.worktrees/claude-heap-pass-copyback` | `claude/heap-pass-copyback` | Port all-forks heap buffer pass on marked slots (7447a7a) and 4 KiB copy-back parts (6ca2743), left out of Wave 3 | `IN PROGRESS` | 2026-11-26 |
 
 ---
 
