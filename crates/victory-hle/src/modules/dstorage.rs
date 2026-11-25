@@ -141,10 +141,12 @@ extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out
         tracing::warn!(path = name, %error, "dstorage: opening a file failed");
         return from_win32(&error);
     }
+    let kept = name.clone();
     tracing::info!(path = name, iid = iid_text(iid), "dstorage: file opened");
     // SAFETY: a handle we just opened and nobody else owns.
     let file = unsafe { std::fs::File::from_raw_handle(handle) };
     let file = Instance::create(Object::new("dstorage file", &FILE_VTABLE), File { file });
+    WALLS_FILES.lock().unwrap_or_else(|e| e.into_inner()).push((file as usize, kept));
     put(out, file)
 }
 
@@ -440,8 +442,64 @@ impl Scheduler {
     }
 }
 
+/// The walls trace (`VICTORY_WALLS_TRACE`): 0 or unset: off; 1: a line for
+/// every read request that fails, with its file; 2: for every request (the
+/// list of a launch's reads, by file and offset, is what a launch with the
+/// first room's walls and one without are compared by).
+fn walls_trace() -> u8 {
+    static ON: OnceLock<u8> = OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("VICTORY_WALLS_TRACE").ok().and_then(|v| v.trim().parse::<u8>().ok()).unwrap_or(0)
+    })
+}
+
+/// The files opened, by the address of our file object, with their paths
+/// (for the walls trace: a request names its file by that address).
+static WALLS_FILES: Mutex<Vec<(usize, String)>> = Mutex::new(Vec::new());
+
+/// The walls trace's line for a request that is done.
+fn walls_request(request: &Request, result: &Result<(), HRESULT>, started: std::time::Instant) {
+    let level = walls_trace();
+    if level == 0 || (level == 1 && result.is_ok()) {
+        return;
+    }
+    let file = if request.options & MEMORY_SOURCE != 0 {
+        "memory".to_string()
+    } else {
+        let files = WALLS_FILES.lock().unwrap_or_else(|e| e.into_inner());
+        let source = request.source as usize;
+        files.iter().find(|f| f.0 == source).map_or_else(|| "?".to_string(), |f| f.1.clone())
+    };
+    let hr = match result {
+        Ok(()) => 0,
+        Err(hr) => *hr as u32,
+    };
+    tracing::info!(
+        file,
+        offset = request.offset,
+        source_size = request.source_size,
+        destination_size = request.destination_size,
+        to_pages = request.options & PAGE_DESTINATION != 0,
+        options = format_args!("{:#x}", request.options),
+        ms = started.elapsed().as_millis() as u64,
+        ok = result.is_ok(),
+        hr = format_args!("{hr:#010x}"),
+        "walls trace: a read request is done"
+    );
+}
+
 /// A worker: runs the next read of the most deserving queue.
 fn work(scheduler: &'static Scheduler) {
+    // `VICTORY_DISK_CORES=slow`: the workers leave the fast cores to the
+    // title's threads (`victory_gpu::framelog::keep_on_slow_cores`; off by
+    // default until it is measured).
+    #[cfg(windows)]
+    {
+        static SLOW: OnceLock<bool> = OnceLock::new();
+        if *SLOW.get_or_init(|| std::env::var_os("VICTORY_DISK_CORES").is_some_and(|v| v == "slow")) {
+            victory_gpu::framelog::keep_on_slow_cores("dstorage worker");
+        }
+    }
     let mut lanes = scheduler.lock();
     loop {
         let Some(job) = lanes.start() else {
@@ -451,6 +509,7 @@ fn work(scheduler: &'static Scheduler) {
         drop(lanes);
         let started = std::time::Instant::now();
         let result = execute(&job.request);
+        walls_request(&job.request, &result, started);
         lanes = scheduler.lock();
         lanes.finish(&job, result);
         lanes.count(&job, started);
@@ -468,6 +527,13 @@ impl Lanes {
         *requests += 1;
         *bytes += u64::from(job.request.destination_size);
         *busy += started.elapsed();
+        #[cfg(windows)]
+        {
+            use victory_gpu::framelog::{T, add};
+            add(T::DiskReads, 1);
+            add(T::DiskBytes, u64::from(job.request.destination_size));
+            add(T::DiskUs, started.elapsed().as_micros() as u64);
+        }
         if job.request.options & BCPACK != 0 {
             self.bcpack.0 += u64::from(job.request.destination_size);
             self.bcpack.1 += started.elapsed();
@@ -1003,6 +1069,44 @@ fn copy_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
     }
 }
 
+/// Makes the committed pages of `[at, at + len)` that cannot be written
+/// read-write; returns each such region with its old protection.
+fn open_read_only(at: usize, len: usize) -> Vec<(usize, usize, u32)> {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE_READWRITE, PAGE_EXECUTE_WRITECOPY, PAGE_GUARD,
+        PAGE_READWRITE, PAGE_WRITECOPY, VirtualProtect, VirtualQuery,
+    };
+    let (mut p, end, mut opened) = (at, at + len, Vec::new());
+    while p < end {
+        // SAFETY: plain data filled in by the query.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out pointer of the right size.
+        if unsafe { VirtualQuery(p as *const _, &mut info, size_of_val(&info)) } == 0 {
+            break;
+        }
+        let region_end = (info.BaseAddress as usize + info.RegionSize).min(end);
+        let writable = PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+        if info.State == MEM_COMMIT && (info.Protect & writable == 0 || info.Protect & PAGE_GUARD != 0) {
+            let mut old = 0;
+            // SAFETY: committed title memory the request names; only its protection changes.
+            if unsafe { VirtualProtect(p as *const _, region_end - p, PAGE_READWRITE, &mut old) } != 0 {
+                opened.push((p, region_end - p, old));
+            }
+        }
+        p = region_end;
+    }
+    opened
+}
+
+/// Gives the regions [`open_read_only`] opened their protection back.
+fn close_again(regions: &[(usize, usize, u32)]) {
+    for &(at, len, old) in regions {
+        let mut was = 0;
+        // SAFETY: regions we opened just before.
+        unsafe { windows_sys::Win32::System::Memory::VirtualProtect(at as *const _, len, old, &mut was) };
+    }
+}
+
 /// Runs `fill` on the destination's first `len` bytes; `fill` returns how
 /// many it produced. GPU-visible destinations are host memory like the
 /// rest (GPU address = CPU address), so an address is written in place;
@@ -1014,37 +1118,60 @@ fn into_destination(
     fill: impl FnOnce(&mut [u8]) -> Result<usize, HRESULT>,
 ) -> Result<(), HRESULT> {
     if request.options & PAGE_DESTINATION == 0 {
-        // Raw reads land through the kernel, which does not fault into the
-        // GPU side's guard on title buffers; open them first.
+        // Opens the guarded blocks and tells the GPU side a placed texture
+        // there changes. `fill` writes from user mode (a file read is read
+        // beside first, see `execute`), so a block guarded again meanwhile
+        // faults into the guard instead of failing the write.
         victory_gpu::kernel_will_write(request.destination as usize, len);
         // SAFETY: the title's destination holds `destination_size` bytes, at
         // least `len`, and nothing else writes it until completion.
         let out = unsafe { std::slice::from_raw_parts_mut(request.destination.cast::<u8>(), len) };
-        return fill(out).map(drop);
+        // The console's engine writes past the processor's page protection;
+        // pages the title made read-only (no guard of ours) are opened for
+        // the write and closed again (a fault here, run of 25/11).
+        let closed = open_read_only(request.destination as usize, len);
+        let filled = fill(out).map(drop);
+        close_again(&closed);
+        // Said again now that the bytes are there (upstream's c75fdba holds
+        // the blocks open over the read and marks them once more at its
+        // end): a copy or a texture pass that took the memory while the
+        // read was under way took what was there before. Counted; acted on
+        // only with `VICTORY_PAGE_WRITES=all`.
+        victory_gpu::title_memory_written(request.destination as usize, len, false);
+        return filled;
     }
     let offset = (request.page_offset & 0xffff) as usize;
     let pages = &filled(request.destination.cast(), (offset + len).div_ceil(PAGE))[..];
     // Consecutive pages of one allocation (the usual case): written in
     // place through one view.
     if let Some(mut window) = super::xmem::page_window(pages, offset, len) {
-        let filled = fill(window.bytes());
-        // With the bytes in: the title's views of them changed without a
-        // fault of theirs (`victory_gpu`'s guard).
-        window.written();
-        return filled.map(drop);
+        let filled = fill(window.bytes()).map(drop);
+        drop(window);
+        // The title maps pages where the card reads them and has them
+        // filled afterwards: the GPU side's copies of those addresses
+        // learn of the bytes only from this (upstream c75fdba, fork PR
+        // #571). After a decode that failed part way too: what it wrote
+        // is there.
+        super::xmem::pages_written(pages, offset, len);
+        return filled;
     }
     let mut data = vec![0; len];
     let n = fill(&mut data)?;
-    // A page the title has just made, or a view the host refuses for a moment (commit
-    // or address space short while a load maps many at once), can come right a little
-    // later: tried again before the request fails (`VICTORY_DSTORAGE_RETRIES`, default 12,
-    // about 1.5 s in all).
+    // A page the title has just made, or a view the host refuses for a
+    // moment, comes right a little later: the write is tried again before
+    // the request fails (`VICTORY_DSTORAGE_RETRIES`, 12 tries, about 0.9 s
+    // in all; 0: not tried again, as before). Runs 175-178 lost 12 to 446
+    // reads a launch here, all in one second of the loading; the one build
+    // that tried again (run 165) lost none of 13.
     static RETRIES: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     let retries = *RETRIES.get_or_init(|| {
-        std::env::var("VICTORY_DSTORAGE_RETRIES").ok().and_then(|v| v.parse().ok()).unwrap_or(12)
+        std::env::var("VICTORY_DSTORAGE_RETRIES").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(12)
     });
+    // Since the start: writes that succeeded on a later try, and writes
+    // given up.
+    static RETRIED: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
     let mut written = super::xmem::write_physical(pages, offset, &data[..n]);
-    let mut tries = 0;
+    let mut tries = 0u32;
     while !written && tries < retries {
         std::thread::sleep(std::time::Duration::from_millis((2u64 << tries.min(6)).min(128)));
         tries += 1;
@@ -1052,12 +1179,28 @@ fn into_destination(
     }
     if written {
         if tries > 0 {
-            tracing::info!(offset, len, tries, "dstorage: a destination's physical pages written after a retry");
+            let on_a_retry = RETRIED[0].fetch_add(1, Ordering::Relaxed) + 1;
+            tracing::info!(
+                offset,
+                len,
+                tries,
+                on_a_retry,
+                given_up = RETRIED[1].load(Ordering::Relaxed),
+                "dstorage: a destination's physical pages written after a retry"
+            );
         }
+        // As above, after the write that succeeded.
+        super::xmem::pages_written(pages, offset, n);
         Ok(())
     } else {
-        let known = super::xmem::pages_known(pages, offset, len);
-        tracing::warn!(known, last_error = std::io::Error::last_os_error().raw_os_error(), "dstorage: retries used up");
+        let given_up = RETRIED[1].fetch_add(1, Ordering::Relaxed) + 1;
+        tracing::warn!(
+            known = super::xmem::pages_known(pages, offset, len),
+            tries,
+            given_up,
+            on_a_retry = RETRIED[0].load(Ordering::Relaxed),
+            "dstorage: retries used up (VICTORY_DSTORAGE_RETRIES)"
+        );
         // Said aloud: the title never reads a request's result
         // (it only polls for completion), so a destination left unwritten
         // is a model or texture that silently holds whatever its pages
@@ -1325,11 +1468,19 @@ mod tests {
         void(queue, 0x40);
     }
 
-    /// A raw read the kernel cannot land is done again and copied in by us;
-    /// where that cannot write either (read-only memory no guard of ours
-    /// holds), the request fails with the host's error, no fault.
+    fn writable_now(at: usize) -> bool {
+        use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, PAGE_READWRITE, VirtualQuery};
+        // SAFETY: plain data filled in by the query.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out pointer of the right size.
+        unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
+        info.Protect == PAGE_READWRITE
+    }
+
+    /// Read-only memory no guard of ours holds is written all the same,
+    /// like the console's engine does, and stays read-only afterwards.
     #[test]
-    fn raw_reads_into_read_only_memory_fail_cleanly() {
+    fn reads_into_read_only_memory_land_and_keep_its_protection() {
         use windows_sys::Win32::System::Memory::{
             MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READONLY, VirtualAlloc, VirtualFree,
         };
@@ -1342,9 +1493,10 @@ mod tests {
         enqueue(queue, &request(0, at, plain.len(), file, 0, plain.len()));
         enqueue_status(queue, array, 0);
         void(queue, 0x30);
-        assert!(matches!(wait(array, 0), NO_ACCESS | INVALID_USER_BUFFER));
+        assert_eq!(wait(array, 0), S_OK);
         // SAFETY: our readable allocation.
-        assert!(unsafe { std::slice::from_raw_parts(at.cast::<u8>(), 8192) }.iter().all(|&b| b == 0));
+        assert_eq!(unsafe { std::slice::from_raw_parts(at.cast::<u8>(), plain.len()) }, &plain[..]);
+        assert!(!writable_now(at as usize), "the title's protection is given back");
         void(queue, 0x40);
         // SAFETY: our allocation.
         unsafe { VirtualFree(at, 0, MEM_RELEASE) };

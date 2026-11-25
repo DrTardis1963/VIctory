@@ -1232,6 +1232,26 @@ fn pops_wave_sgpr(x: &Parts) -> Option<u8> {
         .filter(|_| readers.count() > 0)
 }
 
+/// The refusal of a first half of an interpolation whose result is read
+/// as data ([`Lower::interp`]).
+pub(super) const FIRST_HALF: &str = "the first half of an interpolation";
+
+thread_local! {
+    /// Whether first halves of interpolations are evaluated as the pair
+    /// they start ([`with_first_half_pairs`]).
+    static FIRST_HALF_PAIRS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `translate` with first halves of interpolations evaluated as the
+/// pair they start: the translation of a program refused with
+/// [`FIRST_HALF`] (`VICTORY_FIRST_HALF=0`: refused again, as before).
+pub(super) fn with_first_half_pairs<R>(translate: impl FnOnce() -> R) -> R {
+    let before = FIRST_HALF_PAIRS.replace(true);
+    let result = translate();
+    FIRST_HALF_PAIRS.set(before);
+    result
+}
+
 pub fn host_max_wave() -> u32 {
     #[cfg(test)]
     if let Some(lanes) = TEST_HOST_WAVE.get() {
@@ -1348,6 +1368,29 @@ fn packed_half(
     })
 }
 
+/// Whether a pixel program runs its depth and stencil tests before the
+/// shader on the console (`DB_SHADER_CONTROL.DEPTH_BEFORE_SHADER`, bit 12:
+/// HLSL `[earlydepthstencil]`), so the host is told too (ShaderFlags
+/// ForceEarlyDepthStencil). Without it the host tests after the shader, and
+/// a program that writes unordered views writes them for pixels the depth
+/// test then rejects: the title's glass prepass wrote its depth and motion
+/// for every pixel of a window pane, the character standing in front of it
+/// too, and a later pass copied those over the character's. Not for a
+/// program that exports depth, stencil or coverage (bits 0-2 and 8, or such
+/// an output), which cannot test before it runs.
+pub(super) fn early_depth(io: &StageIo, outputs: &[SigElement]) -> bool {
+    const DEPTH_BEFORE_SHADER: u32 = 1 << 12;
+    const EXPORTS: u32 = 0b111 | 1 << 8;
+    let StageIo::Ps { db_shader_control, .. } = io else {
+        return false;
+    };
+    // SV_Depth, SV_DepthLessEqual, SV_DepthGreaterEqual, SV_Coverage,
+    // SV_StencilRef.
+    db_shader_control & DEPTH_BEFORE_SHADER != 0
+        && db_shader_control & EXPORTS == 0
+        && !outputs.iter().any(|o| matches!(o.kind, 14 | 17 | 18 | 19 | 20))
+}
+
 /// The pixel inputs packing two 16-bit rows per dword, as (first row,
 /// second row) ([`packed_layout`]).
 fn input_packs(io: &StageIo, inputs: &[SigElement]) -> Vec<(u8, Option<u8>)> {
@@ -1455,6 +1498,9 @@ impl<'a> Lower<'a> {
         let pops_sgpr = if s.rov { pops_wave_sgpr(x) } else { None };
         s.inputs = x.inputs.clone();
         s.outputs = x.outputs.clone();
+        if early_depth(&x.native.io, &x.outputs) {
+            s.flags |= flags::EARLY_DEPTH;
+        }
         let insts = || p.blocks.iter().flat_map(|b| &b.insts);
         let writes_uavs = insts().any(|i| {
             matches!(i.fields, Fields::Image { .. } | Fields::Buffer { .. })
@@ -1760,7 +1806,9 @@ impl<'a> Lower<'a> {
                 // the other half of its dst, PS_DeferredTextured): evaluated as the pair it
                 // starts. Approximate for those other bits (P0 + i P10 on the console); a
                 // first half only the second half reads is gone before lowering.
-                if std::env::var_os("VICTORY_FIRST_HALF").is_none_or(|v| v != "0") {
+                // Only in the second translation of a program the first
+                // one refused for it ([`with_first_half_pairs`]).
+                if FIRST_HALF_PAIRS.get() && std::env::var_os("VICTORY_FIRST_HALF").is_none_or(|v| v != "0") {
                     for (_, i) in &x.io.interps {
                         if let Interp::Interpolated { first, .. } = i {
                             for s in first {
@@ -2620,6 +2668,18 @@ impl<'a> Lower<'a> {
             Input::ThreadIdInGroup(c) => return self.thread_id(c),
             Input::GroupId(c) => return self.compute_id("groupId.i32", 94, c),
             Input::GroupInfo => return Val::Missing("the thread-group info SGPR"),
+            // The dispatch's threads along x less those of the groups before
+            // this one (a dispatch by group count has `u32::MAX` of them).
+            Input::ThreadLimit => {
+                let total = self.host_word(RootType::Other(super::shader::USER_THREAD_LIMIT), 0, 0);
+                let Val::I32(group) = self.compute_id("groupId.i32", 94, 0) else {
+                    unreachable!()
+                };
+                let e = self.s.entry;
+                let x = self.s.m.i32(self.s.threads.expect("compute")[0]);
+                let before = self.s.m.bin(e, Bin::Mul, group, x);
+                return Val::I32(self.s.m.bin(e, Bin::Sub, total, before));
+            }
             Input::MeshGroup => {
                 let Val::I32(g) = self.compute_id("groupId.i32", 94, 0) else {
                     unreachable!()
@@ -3100,6 +3160,13 @@ impl<'a> Lower<'a> {
     /// (and drops writes) through the null view at the first slot, and its
     /// number is left for the host, for lanes that run (`guard`).
     fn memory(&mut self, lo: V, hi: V, guard: Option<V>) -> (V, V) {
+        let (h, byte, _, _) = self.memory_with_page(lo, hi, guard);
+        (h, byte)
+    }
+
+    /// [`Self::memory`], and the page's number and its copy's, for
+    /// [`Self::mark_memory_dirty`].
+    fn memory_with_page(&mut self, lo: V, hi: V, guard: Option<V>) -> (V, V, V, V) {
         use super::shader::{MEMORY_FAULTS, MEMORY_PAGES, SLOT_FAULTS, SLOT_MEMORY, USER_MEMORY_BASE};
         let c = self.cur;
         let (i32t, res) = (self.s.t.i32, self.s.t.res_ret);
@@ -3161,7 +3228,32 @@ impl<'a> Lower<'a> {
         let k64k = k(self, 0xFFFF);
         let within = self.s.m.bin(c, Bin::And, lo, k64k);
         let byte = self.s.m.bin(c, Bin::Add, start, within);
-        (h, byte)
+        (h, byte, page, copy)
+    }
+
+    /// After a store to title memory by address, inside its guard: sets the
+    /// page's bit in the mask behind the fault notes (`shader.rs`
+    /// `MEMORY_DIRTY_DWORDS`), so the host looks for shader writes only in
+    /// pages shaders wrote. A page without a copy (`copy` 0) sets no bit, at
+    /// the sink. Port of fxceless/victory-fork #814.
+    fn mark_memory_dirty(&mut self, page: V, copy: V) {
+        use super::shader::{MEMORY_FAULTS, SLOT_FAULTS};
+        let c = self.cur;
+        let i32t = self.s.t.i32;
+        let iu = self.s.m.undef(i32t);
+        let k = |l: &mut Self, v: u32| l.s.m.i32(v);
+        let (zero, one, or, k5, k31, k2, base) = (k(self, 0), k(self, 1), k(self, 2), k(self, 5), k(self, 31), k(self, 2), k(self, MEMORY_FAULTS));
+        let mapped = self.s.m.cmp(c, pred::NE, copy, zero);
+        let word = self.s.m.bin(c, Bin::LShr, page, k5);
+        let dword = self.s.m.bin(c, Bin::Add, base, word);
+        let at = self.s.m.bin(c, Bin::Shl, dword, k2);
+        let at = self.s.m.select(c, mapped, at, zero);
+        let bit = self.s.m.bin(c, Bin::And, page, k31);
+        let bit = self.s.m.bin(c, Bin::Shl, one, bit);
+        let bit = self.s.m.select(c, mapped, bit, zero);
+        let faults = self.s.root_uav_handle(SLOT_FAULTS);
+        self.s
+            .op(c, "atomicBinOp.i32", Attr::NoUnwind, i32t, 78, &[faults, or, at, iu, iu, bit]);
     }
 
     /// `global_load_*`, `global_store_*` and `global_atomic_*` on title
@@ -3231,7 +3323,7 @@ impl<'a> Lower<'a> {
             let n = count(rest)?;
             let d = data.as_ref().ok_or("global store data")?;
             let vals = self.vgprs(inst, d, n)?;
-            let (h, byte) = self.memory(lo, hi, guard);
+            let (h, byte, page, copy) = self.memory_with_page(lo, hi, guard);
             let mut args = vec![h, byte, iu];
             args.extend(&vals);
             args.resize(3 + 4, iu);
@@ -3240,6 +3332,20 @@ impl<'a> Lower<'a> {
             let at = self.begin_guarded(guard);
             self.s
                 .op(self.cur, "rawBufferStore.i32", Attr::NoUnwind, void, 140, &args);
+            self.mark_memory_dirty(page, copy);
+            if n > 1 {
+                // Several dwords may end in the next page.
+                let c = self.cur;
+                let k = |l: &mut Self, v: u32| l.s.m.i32(v);
+                let (k64k, limit, one, zero) = (k(self, 0xFFFF), k(self, 0x10000 - 4 * u32::from(n)), k(self, 1), k(self, 0));
+                let last = k(self, super::shader::MEMORY_PAGES - 1);
+                let within = self.s.m.bin(c, Bin::And, lo, k64k);
+                let crosses = self.s.m.cmp(c, pred::IUGT, within, limit);
+                let next = self.s.m.bin(c, Bin::Add, page, one);
+                let next = self.s.op(c, "binary.i32", Attr::ReadNone, i32t, 40, &[next, last]);
+                let copy = self.s.m.select(c, crosses, copy, zero);
+                self.mark_memory_dirty(next, copy);
+            }
             self.end_guarded(at, &[]);
             return Ok(());
         }
@@ -3258,7 +3364,7 @@ impl<'a> Lower<'a> {
             Some(x) => self.i32_of(x)?,
             None => self.s.m.i32(0),
         };
-        let (h, byte) = self.memory(lo, hi, guard);
+        let (h, byte, page, copy) = self.memory_with_page(lo, hi, guard);
         // DXIL's atomic operations: add 0, and 1, or 2, xor 3, signed
         // minimum 4 and maximum 5, unsigned 6 and 7, exchange 8.
         let simple = match op {
@@ -3344,6 +3450,7 @@ impl<'a> Lower<'a> {
                 found
             }
         };
+        self.mark_memory_dirty(page, copy);
         let was = self.end_guarded(at, &[(was, old)])[0];
         if let Some(reg) = back {
             self.write(inst, Reg::V(reg), was, None);
@@ -4710,6 +4817,17 @@ impl<'a> Lower<'a> {
         )
     }
 
+    /// Whether a read of another lane of this lane's quad must reach helper
+    /// lanes: in a pixel shader, always. At a triangle's edge the quad's
+    /// other pixels are helpers (and so are discarded ones), which only quad
+    /// reads see: wave reads give 0 from them on AMD, so a derivative taken
+    /// by hand (`quad_perm`) was the whole value there, the texture read
+    /// that used it took its smallest level, and the triangles' edges showed
+    /// as lines on car paint, glass and skin.
+    fn helpers_read(&self, quad: bool) -> bool {
+        quad && self.s.pixel
+    }
+
     /// `x` of lane `src` (in this lane's quad) through quad reads, whose
     /// lane must be a constant.
     fn quad_pick(&mut self, x: V, src: V) -> V {
@@ -4933,7 +5051,7 @@ impl<'a> Lower<'a> {
                 let t = self.s.m.bin(c, Bin::Or, t, or);
                 self.s.m.bin(c, Bin::Xor, t, xor)
             };
-            let r = if mesh_quad {
+            let r = if mesh_quad || self.helpers_read(quad) {
                 self.quad_pick(x, src)
             } else {
                 self.read_lane(x, src)
@@ -7517,7 +7635,7 @@ impl<'a> Lower<'a> {
                 (src, inside, masks, bound_ctrl)
             }
         };
-        let mut r = if mesh_quad {
+        let mut r = if mesh_quad || self.helpers_read(quad) {
             self.quad_pick(x, src)
         } else {
             self.read_lane(x, src)
@@ -9883,7 +10001,7 @@ impl<'a> Lower<'a> {
                     return Ok(());
                 }
             }
-            return Err("the first half of an interpolation");
+            return Err(FIRST_HALF);
         };
         let name = inst.name();
         let (dst, src) = match &inst.fields {
@@ -12475,6 +12593,37 @@ mod tests {
             prims: vec![],
             mesh_stride: 0,
         })
+    }
+
+    /// A store to title memory by address also sets its page's bit behind
+    /// the fault notes (`mark_memory_dirty`): the module stays valid.
+    /// (Port of the test of fxceless/victory-fork #814.)
+    #[test]
+    fn a_store_by_address_marks_its_page_for_the_host() {
+        let layout = vec![RootParam {
+            root: RootType::Constants,
+            table_offset_dwords: 0,
+            sgprs: 2,
+            base_register: 0,
+            user_data: 0,
+            slot: 0,
+        }];
+        let words = [
+            0x7E00_0200, // v_mov_b32 v0, s0
+            0x7E02_0201, // v_mov_b32 v1, s1
+            0x7E04_0281, // v_mov_b32 v2, 1
+            0xDC70_8000,
+            0x007D_0200, // global_store_dword v[0:1], v2
+            S_ENDPGM,
+        ];
+        let lowered = lower_with(&words, layout, Vec::new()).expect("a store by address");
+        assert!(lowered.root_srvs.contains(&super::super::shader::SLOT_MEMORY));
+        assert!(lowered.root_uavs.contains(&super::super::shader::SLOT_FAULTS));
+        use crate::emit::validator::Validator;
+        if let Ok(mut v) = Validator::load(Validator::default_path().as_deref()) {
+            let mut copy = lowered.dxil.clone();
+            v.validate(&mut copy).expect("DXIL validation failed");
+        }
     }
 
     /// Root parameter `slot` in user SGPRs from `user_data` on.

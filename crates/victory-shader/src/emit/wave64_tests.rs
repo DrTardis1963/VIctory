@@ -1069,3 +1069,120 @@ fn a_first_lane_refusal_is_retried_wave_wide() {
         "a descriptor chosen by control flow"
     ));
 }
+
+/// A program of the structure builder's kind (a spilled user-data table, groups of 64
+/// threads) that stores the number of lanes in EXEC at the dword of its thread,
+/// `64 * group + thread`: dispatched by thread count, the threads past the count store
+/// nothing and the wave the count ends in counts only its launched lanes
+/// ([`crate::spill::limit_threads`]). As 32-lane console waves, and as 64-lane ones, each
+/// two host waves that exchange.
+#[test]
+fn a_dispatch_by_thread_count_runs_only_the_threads_it_launches() {
+    for wave64 in [false, true] {
+        threads_past_the_count_are_left_out(wave64);
+    }
+}
+
+fn threads_past_the_count_are_left_out(wave64: bool) {
+    let words = [
+        0x8703_FF01,
+        0x0000_00FF, // s_and_b32 s3, s1, 0xff
+        0xBE82_0300, // s_mov_b32 s2, s0
+        0xF400_0181,
+        0xFA00_0000, // s_load_dword s6, s[2:3], 0 (user data 16: the table)
+        0xBE87_0380, // s_mov_b32 s7, 0
+        0x3D << 26 | 0x02 << 18 | 8 << 6 | 3,
+        125 << 25,   // s_load_dwordx4 s[8:11], s[6:7], 0
+        if wave64 { 0xBE8C_107E } else { 0xBE8C_0F7E }, // s_bcnt1_i32_b32 / _b64 s12, exec
+        0x7E02_020C, // v_mov_b32 v1, s12
+        0x8F0D_8604, // s_lshl_b32 s13, s4, 6 (s4: the group)
+        0x4A06_000D, // v_add_nc_u32 v3, s13, v0
+        0x3404_0682, // v_lshlrev_b32 v2, 2, v3
+        0x38 << 26 | 0x1C << 18 | 1 << 12,
+        0x80 << 24 | 2 << 16 | 1 << 8 | 2, // buffer_store_dword v1, v2, s[8:11], 0 offen
+        S_ENDPGM,
+    ];
+    let mut native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64,
+        vgprs: 16,
+        layout: vec![RootParam {
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            sgprs: 1,
+            base_register: 0,
+            user_data: 16,
+            slot: 1,
+        }],
+        used: vec![UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 16,
+            slot: 1,
+        }],
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: 4 << 1 | 1 << 7, // 4 user SGPRs, then the group in s4
+            threads: [64, 1, 1],
+        }),
+        code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    };
+    assert_eq!(crate::spill::thread_limit(&native), None);
+    crate::spill::limit_threads(&mut native);
+    // (the first SGPR the hardware leaves alone)
+    assert_eq!(crate::spill::thread_limit(&native), Some(5));
+    let p = crate::spill::build(&native).expect("spill::build");
+    assert_eq!(p.blocks[0].insts[0].name(), "v_cmpx_gt_u32");
+    let limit = io::raise(&p, &native).expect("io::raise").inputs.iter().any(|i| i.1 == io::Input::ThreadLimit);
+    assert!(limit, "the limit is an input");
+    let shader = lowered(&native, &p, &HashSet::new()).expect("lower");
+    let word = RootType::Other(super::USER_THREAD_LIMIT);
+    assert!(shader.user_data.iter().any(|u| u.root == word), "{:?}", shader.user_data);
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed");
+    }
+    // (straight-line code: every thread of a group reaches the barriers of the exchange)
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 hardware device; not run");
+        return;
+    };
+    let (root, pso) = match host.compute_pipeline(&shader) {
+        Ok(x) => x,
+        Err(e) => {
+            eprintln!("the hardware device does not take this program (waves of 32?): {e}; not run");
+            return;
+        }
+    };
+    // Two groups: by group count every thread runs; 104 threads end 8 lanes into the last wave.
+    for threads in [u32::MAX, 104, 64, 33, 1] {
+        let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        for u in &shader.user_data {
+            if u.root == word {
+                ud[u.index as usize] = threads;
+            }
+        }
+        let groups = threads.min(128).div_ceil(64);
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(ud))],
+                    views: &[View::RawUav(128)],
+                    samplers: &[],
+                    groups: [groups, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("dispatch failed: {e}"));
+        let wave = if wave64 { 64 } else { 32 };
+        let expected: Vec<u32> =
+            (0..128u32).map(|t| if t >= threads { 0 } else { (threads - (t & !(wave - 1))).min(wave) }).collect();
+        assert_eq!(out[0], expected, "{threads} threads, wave64 {wave64}");
+    }
+    eprintln!("ran on the hardware device (wave64 {wave64}): only the launched threads, and the count of them");
+}

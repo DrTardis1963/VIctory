@@ -77,6 +77,10 @@ pub fn heap_usage_marks() -> bool {
 pub const MEMORY_PAGES: u32 = 1 << 21;
 /// Dwords of the [`SLOT_FAULTS`] buffer.
 pub const MEMORY_FAULTS: u32 = 4096;
+/// Dwords of the [`SLOT_FAULTS`] buffer after [`MEMORY_FAULTS`]: a bit per
+/// page of [`MEMORY_PAGES`], set by a shader that stores to the page by
+/// address.
+pub const MEMORY_DIRTY_DWORDS: u32 = MEMORY_PAGES / 32;
 /// `RootType::Other` code of a user-data dword the host computes: the view
 /// heap slot of the memory copies' views ([`SLOT_MEMORY`]).
 pub const USER_MEMORY_BASE: u32 = 0x100;
@@ -95,6 +99,12 @@ pub const USER_VIEW_ADDRESS: u32 = 0x101;
 /// view. Asked for every root UAV, and for the root SRVs of programs with
 /// a spilled user-data table.
 pub const USER_VIEW_BIAS: u32 = 0x103;
+/// `RootType::Other` code of a user-data dword the host computes: the
+/// threads along x of a dispatch by thread count (`DispatchX` with the
+/// console's thread-dimensions flag), `u32::MAX` for a dispatch by group
+/// count. A program [`crate::spill::limit_threads`] changed runs only the
+/// lanes below it.
+pub const USER_THREAD_LIMIT: u32 = 0x104;
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {

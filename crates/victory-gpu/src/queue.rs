@@ -53,7 +53,110 @@ enum Held {
     Run(Vec<crate::list::Detached>, Vec<usize>),
     /// A signal of the queue's, due after what it holds before it.
     Signal(usize, u64),
+    /// With [`behind`]: the submission at the head of the line is being
+    /// prepared and sent by our thread, with the line unlocked, so the
+    /// title can add to its end meanwhile; whatever is added stays behind
+    /// this (the line is not empty), signals too.
+    Running,
+    /// With [`present_behind`]: the title's present of a frame, due after
+    /// what the queue holds before it: the host texture shown, the state
+    /// the title's lists leave it in, and the frame's number.
+    Present(windows::Win32::Graphics::Direct3D12::ID3D12Resource, u32, u64),
 }
+
+/// Presents that are in a queue's line and have not run ([`Held::Present`]).
+#[cfg(windows)]
+static PRESENTS_HELD: AtomicU64 = AtomicU64::new(0);
+
+/// Whether a present goes behind the queue's line and returns at once
+/// (`VICTORY_ASYNC_PRESENT=1`; needs [`behind`] and presents that do not
+/// settle the flights, `crate::host::late_free_present`).
+///
+/// Why: with [`behind`] our thread prepares and sends the submissions, but
+/// the title's present still ran the line itself first, that is: it stood
+/// until our thread had prepared every submission of the frame. Run 225's
+/// frame log (the cell, 136 ms a frame): the title's render thread is 77 ms
+/// of every frame inside the present waiting for that, using 3 ms of
+/// processor itself, and only then begins to record the next frame (about
+/// 57 ms), during which our thread has nothing to prepare. The two phases
+/// ran one after the other.
+///
+/// With the switch the present is one more thing in the line
+/// ([`Held::Present`]): our thread shows the frame when it gets there, in
+/// order, and the title records the next frame meanwhile.
+///
+/// The title is one frame ahead at most: a present that finds the one
+/// before it still in a line runs the old way (the lines first, then
+/// itself), and so does a frame that is saved or listed, and a present
+/// that finds its queue's line empty. A wait nothing ever meets is
+/// therefore still forced, by the present after it.
+///
+/// What it assumes, beyond what [`behind`] does: title memory a submission
+/// reads stays as it was until the submission's fence is signalled, also
+/// across the title's present. On the console the card reads that memory
+/// when it runs the list, after the present call has returned.
+#[cfg(windows)]
+fn present_behind() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_ASYNC_PRESENT").is_some_and(|v| v == "1")
+            && behind()
+            && crate::host::late_free_present();
+        if on {
+            tracing::info!("presents go behind the queue's line and return at once (VICTORY_ASYNC_PRESENT=1)");
+        }
+        on
+    })
+}
+
+/// With [`present_behind`]: puts the present of the next frame behind what
+/// the queue `this` holds. False if it has to run the old way.
+#[cfg(windows)]
+fn send_behind(this: This, planes: u32, plane_parameters: *const Plane) -> bool {
+    // shortcut: a present of several planes runs the old way; hold every
+    // plane's texture in `Held::Present` if such a title is to run ahead.
+    if this.is_null() || planes != 1 || PRESENTS_HELD.load(Ordering::Relaxed) != 0 {
+        return false;
+    }
+    let frame = FRAMES.load(Ordering::Relaxed) + 1;
+    // A frame that is saved or listed is read back at once.
+    #[cfg(feature = "diagnostics")]
+    if crate::capture::wanted(frame) || crate::capture::listed(frame) {
+        return false;
+    }
+    // SAFETY: the title passes `planes` plane descriptions.
+    let Some(plane) = (unsafe { plane_parameters.as_ref() }) else {
+        return false;
+    };
+    if plane.count == 0 || plane.resources.is_null() {
+        return false;
+    }
+    // SAFETY: the plane lists `count` resources.
+    let resource = unsafe { *plane.resources };
+    let Some(texture) = crate::resource::host_resource(resource) else {
+        return false;
+    };
+    // The state the lists recorded so far leave the texture in: what our
+    // copy finds it in when it runs behind them (looked at, not changed).
+    const COPY_SOURCE: u32 = 0x800;
+    let state = crate::resource::host_transition(resource, COPY_SOURCE).map_or(COPY_SOURCE, |(_, before)| before);
+    crate::resource::host_transition(resource, state);
+    let texture = texture.clone();
+    let sent = hold(this, || {
+        PRESENTS_HELD.fetch_add(1, Ordering::Relaxed);
+        Held::Present(texture, state, frame)
+    });
+    if sent {
+        PRESENTS_BEHIND.fetch_add(1, Ordering::Relaxed);
+        wake();
+    }
+    sent
+}
+
+/// Presents sent behind their queue's line since the start
+/// ([`send_behind`]), for the line every 512 of them.
+#[cfg(windows)]
+static PRESENTS_BEHIND: AtomicU64 = AtomicU64::new(0);
 
 /// The queues that hold something (their addresses).
 #[cfg(windows)]
@@ -131,7 +234,7 @@ fn submit_cut(this: This, lists: &[This]) {
     let Some(host) = crate::host::host() else {
         return;
     };
-    let first = if lock(&queue(this).held).is_empty() {
+    let first = if !behind() && lock(&queue(this).held).is_empty() {
         lists
             .iter()
             .position(|&l| crate::list::cut_list(l))
@@ -307,22 +410,134 @@ fn hold(this: This, what: impl FnOnce() -> Held) -> bool {
 /// one.
 #[cfg(windows)]
 pub(crate) fn release_held(all: bool) {
+    if !all && behind() {
+        // A thread of ours runs what is free to run ([`behind`]).
+        wake();
+        return;
+    }
+    release_held_now(all);
+}
+
+/// Whether a submission is only put in its queue's line by the thread
+/// that submits it, and prepared and sent by a thread of ours
+/// (`VICTORY_ASYNC_SUBMIT=1`; needs flights and lists cut at their waits,
+/// both defaults).
+///
+/// Why: the profile of run 213 (292 ms a frame) has the title's render
+/// thread inside `queue::execute` for 202 ms of every frame: 155 ms in
+/// `Host::submit` (preparing: the copies of title memory, the write
+/// watch, descriptors, textures; and waiting for flights), while its five
+/// recording threads stand idle 78 % of the time and the card 43 %. The
+/// title's thread does nothing with the result of that work: it only has
+/// to be done before the lists run, in order.
+///
+/// With the switch a submission's lists are taken from the title's lists
+/// (as they already are when the queue holds anything) and put behind
+/// the queue's line; one thread of ours ([`worker`]) runs the line in
+/// order. A signal of the queue goes behind them, as it does behind
+/// anything held. Everything that must see earlier submissions done runs
+/// the line itself first: a present, and every submission of ours that
+/// is waited for ([`before_sync`]).
+///
+/// What it assumes: title memory a submission reads is not rewritten by
+/// the title between its submit call and the moment our thread prepares
+/// it, some milliseconds later. On the console the card reads that
+/// memory when it runs the list, later still, so a title that rewrote it
+/// earlier would be wrong there too.
+#[cfg(windows)]
+pub(crate) fn behind() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_ASYNC_SUBMIT").is_some_and(|v| v == "1") && crate::host::late() && cuts();
+        if on {
+            tracing::info!("submissions are prepared and sent by a thread of ours, not by the thread that submits (VICTORY_ASYNC_SUBMIT=1)");
+            let _ = std::thread::Builder::new().name("victory-submit".into()).spawn(worker);
+        }
+        on
+    })
+}
+
+/// Whether there is something for [`worker`] to look at.
+#[cfg(windows)]
+static WORK: (std::sync::Mutex<bool>, std::sync::Condvar) = (std::sync::Mutex::new(false), std::sync::Condvar::new());
+
+#[cfg(windows)]
+fn wake() {
+    *lock(&WORK.0) = true;
+    WORK.1.notify_one();
+}
+
+/// The thread of [`behind`]: runs what queues hold as far as it is free
+/// to run, each time something was added or a fence moved.
+#[cfg(windows)]
+fn worker() {
+    crate::framelog::keep_on_fast_cores("victory-submit");
+    loop {
+        {
+            let mut work = lock(&WORK.0);
+            while !*work {
+                work = WORK.1.wait(work).unwrap_or_else(|e| e.into_inner());
+            }
+            *work = false;
+        }
+        let started = std::time::Instant::now();
+        let (user, kernel) = crate::framelog::thread_times();
+        if crate::framelog::on() {
+            crate::framelog::add(crate::framelog::T::WorkerLooks, 1);
+            if crate::framelog::on_slow_core() {
+                crate::framelog::add(crate::framelog::T::WorkerSlow, 1);
+            }
+        }
+        release_held_now(false);
+        let (user_now, kernel_now) = crate::framelog::thread_times();
+        crate::framelog::add(crate::framelog::T::WorkerUs, started.elapsed().as_micros() as u64);
+        crate::framelog::add(crate::framelog::T::WorkerUserUs, user_now.saturating_sub(user));
+        crate::framelog::add(crate::framelog::T::WorkerKernelUs, kernel_now.saturating_sub(kernel));
+    }
+}
+
+#[cfg(windows)]
+thread_local! {
+    /// This thread is inside [`release_held_now`].
+    static RELEASING_HERE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Before a submission of ours that is waited for, with [`behind`]: what
+/// the queues hold and is free to run runs first, on this thread, so the
+/// submission keeps its place behind them.
+#[cfg(windows)]
+pub(crate) fn before_sync() {
+    if behind() && !RELEASING_HERE.get() {
+        release_held_now(false);
+    }
+}
+
+#[cfg(windows)]
+fn release_held_now(all: bool) {
     // One caller at a time, so a queue's submissions keep their order.
     static RELEASING: std::sync::Mutex<()> = std::sync::Mutex::new(());
     if lock(&WAITING).is_empty() {
         return;
     }
     let _one = lock(&RELEASING);
+    let was_here = RELEASING_HERE.replace(true);
+    struct Leave(bool);
+    impl Drop for Leave {
+        fn drop(&mut self) {
+            RELEASING_HERE.set(self.0);
+        }
+    }
+    let _leave = Leave(was_here);
     loop {
         let queues = lock(&WAITING).clone();
         let mut moved = false;
         for q in queues {
             // SAFETY: a live queue: one released is taken off the list.
-            let held = unsafe { &(*(q as *const Queue)).held };
-            let mut held = lock(held);
+            let line = unsafe { &(*(q as *const Queue)).held };
+            let mut held = lock(line);
             loop {
                 match held.first() {
-                    None => break,
+                    None | Some(Held::Running) => break,
                     Some(&Held::Wait(fence, value))
                         if !all && crate::fence::completed(fence as This) < value =>
                     {
@@ -332,7 +547,7 @@ pub(crate) fn release_held(all: bool) {
                     Some(_) => {}
                 }
                 match held.remove(0) {
-                    Held::Wait(..) => {}
+                    Held::Wait(..) | Held::Running => {}
                     Held::Value(wait) => {
                         // Passed at a present without being met: what the
                         // queue stood at.
@@ -374,7 +589,20 @@ pub(crate) fn release_held(all: bool) {
                         {
                             // Not waited for: the host keeps the lists
                             // until they are settled.
-                            host.execute_late(lists, order);
+                            if behind() && !all {
+                                // The line is open while this part is
+                                // prepared and sent: only this thread takes
+                                // from its head (one releaser at a time).
+                                held.insert(0, Held::Running);
+                                drop(held);
+                                host.execute_late(lists, order);
+                                held = lock(line);
+                                if matches!(held.first(), Some(Held::Running)) {
+                                    held.remove(0);
+                                }
+                            } else {
+                                host.execute_late(lists, order);
+                            }
                         } else {
                             let ran = {
                                 let runs: Vec<&crate::host::HostList> =
@@ -402,6 +630,27 @@ pub(crate) fn release_held(all: bool) {
                                 );
                             }
                         }
+                    }
+                    Held::Present(texture, state, frame) => {
+                        let show = || {
+                            if let Some(host) = crate::host::host() {
+                                let _ = host.present(&[(&texture, state, None)], frame);
+                            }
+                        };
+                        if all {
+                            show();
+                        } else {
+                            // The line is open while the frame is shown,
+                            // as it is while a submission is prepared.
+                            held.insert(0, Held::Running);
+                            drop(held);
+                            show();
+                            held = lock(line);
+                            if matches!(held.first(), Some(Held::Running)) {
+                                held.remove(0);
+                            }
+                        }
+                        PRESENTS_HELD.fetch_sub(1, Ordering::Relaxed);
                     }
                     // Behind what was sent to the card and not waited
                     // for, if anything was.
@@ -514,6 +763,18 @@ extern "system" fn release(this: This) -> u32 {
 /// Runs the lists' host lists and waits for them (decision 0007). A queue
 /// that waits for a fence keeps them until the fence is reached.
 extern "system" fn execute(this: This, count: u32, lists: *const This) {
+    #[cfg(windows)]
+    let started = std::time::Instant::now();
+    execute_now(this, count, lists);
+    #[cfg(windows)]
+    {
+        let us = started.elapsed().as_micros() as u64;
+        crate::framelog::add(crate::framelog::T::ExecuteUs, us);
+        crate::framelog::here(crate::framelog::H::ExecuteUs, us);
+    }
+}
+
+fn execute_now(this: This, count: u32, lists: *const This) {
     if lists.is_null() {
         return;
     }
@@ -585,12 +846,143 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
     }
 }
 
-/// The start of a present plane: frame token, then the plane's resources.
+/// A present plane as the title describes it (the console's
+/// `D3D12XBOX_PRESENT_PLANE_PARAMETERS`): frame token, the plane's
+/// resources, and how the display shows them. A present names its planes
+/// bottom first: the display scales each to the screen and blends it over
+/// the ones before it.
 #[repr(C)]
+#[derive(Clone, Copy)]
 pub(crate) struct Plane {
     token: u64,
     count: u32,
     resources: *const This,
+    /// Per resource, the part of it that is shown (left, top, right,
+    /// bottom); null: all of it.
+    parts: *const [u32; 4],
+    /// Where on the screen the plane goes; null: over all of it.
+    placement: *const [u32; 4],
+    color_space: u32,
+    scale_filter: u32,
+    extended_count: u32,
+    extended: *const This,
+    flags: u32,
+}
+const _: () = assert!(size_of::<Plane>() == 0x48);
+
+/// A value of plain data read from title memory; `None` if it cannot be
+/// read there.
+#[cfg(windows)]
+fn peek<T: Copy>(at: *const T) -> Option<T> {
+    let mut value = std::mem::MaybeUninit::<T>::uninit();
+    // SAFETY: the bytes of `value`, all written before it is read.
+    let bytes =
+        unsafe { std::slice::from_raw_parts_mut(value.as_mut_ptr().cast::<u8>(), size_of::<T>()) };
+    // SAFETY: every byte was read into; plain data.
+    (!at.is_null() && crate::host::read_into(at.cast(), bytes))
+        .then(|| unsafe { value.assume_init() })
+}
+
+/// The planes of a present that can be shown, bottom first: each one's
+/// first resource and the part of it the title wants shown. None if the first plane has no resource; a later
+/// plane counts only if its resource is an object of the same kind as the
+/// first's (the same method table), so a plane that does not read as one
+/// is left out and not followed.
+///
+/// shortcut: a plane's first resource only (more are the views of a
+/// stereo display), and at most four planes; the console has two.
+#[cfg(windows)]
+fn shown(planes: u32, plane_parameters: *const Plane) -> Vec<(This, Option<[u32; 4]>)> {
+    let read = |i: usize| {
+        let plane = peek(plane_parameters.wrapping_add(i))?;
+        let resource = peek(plane.resources).filter(|r| plane.count > 0 && !r.is_null())?;
+        Some((resource, peek(resource.cast::<usize>())?, peek(plane.parts)))
+    };
+    let Some((first, kind, part)) = (planes > 0).then(|| read(0)).flatten() else {
+        return Vec::new();
+    };
+    let over = (1..planes.min(4) as usize).filter_map(read).filter(|plane| plane.1 == kind);
+    std::iter::once((first, part)).chain(over.map(|(resource, _, part)| (resource, part))).collect()
+}
+
+/// The host state the lists recorded so far leave a title texture in
+/// (looked at, not changed).
+#[cfg(windows)]
+fn state_of(resource: This) -> u32 {
+    const COPY_SOURCE: u32 = 0x800;
+    let state = crate::resource::host_transition(resource, COPY_SOURCE)
+        .map_or(COPY_SOURCE, |(_, before)| before);
+    crate::resource::host_transition(resource, state);
+    state
+}
+
+/// Logs the planes of a present as the title passes them and the textures
+/// of those that can be shown, whenever the planes' description differs from the
+/// present before (resources and frame tokens aside): the first eight
+/// times.
+#[cfg(windows)]
+fn log_planes(
+    frame: u64,
+    planes: u32,
+    plane_parameters: *const Plane,
+    shown: &[(This, Option<[u32; 4]>)],
+) {
+    static LOGGED: AtomicU64 = AtomicU64::new(0);
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    if LOGGED.load(Ordering::Relaxed) >= 8 {
+        return;
+    }
+    let passed: Vec<Plane> =
+        (0..planes.min(4) as usize).map_while(|i| peek(plane_parameters.wrapping_add(i))).collect();
+    let rects = |plane: &Plane| (peek(plane.parts), peek(plane.placement));
+    let mut key = u64::from(planes) << 32 | shown.len() as u64;
+    for plane in &passed {
+        let (part, placement) = rects(plane);
+        let fields =
+            [plane.count, plane.color_space, plane.scale_filter, plane.extended_count, plane.flags];
+        for value in fields.into_iter().chain(part.into_iter().chain(placement).flatten()) {
+            key = (key ^ u64::from(value)).wrapping_mul(0x100_0000_01b3);
+        }
+    }
+    if LAST.swap(key, Ordering::Relaxed) == key {
+        return;
+    }
+    LOGGED.fetch_add(1, Ordering::Relaxed);
+    for (i, plane) in passed.iter().enumerate() {
+        let (part, placement) = rects(plane);
+        // The description as it lies in memory, to check the layout read.
+        let raw: Option<[u64; 9]> = peek(plane_parameters.wrapping_add(i).cast());
+        tracing::info!(
+            frame,
+            plane = i,
+            of = planes,
+            resources = plane.count,
+            ?part,
+            ?placement,
+            color_space = plane.color_space,
+            scale_filter = plane.scale_filter,
+            extended = plane.extended_count,
+            flags = format_args!("{:#x}", plane.flags),
+            raw = format_args!("{:x?}", raw.unwrap_or_default()),
+            "a present's plane as the title passes it"
+        );
+    }
+    for (i, &(resource, part)) in shown.iter().enumerate() {
+        let desc = crate::resource::host_resource(resource)
+            // SAFETY: a live resource.
+            .map(|texture| unsafe { texture.GetDesc() });
+        tracing::info!(
+            frame,
+            layer = i,
+            of = shown.len(),
+            resource = ?resource,
+            width = desc.map(|d| d.Width),
+            height = desc.map(|d| d.Height),
+            format = desc.map(|d| d.Format.0),
+            ?part,
+            "a plane of the present that can be shown, bottom first (without a size: it has no host texture)"
+        );
+    }
 }
 /// Submission tagged with the frame it belongs to `(count, lists, frame
 /// token, flags)`; frames are paced elsewhere, so it runs as a plain one.
@@ -745,40 +1137,81 @@ fn system_timestamp() -> u64 {
 /// Frames presented so far.
 static FRAMES: AtomicU64 = AtomicU64::new(0);
 
-#[cfg(feature = "diagnostics")]
 pub(crate) fn presented() -> u64 {
     FRAMES.load(Ordering::Relaxed)
 }
 
-/// Shows the first plane's first resource in our window.
+/// Shows the planes' first resources in our window: one plane as it is,
+/// several scaled to the largest and blended bottom first
+/// (`crate::host::Host::present`).
 ///
-/// shortcut: one plane, no scaling or placement, the source expected in
-/// the common state.
+/// shortcut: one plane is shown whole, whatever part of it the title
+/// names, and no plane is placed: each covers the window.
 extern "system" fn present(
-    _: This,
+    this: This,
     planes: u32,
     plane_parameters: *const Plane,
     _parameters: *const u8,
 ) -> HRESULT {
+    #[cfg(windows)]
+    let presenting = std::time::Instant::now();
+    let hr = present_now(this, planes, plane_parameters);
+    #[cfg(windows)]
+    {
+        crate::framelog::add(crate::framelog::T::PresentUs, presenting.elapsed().as_micros() as u64);
+        crate::framelog::frame();
+    }
+    hr
+}
+
+fn present_now(this: This, planes: u32, plane_parameters: *const Plane) -> HRESULT {
+    #[cfg(windows)]
+    let presenting = std::time::Instant::now();
     #[cfg(all(windows, feature = "diagnostics"))]
     crate::copystat::present_begins();
+    #[cfg(all(windows, feature = "diagnostics"))]
+    crate::profile::frame();
+    // With `present_behind`: the frame is shown by our thread, behind what
+    // the queue holds, and nothing is run or waited for here.
+    #[cfg(windows)]
+    let sent_behind = present_behind() && send_behind(this, planes, plane_parameters);
+    #[cfg(not(windows))]
+    let _ = this;
     // Submissions sent to the card and not waited for are settled first,
     // and what that frees runs in its own order, before anything is forced.
     #[cfg(windows)]
-    if crate::host::late() && !crate::host::late_free_present() {
+    if sent_behind {
+    } else if crate::host::late() && !crate::host::late_free_present() {
+        // (With `behind`: what the queues hold runs here first, and what
+        // it sent is settled with the rest.)
+        if behind() {
+            release_held_now(false);
+        }
         crate::host::settle_for_present();
-        release_held(false);
+        release_held_now(false);
         crate::host::settle_for_present();
     } else if crate::host::late() {
         // The present is sent ahead too: what waits for a value a flight
         // will write runs behind that flight, and nothing is settled here.
-        release_held(false);
+        release_held_now(false);
     }
     // shortcut: what a queue still holds at a present runs now, whatever
     // its fence: a wait is not kept across frames.
     #[cfg(windows)]
-    release_held(forces());
+    if !sent_behind {
+        release_held(forces());
+    }
+    #[cfg(windows)]
+    crate::framelog::add(crate::framelog::T::PresentLineUs, presenting.elapsed().as_micros() as u64);
     let frame = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
+    #[cfg(windows)]
+    if sent_behind && PRESENTS_BEHIND.load(Ordering::Relaxed).is_multiple_of(512) {
+        tracing::info!(
+            frame,
+            behind = PRESENTS_BEHIND.load(Ordering::Relaxed),
+            "presents sent behind their queue's line so far (VICTORY_ASYNC_PRESENT=1); the others ran the old way"
+        );
+    }
     if frame.is_power_of_two() {
         let (draws, dispatches) = crate::list::take_counts();
         #[cfg(windows)]
@@ -815,25 +1248,26 @@ extern "system" fn present(
         }
     }
     #[cfg(windows)]
-    if planes > 0
-        // SAFETY: the title passes `planes` plane descriptions.
-        && let Some(plane) = unsafe { plane_parameters.as_ref() }
-        && plane.count > 0
-        && !plane.resources.is_null()
-        // SAFETY: the plane lists `count` resources.
-        && let resource = unsafe { *plane.resources }
-        && let Some(texture) = crate::resource::host_resource(resource)
-        && let Some(host) = crate::host::host()
-    {
-        const COPY_SOURCE: u32 = 0x800;
-        let state = crate::resource::host_transition(resource, COPY_SOURCE)
-            .map_or(COPY_SOURCE, |(_, before)| before);
-        let shown = host.present(texture, state, frame);
-        crate::resource::host_transition(resource, state);
-        #[cfg(feature = "diagnostics")]
-        blinks(frame, resource, state, shown);
-        #[cfg(not(feature = "diagnostics"))]
-        let _ = shown;
+    if !sent_behind {
+        let shown = shown(planes, plane_parameters);
+        log_planes(frame, planes, plane_parameters, &shown);
+        // Each plane that has a host texture, in the state the lists
+        // leave it in; nothing without the first.
+        let mut textures = shown.iter().map(|&(resource, part)| {
+            Some((crate::resource::host_resource(resource)?, state_of(resource), part))
+        });
+        if let Some(Some(first)) = textures.next()
+            && let Some(host) = crate::host::host()
+        {
+            let (resource, state) = (shown[0].0, first.1);
+            let textures: Vec<crate::host::Shown> =
+                std::iter::once(first).chain(textures.flatten()).collect();
+            let black = host.present(&textures, frame);
+            #[cfg(feature = "diagnostics")]
+            blinks(frame, resource, state, black);
+            #[cfg(not(feature = "diagnostics"))]
+            let _ = (resource, state, black);
+        }
     }
     #[cfg(not(windows))]
     let _ = (planes, plane_parameters);
@@ -1082,5 +1516,35 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(2));
         Written::GpuTimestamp.write(at[1..].as_mut_ptr().cast(), 8);
         assert!(at[1] > first);
+    }
+
+    /// Three planes whose resources are objects with a method table, the
+    /// third's another: the first two are shown, with the part named.
+    #[cfg(windows)]
+    #[test]
+    fn a_present_shows_the_planes_whose_resources_are_like_the_first() {
+        let objects = [0x1000usize, 0x1000, 0x2000];
+        let resources = [0, 1, 2].map(|i| std::ptr::from_ref(&objects[i]).cast::<Object>());
+        let part = [0u32, 0, 960, 540];
+        let plane = |i: usize, parts: *const [u32; 4]| Plane {
+            token: 7,
+            count: 1,
+            resources: &resources[i],
+            parts,
+            placement: std::ptr::null(),
+            color_space: 0,
+            scale_filter: 0,
+            extended_count: 0,
+            extended: std::ptr::null(),
+            flags: 0,
+        };
+        let planes = [plane(0, std::ptr::null()), plane(1, &part), plane(2, std::ptr::null())];
+        let both = vec![(resources[0], None), (resources[1], Some(part))];
+        assert_eq!(shown(3, planes.as_ptr()), both);
+        assert_eq!(shown(1, planes.as_ptr()), both[..1]);
+        assert!(shown(0, planes.as_ptr()).is_empty());
+        assert!(shown(2, std::ptr::null()).is_empty());
+        let empty = Plane { count: 0, ..planes[0] };
+        assert!(shown(1, &empty).is_empty());
     }
 }

@@ -7,6 +7,8 @@ mod census;
 mod inspect;
 mod run;
 mod shader;
+#[cfg(windows)]
+mod title_patch;
 mod translate;
 
 use std::path::PathBuf;
