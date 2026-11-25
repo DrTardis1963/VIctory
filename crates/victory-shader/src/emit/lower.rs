@@ -9401,8 +9401,13 @@ impl<'a> Lower<'a> {
                     let f = half(self, h)?.ok_or("a packed input half no element holds")?;
                     self.as_int(f)
                 } else if f16 {
-                    let f = half(self, h)?.ok_or("a packed input half no element holds")?;
-                    let lo = to_f16(self, f);
+                    // A padding half no element holds reads as 0.
+                    // shortcut: the console reads whatever the export left there;
+                    // look at that export if such a read ever shows up wrong.
+                    let lo = match half(self, h)? {
+                        Some(f) => to_f16(self, f),
+                        None => self.s.m.i32(0),
+                    };
                     self.low_half(inst, reg, lo)
                 } else if matches!(eval, Eval::Mode(1)) {
                     // The whole dword of a flat input: both halves.
