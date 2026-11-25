@@ -2048,7 +2048,10 @@ pub(crate) fn relay() -> bool {
 /// both wait for everything.
 fn relay_exact() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| relay() && std::env::var_os("VICTORY_RELAY").is_some_and(|v| v == "2"))
+    // Stage 2 unless `VICTORY_RELAY=1` asks for the first one (the default
+    // since the walls of the first room were found drawn in every run with
+    // this set and in fewer than half without it).
+    *ON.get_or_init(|| relay() && std::env::var_os("VICTORY_RELAY").is_none_or(|v| v == "2"))
 }
 
 /// Told when something joins [`LINE`], for the thread that lands flights
@@ -2139,7 +2142,10 @@ mod relay_tests {
 }
 
 /// The most host lists in the air before the flights are settled
-/// (`VICTORY_LATE_WAIT_LISTS`, 128; 32 settled the flights three times a
+/// (`VICTORY_LATE_WAIT_LISTS`, 256; `=128` is the value before: with the
+/// relay it stopped the submitting thread twice a frame for 92-103 ms in
+/// all while the card stood idle 64-113 ms a frame, runs 158, 159 and 162;
+/// 32 settled the flights three times a
 /// frame in run 92 and 64 still 1.3-1.7 times in run 99, with 12,919 tables
 /// asked and none refused; watch "tables asked, N refused"): their dynamic
 /// descriptor slots, upload
@@ -2148,7 +2154,7 @@ mod relay_tests {
 fn late_most() -> usize {
     static MOST: OnceLock<usize> = OnceLock::new();
     *MOST.get_or_init(|| {
-        std::env::var("VICTORY_LATE_WAIT_LISTS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(128).max(1)
+        std::env::var("VICTORY_LATE_WAIT_LISTS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(256).max(1)
     })
 }
 
@@ -3268,6 +3274,27 @@ impl Host {
         })
     }
 
+    /// Whether the host GPU supports the depth bounds test; logged once.
+    pub(crate) fn depth_bounds(&self) -> bool {
+        static BOUNDS: OnceLock<bool> = OnceLock::new();
+        *BOUNDS.get_or_init(|| {
+            let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS2::default();
+            // SAFETY: writes `options` of the given size.
+            let ok = unsafe {
+                self.device
+                    .CheckFeatureSupport(
+                        D3D12_FEATURE_D3D12_OPTIONS2,
+                        (&raw mut options).cast(),
+                        size_of_val(&options) as u32,
+                    )
+                    .is_ok()
+            };
+            let supported = ok && options.DepthBoundsTestSupported.as_bool();
+            tracing::info!(supported, "host depth bounds support");
+            supported
+        })
+    }
+
     /// A new list, open for recording.
     pub(crate) fn new_list(&self) -> windows::core::Result<HostList> {
         #[cfg(feature = "diagnostics")]
@@ -3525,7 +3552,7 @@ impl Host {
             }) {
                 whole.push(shadow.clone());
                 if !dirty.iter().any(|(s, _)| Arc::ptr_eq(s, shadow)) {
-                    dirty.push((shadow.clone(), Vec::new()));
+                    dirty.push((shadow.clone(), Default::default()));
                 }
             }
         }
@@ -3554,7 +3581,8 @@ impl Host {
                     let wide = hash_wide();
                     if wide {
                         let mut barriers = Vec::new();
-                        for (shadow, ranges) in &dirty {
+                        for (shadow, updates) in &dirty {
+                            let ranges = &updates.upload;
                             let Some((staging, before, _)) = shadow.card_sides() else {
                                 continue;
                             };
@@ -3571,7 +3599,8 @@ impl Host {
                             list.ResourceBarrier(&barriers);
                         }
                     }
-                    for (shadow, ranges) in &dirty {
+                    for (shadow, updates) in &dirty {
+                        let ranges = &updates.upload;
                         let Some((staging, before, size)) = shadow.card_sides() else {
                             continue;
                         };
@@ -3583,8 +3612,8 @@ impl Host {
                         };
                         // No twin (it cost the card the copy's size again,
                         // 399 MB in run 75): `before` holds a 128-bit hash
-                        // of each 64 KiB piece. The pieces just sent up are
-                        // hashed again, all of them the first time; the
+                        // of each 64 KiB piece. Hash pieces just uploaded or already
+                        // merged from the card, all of them the first time; the
                         // compare after the lists hashes the declared
                         // pieces and flags those whose hash is another.
                         if !wide && !ranges.is_empty() {
@@ -3602,7 +3631,7 @@ impl Host {
                         let runs: Vec<crate::shadow::CardSpan> = if whole.iter().any(|s| Arc::ptr_eq(s, shadow)) {
                             vec![shadow.card_run(0, usize::MAX)]
                         } else {
-                            ranges.iter().map(|&(a, b)| shadow.card_run(a, b)).collect()
+                            updates.hash_ranges().iter().map(|&(a, b)| shadow.card_run(a, b)).collect()
                         };
                         // The same pieces in fewer passes (`rehash_runs`).
                         let runs = if rehash_runs() { crate::shadow::joined_piece_runs(runs) } else { runs };
@@ -6849,6 +6878,15 @@ impl Host {
                 crate::capture::finish_frame(frame, buffer, footprint);
             }
             let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            #[cfg(feature = "diagnostics")]
+            if frame <= 900 {
+                static TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                if *TRACE.get_or_init(|| std::env::var_os("VICTORY_PRESENT_TIMING").is_some()) {
+                    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+                    let time_us = START.get_or_init(std::time::Instant::now).elapsed().as_micros() as u64;
+                    tracing::info!(frame, time_us, "intro present clock");
+                }
+            }
             p.meter.frame(p.hwnd);
             #[cfg(feature = "diagnostics")]
             return Some(probe.is_some_and(|b| crate::capture::black(&b)));
