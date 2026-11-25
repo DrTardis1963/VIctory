@@ -368,6 +368,32 @@ pub(crate) static HEAP_VIEWS_ELSEWHERE: AtomicU64 = AtomicU64::new(0);
 /// Passes over the view heap's buffer views for shaders that pick them by
 /// index ([`State::heap_buffers`]), and the microseconds they took.
 pub(crate) static HEAP_BUFFER_PASSES: AtomicU64 = AtomicU64::new(0);
+/// Per host view heap (its address): the spans of host copies its buffer
+/// views show, as the last pass found them, for [`heap_every_list`].
+#[allow(clippy::type_complexity)]
+static HEAP_SPANS: std::sync::Mutex<
+    Option<std::collections::HashMap<usize, Vec<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)>>>,
+> = std::sync::Mutex::new(None);
+/// Refreshes of those spans in lists after the frame's first
+/// ([`heap_every_list`]), since the last frame-rate line.
+pub(crate) static HEAP_LATE_REFRESHES: AtomicU64 = AtomicU64::new(0);
+
+/// Whether every list that runs a shader picking buffers by index brings
+/// the heap's buffer views up to date, not only the frame's first
+/// (`VICTORY_HEAP_EVERY_LIST=1`; off by default until a run prices it).
+///
+/// On the console a shader reads the title's memory as it is when the
+/// shader runs. The pass over the heap's views runs once a frame (per list
+/// it cost 18 s a frame, run 11), so what the title writes into such
+/// buffers after the frame's first list was seen a frame late: per-frame
+/// constants and instance records one frame stale. With the switch, later
+/// lists of the frame refresh the spans the frame's pass found, for
+/// memory that is write-watched or guarded (only pages the title wrote are
+/// copied); memory that is neither is still copied once a frame.
+fn heap_every_list() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_EVERY_LIST").is_some_and(|v| v == "1"))
+}
 pub(crate) static HEAP_BUFFER_MICROS: AtomicU64 = AtomicU64::new(0);
 /// Of [`HEAP_BUFFER_MICROS`], the microseconds of the pass over textures
 /// picked by index (`heap_textures`), and the buffer slots inspected.
@@ -1491,10 +1517,28 @@ impl State {
         // frame over 81,000 views and 4,100 host copies, 18 s of every
         // frame (2026-11-24, run 11).
         // shortcut: what the title writes into such buffers between lists
-        // of one frame is seen a frame late.
+        // of one frame is seen a frame late, unless [`heap_every_list`]
+        // brings the spans the frame's pass found up to date here too.
         static FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
         let frame = crate::frame::current();
         if FRAME.swap(frame, Ordering::Relaxed) == frame {
+            if heap_every_list() {
+                let spans = HEAP_SPANS
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .as_ref()
+                    .and_then(|m| m.get(&(std::ptr::from_ref(host) as usize)).cloned())
+                    .unwrap_or_default();
+                for (shadow, from, to) in spans {
+                    // Write-watched or guarded memory only: the rest is
+                    // copied whole by a refresh (the pass does it once a
+                    // frame).
+                    if !shadow.unwatched() {
+                        shadow.refresh(list, from, to - from);
+                        HEAP_LATE_REFRESHES.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }
             return Some(gpu);
         }
         let started = std::time::Instant::now();
@@ -1569,6 +1613,11 @@ impl State {
             span.1 = span.1.min(*from);
             span.2 = span.2.max(*to);
         }
+        HEAP_SPANS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_or_insert_with(Default::default)
+            .insert(std::ptr::from_ref(host) as usize, spans.values().cloned().collect());
         drop(kept);
         let bytes: u64 = spans.values().map(|s| s.2 - s.1).sum();
         // Memory that is not write-watched is copied whole by every refresh.
