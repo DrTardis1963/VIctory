@@ -1320,23 +1320,6 @@ impl HostHeap {
         self.textures.lock().unwrap_or_else(|e| e.into_inner()).mapped(index)
     }
 
-    /// Right before a decoration bake: slots uploaded whole and not yet
-    /// looked at again, and slots uploaded with part of their memory, are
-    /// due at `frame` (after fxceless/victory-fork #1097), so a skin texture
-    /// whose bytes landed after its upload is uploaded again before the bake
-    /// reads it. Returns how many.
-    pub(crate) fn texture_slots_bake_prepare(&self, frame: u64) -> usize {
-        let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
-        let mut pulled = 0;
-        for w in textures.slots.values_mut() {
-            if w.due > frame && ((w.checked.2 != 0 && w.checked.3 <= 1) || w.mapped > 0) {
-                w.due = frame;
-                pulled += 1;
-            }
-        }
-        pulled
-    }
-
     /// Takes the ranges of title memory the runtime mapped, unmapped or
     /// wrote since the last call ([`remapped`]) and makes the slots whose
     /// placed texture lies there due from the next frame (by when a write

@@ -2084,11 +2084,6 @@ impl State {
         // Slots whose texture's memory the runtime mapped, unmapped or
         // wrote since the last pass are due again.
         host.texture_slots_remapped(frame);
-        if is_bake {
-            // Slots still to be looked at again (uploaded while their bytes
-            // were landing, or partly mapped) are due now, before the bake reads them.
-            host.texture_slots_bake_prepare(frame);
-        }
         host.texture_sweep(heap, frame);
         // Levels on demand: the slots of textures whose first level with
         // memory changed since the last pass are made again from it.
