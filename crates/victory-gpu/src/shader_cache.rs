@@ -179,6 +179,8 @@ fn settings() -> Vec<u8> {
         "VICTORY_WAVE_GROUP_BARRIERS",
         "VICTORY_WAVE_OWN_BITS",
         "VICTORY_F16_NEAREST",
+        // Whether shaders mark the heap slots they take.
+        "VICTORY_HEAP_USAGE",
     ] {
         bytes.extend_from_slice(name.as_bytes());
         bytes.push(b'=');
