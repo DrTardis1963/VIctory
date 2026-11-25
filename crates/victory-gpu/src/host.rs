@@ -2275,6 +2275,23 @@ static LATE_STATS: [std::sync::atomic::AtomicU64; 18] = [const { std::sync::atom
 /// card, by why they settled (the `WHY_` places).
 static LATE_WAITED: [std::sync::atomic::AtomicU64; 11] = [const { std::sync::atomic::AtomicU64::new(0) }; 11];
 
+/// Since the last frame-rate line, the title buffer copies that settled the
+/// flights (destination, source, bytes): how many times, and whether their
+/// source, their destination or both lie in what flights' shaders may write.
+/// They are what a copy run on the card in queue order would spare.
+#[cfg(feature = "diagnostics")]
+static SETTLING_COPIES: Mutex<Option<std::collections::HashMap<(usize, usize, usize), (u64, bool, bool)>>> =
+    Mutex::new(None);
+
+#[cfg(feature = "diagnostics")]
+fn settling_copy(written: &[(usize, usize)], dst: usize, src: usize, len: usize) {
+    let mut copies = SETTLING_COPIES.lock().unwrap_or_else(|e| e.into_inner());
+    let e = copies.get_or_insert_with(Default::default).entry((dst, src, len)).or_insert((0, false, false));
+    e.0 += 1;
+    e.1 |= touches(written, src, src + len);
+    e.2 |= touches(written, dst, dst + len);
+}
+
 /// Whether `[from, to)` touches one of `ranges` (in order, joined).
 fn touches(ranges: &[(usize, usize)], from: usize, to: usize) -> bool {
     if from >= to {
@@ -2338,6 +2355,8 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                     if touches(written, src, src + len) || touches(written, dst, dst + len) {
                         if count {
                             LATE_STATS[15].fetch_add(1, Ordering::Relaxed);
+                            #[cfg(feature = "diagnostics")]
+                            settling_copy(written, dst, src, len);
                         }
                         return Some(WHY_READ);
                     }
@@ -2832,6 +2851,23 @@ fn late_line(frames: f64) {
             w[WHY_WRITES],
             w[WHY_FENCE],
         );
+    }
+    #[cfg(feature = "diagnostics")]
+    {
+        let copies = SETTLING_COPIES.lock().unwrap_or_else(|e| e.into_inner()).take();
+        let mut copies: Vec<_> = copies.into_iter().flatten().collect();
+        copies.sort_by_key(|&(_, (n, ..))| std::cmp::Reverse(n));
+        for ((dst, src, len), (n, from, to)) in copies.into_iter().take(6) {
+            let side = match (from, to) {
+                (true, true) => "source and destination",
+                (true, false) => "source",
+                _ => "destination",
+            };
+            tracing::info!(
+                "  a title buffer copy that settled the flights: {src:#x} to {dst:#x}, {len} bytes, {:.1}x a frame; its {side} in what flights' shaders may write",
+                n as f64 / frames
+            );
+        }
     }
     if relay() {
         let r: Vec<f64> = RELAY_STATS.iter().map(|r| r.swap(0, Ordering::Relaxed) as f64 / frames).collect();
