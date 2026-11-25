@@ -1899,6 +1899,26 @@ impl State {
         }
         let now = crate::host::now_ms();
         let mut made = 0;
+        #[cfg(feature = "diagnostics")]
+        {
+            // Sources with only part of their memory mapped: uploaded with zeros where the rest is.
+            static PARTS: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+            for index in named_words(&bytes, |index| title_texture_there(heap, index)) {
+                if let Some(View::Placed(false, resource, desc)) = heap.handle(index).and_then(crate::descriptor::view) {
+                    let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
+                    let len = crate::resource::placed_bytes_from(&resource, crate::resource::first_mip(&desc)).unwrap_or(1);
+                    let mapped = crate::texture::mapped_bytes(address as *const u8, len as usize);
+                    let [all, part] = PARTS.each_ref().map(|c| c.fetch_add(0, Ordering::Relaxed));
+                    PARTS[0].fetch_add(1, Ordering::Relaxed);
+                    if mapped < len {
+                        PARTS[1].fetch_add(1, Ordering::Relaxed);
+                        if part < 40 {
+                            tracing::info!(index, mapped, len, all, part, "a bake source with only part of its memory mapped");
+                        }
+                    }
+                }
+            }
+        }
         for index in named_words(&bytes, |index| title_texture_there(heap, index)) {
             if let Some(handle) = heap.handle(index)
                 && let Some(view) = host.mirror(index, handle, true)
