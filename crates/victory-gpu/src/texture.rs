@@ -141,14 +141,91 @@ pub(crate) struct Staging {
 struct Last {
     hash: Option<blake3::Hash>,
     asked: u64,
+    /// The frame a guarded texture was last hashed in.
+    inspected: Option<u64>,
+    /// Whether that was its first hash: it is hashed again the next frame.
+    confirm_first: bool,
+    /// The last frame its hash changed with no write reported by the guard.
+    alias_change: Option<u64>,
     /// The frame a partly mapped texture was last read in.
     partial: Option<u64>,
     /// The frame a refresh without the lock last found a page of the
     /// texture not there ([`no_wait`]): it is not read again that frame.
     left: Option<u64>,
-    /// The frame a guarded texture was last read whole (written, or on its
-    /// turn for the hash under the guard).
-    netted: Option<u64>,
+}
+
+impl Last {
+    /// Recheck a new guarded view on its next frame of use. A change that
+    /// the guard did not report indicates writes through an alias. While
+    /// those continue, check this texture on each frame it is sampled.
+    fn check_quiet_view(&self, frame: u64, address: usize) -> bool {
+        let Some(previous) = self.inspected else { return true };
+        if previous == frame { return false; }
+        self.confirm_first
+            || self.alias_change.is_some_and(|at| frame.saturating_sub(at) <= 30)
+            || frame.saturating_sub(previous) >= 8
+            || frame.wrapping_add((address >> 16) as u64).is_multiple_of(8)
+    }
+
+    fn changed(&mut self, hash: blake3::Hash, guard: Option<(u64, bool)>) -> bool {
+        let changed = self.hash != Some(hash);
+        if let Some((frame, unwritten)) = guard {
+            if self.inspected != Some(frame) {
+                self.confirm_first = self.inspected.is_none();
+            }
+            self.inspected = Some(frame);
+            if changed && unwritten && self.hash.is_some() {
+                self.alias_change = Some(frame);
+            }
+        }
+        self.hash = Some(hash);
+        changed
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn aliased_texture_changes_are_detected_and_stable_views_return_to_periodic_checks() {
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Memory::{
+        CreateFileMappingW, FILE_MAP_ALL_ACCESS, MapViewOfFile, PAGE_READWRITE, UnmapViewOfFile,
+    };
+    const BYTES: usize = 65536;
+    // Two real virtual views share the same physical pages: one sampled, one written.
+    unsafe {
+        let section = CreateFileMappingW(INVALID_HANDLE_VALUE, std::ptr::null(), PAGE_READWRITE, 0, BYTES as u32, std::ptr::null());
+        assert!(!section.is_null());
+        let view = MapViewOfFile(section, FILE_MAP_ALL_ACCESS, 0, 0, BYTES);
+        let writer = MapViewOfFile(section, FILE_MAP_ALL_ACCESS, 0, 0, BYTES);
+        CloseHandle(section);
+        assert!(!view.Value.is_null() && !writer.Value.is_null() && view.Value != writer.Value);
+        let address = view.Value as usize;
+        let bytes = || std::slice::from_raw_parts(view.Value.cast::<u8>(), BYTES);
+        // Here the guard does report such writes (`watch` makes every view
+        // read-only); the test passes "unreported" itself, as for a write
+        // it misses (the decoder's, seen in the opening video).
+        let mut last = Last::default();
+        assert!(last.changed(blake3::hash(bytes()), Some((16, false))));
+        *writer.Value.cast::<u8>() = 42;
+        assert!(last.check_quiet_view(17, address), "a new texture gets a second observation");
+        assert!(last.changed(blake3::hash(bytes()), Some((17, true))));
+        for frame in 18..45 {
+            assert!(last.check_quiet_view(frame, address));
+            *writer.Value.cast::<u8>() = frame as u8;
+            assert!(last.changed(blake3::hash(bytes()), Some((frame, true))));
+            assert!(!last.check_quiet_view(frame, address), "already inspected this frame");
+        }
+        let mut stable_checks = 0;
+        for frame in 45..165 {
+            if last.check_quiet_view(frame, address) {
+                assert!(!last.changed(blake3::hash(bytes()), Some((frame, true))));
+                if frame >= 85 { stable_checks += 1; }
+            }
+        }
+        assert!((9..=11).contains(&stable_checks), "stable texture should average one scan per eight frames, got {stable_checks}");
+        UnmapViewOfFile(writer);
+        UnmapViewOfFile(view);
+    }
 }
 
 // SAFETY: the staging mapping is written only at submission, under
@@ -891,28 +968,28 @@ impl Staging {
         // of the same pages is a fault of that view too (the guard makes
         // every view of them read-only, `crate::watch`), and a write the
         // runtime makes itself into physical pages is told to the guard
-        // there; the hash is the net under both, taken every eighth frame
-        // by the texture's address, so the textures take turns.
+        // there; the hash is the net under both. Stable views take turns
+        // about every eighth frame, by the texture's address; a view whose
+        // hash changed with nothing reported is checked every frame while
+        // it keeps changing ([`Last::check_quiet_view`]).
         // `VICTORY_TEXTURE_GUARD=0` hashes at every check, as before.
         #[cfg(feature = "diagnostics")]
         let mut unreported = false;
         static GUARD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let mut guard = None;
         if self.guard_view
             && *GUARD.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_GUARD").is_none_or(|v| v != "0"))
             && let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, true))
         {
-            const HASH_EVERY: u64 = 8;
             let unwritten = last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked);
             last.asked = now;
             let frame = crate::frame::current();
-            // The net once on the turn's frame, not at each of its ~32
-            // submissions that sample the texture.
-            let turn = frame.wrapping_add((start >> 16) as u64).is_multiple_of(HASH_EVERY)
-                && last.netted != Some(frame);
-            if unwritten && !turn {
+            // Once a frame at most, not at each of its ~32 submissions that
+            // sample the texture (`Last::check_quiet_view`).
+            if unwritten && !last.check_quiet_view(frame, start) {
                 return 0;
             }
-            last.netted = Some(frame);
+            guard = Some((frame, unwritten));
             #[cfg(feature = "diagnostics")]
             {
                 unreported = unwritten;
@@ -929,7 +1006,7 @@ impl Staging {
             // texture is read through the kernel instead, whole or not at
             // all (`no_wait`).
             let Some(mapped) = crate::watch::title_memory_reading_now(start, size) else {
-                return self.refresh_unlocked(last, size);
+                return self.refresh_unlocked(last, size, guard);
             };
             mapped
         } else {
@@ -953,10 +1030,9 @@ impl Staging {
             let changed = with_read(size, |read| {
                 crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
                 let hash = blake3::hash(read);
-                if last.hash == Some(hash) {
+                if !last.changed(hash, guard) {
                     return false;
                 }
-                last.hash = Some(hash);
                 if read.iter().all(|&b| b == 0) {
                     return false;
                 }
@@ -979,10 +1055,9 @@ impl Staging {
                 let hash = blake3::hash(tiled);
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
-                if last.hash == Some(hash) {
+                if !last.changed(hash, guard) {
                     return size;
                 }
-                last.hash = Some(hash);
                 self.detile(tiled);
                 #[cfg(feature = "diagnostics")]
                 if unreported {
@@ -999,10 +1074,9 @@ impl Staging {
         let hash = blake3::hash(tiled);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
-        if last.hash == Some(hash) {
+        if !last.changed(hash, guard) {
             return size;
         }
-        last.hash = Some(hash);
         self.detile(tiled);
         #[cfg(feature = "diagnostics")]
         if unreported {
@@ -1035,7 +1109,7 @@ impl Staging {
     /// is looked at again at its next refresh (what was learnt about writes
     /// to it is forgotten, so that it is not passed over as unwritten).
     /// Returns the bytes read.
-    fn refresh_unlocked(&self, last: &mut Last, size: usize) -> usize {
+    fn refresh_unlocked(&self, last: &mut Last, size: usize, guard: Option<(u64, bool)>) -> usize {
         use std::sync::atomic::Ordering::Relaxed;
         // A texture streaming in fails here at every submission that
         // samples it (32 a frame), each read running up to its first page
@@ -1050,8 +1124,7 @@ impl Staging {
                 return false;
             }
             let hash = blake3::hash(read);
-            if last.hash != Some(hash) {
-                last.hash = Some(hash);
+            if last.changed(hash, guard) {
                 self.detile(read);
             }
             true

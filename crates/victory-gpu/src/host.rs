@@ -6829,6 +6829,15 @@ impl Host {
                 crate::capture::finish_frame(frame, buffer, footprint);
             }
             let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            #[cfg(feature = "diagnostics")]
+            if frame <= 900 {
+                static TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                if *TRACE.get_or_init(|| std::env::var_os("VICTORY_PRESENT_TIMING").is_some()) {
+                    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+                    let time_us = START.get_or_init(std::time::Instant::now).elapsed().as_micros() as u64;
+                    tracing::info!(frame, time_us, "intro present clock");
+                }
+            }
             p.meter.frame(p.hwnd);
             #[cfg(feature = "diagnostics")]
             return Some(probe.is_some_and(|b| crate::capture::black(&b)));
