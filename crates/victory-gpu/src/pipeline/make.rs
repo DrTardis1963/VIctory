@@ -489,6 +489,7 @@ mod tests {
             hash: "c0c0c0c0c0c0c0c0".to_owned(),
             container: Vec::new(),
             translated: OnceLock::new(),
+            resolves_light: false,
         });
         let early_one = Arc::new(Pending::new(vec![cs.clone()], None));
         early(&early_one);
