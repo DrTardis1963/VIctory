@@ -91,6 +91,9 @@ pub enum Profile {
     /// with a length and tails for root views (`shadow.rs` `window`,
     /// `tails`). Run 65 had ~1.7 GB of its ~3.5 GB of windows outside any
     /// asked-for range, all of it in PC memory the card reads over PCIe.
+    /// Also clamps indirect records a window at a time (`draw.rs`
+    /// `VICTORY_INDIRECT_WINDOW`), which costs no memory: card time 165 ms
+    /// to 89 ms in victory-all-forks' measurements.
     #[value(name = "trim-8gb")]
     Trim8gb,
     #[value(name = "bvh-test")]
@@ -853,6 +856,7 @@ fn prepare_cmd(
             if matches!(profile, Profile::Trim8gb) {
                 env_vars.push(("VICTORY_WINDOW_KB".to_owned(), "1024".to_owned()));
                 env_vars.push(("VICTORY_WINDOW_TAILS".to_owned(), "1".to_owned()));
+                env_vars.push(("VICTORY_INDIRECT_WINDOW".to_owned(), "1".to_owned()));
             }
         }
         Profile::BvhTest => {
