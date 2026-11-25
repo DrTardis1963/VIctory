@@ -2168,6 +2168,22 @@ impl State {
         if !stage.shader.resolves_light {
             // The reflections, held to the light around (after Belobug 44dcd437):
             // without rays they are the sky's, unoccluded, on every glossy surface.
+            static LISTED: std::sync::Once = std::sync::Once::new();
+            LISTED.call_once(|| {
+                for u in stage.translated().used.iter() {
+                    let found = (u.root == RootType::Table).then(|| view(u.kind, (u.slot, u.table_offset_dwords))).flatten();
+                    let r = match found {
+                        Some(View::Shader(r, _)) | Some(View::Unordered(r, ..)) => r,
+                        _ => 0,
+                    };
+                    let d = crate::resource::host_resource(r as This).map(|t| {
+                        // SAFETY: a live resource.
+                        let d = unsafe { t.GetDesc() };
+                        (d.Format.0, d.Width, d.Height)
+                    });
+                    tracing::info!(kind = ?u.kind, root = ?u.root, slot = u.slot, offset = u.table_offset_dwords, ?d, "the reflections' last pass uses");
+                }
+            });
             return match view(ResourceType::Uav, crate::ambient::REFLECTIONS) {
                 Some(View::Unordered(r, ..)) if r != 0 => crate::ambient::hold(list, r as This),
                 _ => false,
@@ -2946,6 +2962,13 @@ impl State {
         finish(list);
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
+            // An indirect dispatch may be the light's resolve or the
+            // reflections' last pass too.
+            if self.ambient(list, p) {
+                self.host_pipeline = 0;
+                self.host_roots = [0; 2];
+                self.host_heaps = [0; 2];
+            }
         } else {
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
