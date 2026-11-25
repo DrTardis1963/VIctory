@@ -3,7 +3,10 @@
 mod agility;
 mod gate;
 mod harness;
+#[cfg(test)]
+mod hook_tests;
 mod json;
+mod opcodes;
 mod policy;
 mod progress;
 mod todo;
@@ -38,6 +41,20 @@ enum Cmd {
     Harness {
         #[command(subcommand)]
         cmd: harness::HarnessCmd,
+    },
+    /// GFX10 opcode coverage: which opcodes the decoder knows, the shader
+    /// tests lower, and the lowering names. Runs victory-shader's unit tests.
+    Opcodes {
+        /// A list the tests recorded before (one opcode per line), instead
+        /// of running them.
+        #[arg(long)]
+        from: Option<PathBuf>,
+        /// List every opcode, not the first 20 of each kind.
+        #[arg(long)]
+        all: bool,
+        /// Print as one JSON object.
+        #[arg(long)]
+        json: bool,
     },
     /// Copy the D3D12 Agility SDK runtime (shader model 6.6 on Windows 10)
     /// into every build folder, after checking it is the version the
@@ -119,6 +136,7 @@ fn main() -> Result<()> {
         ),
         Cmd::Todo { files, limit, json } => todo::run(&root, files, limit, json),
         Cmd::Agility { from, check } => agility::run(&root, from, check),
+        Cmd::Opcodes { from, all, json } => opcodes::run(&root, from, all, json),
     }
 }
 

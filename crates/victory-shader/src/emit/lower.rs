@@ -5212,9 +5212,12 @@ impl<'a> Lower<'a> {
             // program where its results are needed, and two trace programs
             // came out without their test that way.
             Fields::Image { .. } if name.starts_with("image_bvh") => {
-                return self
-                    .bvh(inst, b, i)
-                    .map_err(|why| unsupported(offset, why));
+                let r = self.bvh(inst, b, i);
+                #[cfg(test)]
+                if r.is_ok() {
+                    super::coverage::record(name);
+                }
+                return r.map_err(|why| unsupported(offset, why));
             }
             Fields::Image { .. } => self.image(inst, b, i),
             Fields::Buffer { .. } => self.buffer(inst, b, i),
@@ -5224,7 +5227,11 @@ impl<'a> Lower<'a> {
             Fields::Flat { .. } => Err("flat memory"),
         };
         match r {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                #[cfg(test)]
+                super::coverage::record(name);
+                Ok(())
+            }
             Err(why) if effect => Err(unsupported(offset, why)),
             Err(why) => {
                 for &(_, v) in &inst.writes {

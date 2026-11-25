@@ -14,7 +14,7 @@
 | Antigravity | `.worktrees/unified` | `synthesis/unified` | `WillyboPeep/victory-all-forks` security audit & Waves 1–3 synthesis | `DONE` | 2026-11-25 |
 | Existing local work | `.` (root) | `legal/policy-and-runtime-guards` | The 8 uncommitted files (table-CBV → root-CBV WIP) moved to a stash, superseded by `fix/table-cbv-raw-views` | `SHELVED` | 2026-11-26 |
 | Claude Code | `.worktrees/port-683` | `fix/table-cbv-raw-views` | Fork survey (`docs/fork-survey-2026-11-26.md`); table CBVs read as raw views (idea of upstream `683ad7a9`, spine-native) | `DONE` | 2026-11-26 |
-| Claude Code | `.worktrees/claude-tooling` | `claude/unified-tooling` | Agent tooling on unified: `xtask gate`, unimplemented-import ledger + `xtask todo`, `xtask agility`, asset-policy write hook, GFX10 opcode coverage | `IN_PROGRESS` | 2026-11-26 |
+| Claude Code | `.worktrees/claude-tooling` | `claude/unified-tooling` | Agent tooling on unified: `xtask gate`, unimplemented-import ledger + `xtask todo`, `xtask agility`, asset-policy write hook, `xtask opcodes` | `DONE` | 2026-11-26 |
 | Existing local work | `.worktrees/agy` | `fix/loader-tls-redirect-bounds-and-empty-section` | Existing worktree — **DO NOT TOUCH** | `RESERVED` | 2026-11-25 |
 
 ---
@@ -33,13 +33,14 @@
 ---
 
 ## 3. Last Verification Gate
-*2026-11-26, `fix/table-cbv-raw-views`: all six steps exit 0.*
-- `cargo xtask policy`: **PASS** (`188 files ok`)
-- `cargo clippy --workspace --all-targets --locked -- -D warnings`: **PASS** (0 warnings)
-- `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`: **PASS** (0 warnings)
-- `cargo test --workspace --locked --exclude victory-gpu --exclude victory-shader`: **PASS** (`230 passed, 0 failed, 5 ignored`)
-- `cargo test -p victory-shader --lib --locked`: **PASS** (`271 passed, 0 failed, 2 ignored` — includes `table_constant_buffers_are_read_through_raw_views`)
-- `cargo test -p victory-gpu --lib --locked -- --test-threads=1`: **PASS** (`221 passed, 0 failed, 4 ignored` — includes `table_cbv_is_a_raw_view_and_null_cbvs_read_zeros_on_gpu`, `targets_room_reservation_respects_budget_and_override` & `zero_address_views_do_not_make_each_other_stale`)
+*2026-11-26, `claude/unified-tooling`: `cargo xtask gate` (all steps exit 0; logs in `target/xtask-gate/`).*
+- `cargo xtask policy`: **PASS**
+- `cargo clippy --workspace --all-targets --locked -- -D warnings`: **PASS**
+- `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`: **PASS**
+- `cargo test --workspace --locked --exclude victory-gpu --exclude victory-shader`: **PASS** (`254 passed, 0 failed, 5 ignored`)
+- `cargo test -p victory-shader --lib --locked`: **PASS** (`271 passed, 0 failed, 2 ignored`)
+- `cargo test -p victory-gpu --lib --locked -- --test-threads=1`: **PASS** (`221 passed, 0 failed, 4 ignored`)
+- `cargo xtask opcodes`: 1,232 GFX10 opcodes decoded; 168 lowered by the shader unit tests, 745 named in the lowering but untested, 319 not named (refused or generic).
 - Shader diagnostic note (`#f133e35efed2a48a`): `dxil.dll` validation passes (`26,703` IR instructions, `52` used resources), `CreateComputePipelineState` fails with `E_INVALIDARG`; queued for Phase 2C root-signature / compute state inspection.
 
 ---
