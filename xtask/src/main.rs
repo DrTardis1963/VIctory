@@ -1,8 +1,6 @@
 //! Repository maintenance. Run with `cargo xtask <command>`.
 
-mod diagnostics;
 mod policy;
-mod progress;
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -28,21 +26,12 @@ enum Cmd {
     },
     /// Point git at .githooks/ so every commit runs the policy check.
     InstallHooks,
-    /// Summarize a VIctory diagnostic JSONL file as JSON.
-    Diagnostics {
-        /// File created by victory --diagnostic-jsonl.
-        input: PathBuf,
-    },
-    /// Write the README's progress tracker from docs/progress/progress.json.
-    Progress,
 }
 
 fn main() -> Result<()> {
     let root = workspace_root();
     match Cli::parse().command {
         Cmd::Policy { staged } => policy::run(&root, staged),
-        Cmd::Diagnostics { input } => diagnostics::run(&input),
-        Cmd::Progress => progress::run(&root),
         Cmd::InstallHooks => {
             let status = Command::new("git")
                 .args(["config", "core.hooksPath", ".githooks"])

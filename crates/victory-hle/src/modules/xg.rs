@@ -3,7 +3,7 @@
 //! slice lies, and to copy linear data into tiled memory and back. Served
 //! from `victory_formats::texture`.
 //!
-//! Grand Theft Auto VI imports `XGCreateTextureComputer` and
+//! The title imports `XGCreateTextureComputer` and
 //! `XGSuggestSwizzleMode` and calls these computer methods: Release (0x08),
 //! the layout (0x10), copies into (0x40) and out of (0x48) a subresource,
 //! and the 64 KiB tiling (0x50). The other slots log and fail.
@@ -15,7 +15,6 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use victory_formats::texture::{Dimension, Error, Layout, Swizzle, Texture, TextureDesc};
 
-use super::release_ref;
 use super::xasync::{E_INVALIDARG, E_NOTIMPL};
 use super::xgameruntime::{HRESULT, S_OK};
 use crate::{HleModule, hle_export};
@@ -135,7 +134,7 @@ pub extern "system" fn XGCreateTextureComputer(
     S_OK
 }
 
-fn texture_desc(desc: &ResourceDesc) -> Option<TextureDesc> {
+fn texture(desc: &ResourceDesc) -> Option<Texture> {
     let dimension = match desc.dimension {
         TEXTURE_1D => Dimension::Tex1d,
         3 => Dimension::Tex2d,
@@ -148,7 +147,7 @@ fn texture_desc(desc: &ResourceDesc) -> Option<TextureDesc> {
         l if l & !0xff == SWIZZLED => Swizzle(l & 0xff),
         _ => return None,
     };
-    Some(TextureDesc {
+    let texture = Texture::new(&TextureDesc {
         dimension,
         width: u32::try_from(desc.width).ok()?,
         height: desc.height,
@@ -158,10 +157,7 @@ fn texture_desc(desc: &ResourceDesc) -> Option<TextureDesc> {
         samples: desc.samples.max(1),
         swizzle,
     })
-}
-
-fn texture(desc: &ResourceDesc) -> Option<Texture> {
-    let texture = Texture::new(&texture_desc(desc)?).ok()?;
+    .ok()?;
     // The layout struct has room for 15 mips.
     (texture.planes[0].layout.mips.len() <= MIPS).then_some(texture)
 }
@@ -169,7 +165,7 @@ fn texture(desc: &ResourceDesc) -> Option<Texture> {
 const MIPS: usize = 15;
 
 /// One mip in the layout the title reads (offsets 0x00, 0x08, 0x10 and
-/// 0x1c are read by Grand Theft Auto VI; the rest follow the library's
+/// 0x1c are read by the title; the rest follow the library's
 /// older public shape).
 #[repr(C)]
 #[derive(Debug, Default, Clone, Copy)]
@@ -284,13 +280,13 @@ extern "system" fn add_ref(this: This) -> u32 {
 }
 
 extern "system" fn release(this: This) -> u32 {
-    let left = release_ref(&computer(this).refs, "texture computer");
-    if left == Some(0) {
+    let left = computer(this).refs.fetch_sub(1, Ordering::AcqRel) - 1;
+    if left == 0 {
         // SAFETY: made by `Box::into_raw` in `XGCreateTextureComputer`; the
         // last reference is gone.
         drop(unsafe { Box::from_raw(this) });
     }
-    left.unwrap_or(0)
+    left
 }
 
 extern "system" fn layout(this: This, out: *mut LayoutOut) -> HRESULT {
@@ -304,6 +300,8 @@ extern "system" fn layout(this: This, out: *mut LayoutOut) -> HRESULT {
         out.write_bytes(0, 1);
         &mut *out
     };
+    out.size = c.texture.size;
+    out.alignment = c.texture.alignment;
     out.mips = c.mips;
     out.planes = c.texture.planes.len() as u32;
     out.dimension = c.desc.dimension;
@@ -311,24 +309,6 @@ extern "system" fn layout(this: This, out: *mut LayoutOut) -> HRESULT {
     // without mips.
     let depth =
         c.desc.flags & ALLOW_DEPTH_STENCIL != 0 && (c.texture.planes.len() > 1 || c.mips == 1);
-    // A render target or depth buffer also needs memory for the console's
-    // compression metadata. Its plane shapes are not published, so report
-    // an upper-bound reservation after the data planes rather than making
-    // up plane types the title might try to copy from.
-    let render = c.desc.flags & (ALLOW_RENDER_TARGET | ALLOW_DEPTH_STENCIL) != 0;
-    let meta = texture_desc(&c.desc)
-        .map(|d| victory_formats::texture::metadata(&d, &c.texture, depth, render))
-        .unwrap_or(0);
-    if meta > 0 {
-        let offset = c.texture.size.next_multiple_of(
-            victory_formats::texture::METADATA_ALIGNMENT,
-        );
-        out.size = offset + meta;
-        out.alignment = c.texture.alignment.max(victory_formats::texture::METADATA_ALIGNMENT);
-    } else {
-        out.size = c.texture.size;
-        out.alignment = c.texture.alignment;
-    }
     for (plane, p) in out.plane.iter_mut().zip(&c.texture.planes) {
         let l = &p.layout;
         plane.usage = match (p.stencil, depth) {
@@ -559,7 +539,7 @@ extern "system" fn tiling(
 }
 
 /// Slot 0x30 `(plane, mip, x, y, z or slice, sample, bit position)`: an
-/// element's byte offset from the texture's start. Grand Theft Auto VI reads
+/// element's byte offset from the texture's start. The title reads
 /// texels of a 128x4 `4KB_S` texture on the CPU through it (title+0x5151c90);
 /// an error returned as an offset made it read wild memory. 0 if outside.
 extern "system" fn element_offset(
@@ -687,32 +667,6 @@ mod tests {
         assert_eq!(out, 0x118);
     }
 
-    #[test]
-    fn render_targets_reserve_metadata_memory() {
-        let plain = desc(256, 256, 1, 28, 0);
-        let mut render = plain;
-        render.flags = ALLOW_RENDER_TARGET;
-        let mut depth = plain;
-        depth.flags = ALLOW_DEPTH_STENCIL;
-        let layout = |d: &ResourceDesc| {
-            let c = create(d);
-            let mut out: Box<LayoutOut> = Box::new(unsafe { std::mem::zeroed() });
-            let get: extern "system" fn(This, *mut LayoutOut) -> HRESULT = slot(c, 2);
-            assert_eq!(get(c, &mut *out), S_OK);
-            let result = (out.size, out.alignment, out.planes);
-            slot::<extern "system" fn(This) -> u32>(c, 1)(c);
-            result
-        };
-        let (base, base_align, base_planes) = layout(&plain);
-        let (color, color_align, color_planes) = layout(&render);
-        let (depth_size, _, _) = layout(&depth);
-        assert!(color > base, "color metadata is reserved");
-        assert!(depth_size > base, "depth metadata is reserved");
-        assert!(depth_size >= color, "HTILE is at least color metadata");
-        assert!(color_align >= base_align && color_align.is_multiple_of(1 << 16));
-        assert_eq!(color_planes, base_planes, "data planes are unchanged");
-    }
-
     /// The title's calls: layout, then a copy in and out of each mip.
     #[test]
     fn layout_and_copies_through_the_object() {
@@ -822,21 +776,5 @@ mod tests {
         let bad = desc(256, 256, 1, 28, 0x103);
         assert_eq!(XGCreateTextureComputer(&bad, &mut c), E_INVALIDARG);
         assert!(module().exports.len() == 2);
-    }
-
-    /// A title releasing a computer once too often: the count stays 0 and
-    /// nothing is freed again (the old `fetch_sub(1) - 1` overflowed).
-    #[test]
-    fn release_past_zero_leaves_the_count_at_zero() {
-        let c = create(&desc(128, 4, 1, 11, 0x100));
-        let release = slot::<extern "system" fn(This) -> u32>(c, 1);
-        assert_eq!(slot::<extern "system" fn(This) -> u32>(c, 0)(c), 2);
-        assert_eq!(release(c), 1);
-        computer(c).refs.store(0, Ordering::Relaxed);
-        assert_eq!(release(c), 0);
-        assert_eq!(computer(c).refs.load(Ordering::Relaxed), 0);
-        // SAFETY: made by `XGCreateTextureComputer` and not freed by
-        // `release`.
-        drop(unsafe { Box::from_raw(c) });
     }
 }

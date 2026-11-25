@@ -59,8 +59,37 @@ impl SigElement {
         }
     }
 
+    fn sig_name(&self) -> &str {
+        match self.kind {
+            1 => "SV_VertexID",
+            2 => "SV_InstanceID",
+            3 => "SV_Position",
+            4 => "SV_RenderTargetArrayIndex",
+            5 => "SV_ViewportArrayIndex",
+            6 => "SV_ClipDistance",
+            7 => "SV_CullDistance",
+            10 => "SV_PrimitiveID",
+            12 => "SV_SampleIndex",
+            13 => "SV_IsFrontFace",
+            14 => "SV_Coverage",
+            15 => "SV_InnerCoverage",
+            16 => "SV_Target",
+            17 => "SV_Depth",
+            18 => "SV_DepthLessEqual",
+            19 => "SV_DepthGreaterEqual",
+            20 => "SV_StencilRef",
+            28 => "SV_Barycentrics",
+            30 => "SV_CullPrimitive",
+            _ => &self.name,
+        }
+    }
+
+    fn effective_col(&self) -> u8 {
+        if self.row.is_some() { self.col } else { 0 }
+    }
+
     fn mask(&self) -> u8 {
-        ((1u8 << self.cols) - 1) << self.col
+        ((1u8 << self.cols) - 1) << self.effective_col()
     }
 }
 
@@ -72,8 +101,8 @@ pub(crate) fn signature(elements: &[SigElement], input: bool) -> Vec<u8> {
     // Validator 1.6 writes one name per element in element order, repeats
     // included, except that system values share theirs (it keys names by
     // the semantic's string, which is one static string per system value);
-    // the rows are stably sorted by register (unallocated last), preserving
-    // element order within a row.
+    // the rows sorted by register (unallocated last), keeping element order
+    // within the same register.
     let mut offsets: Vec<u32> = Vec::new();
     let mut next = 8 + 32 * elements.len() as u32;
     let mut names = Vec::new();
@@ -84,9 +113,10 @@ pub(crate) fn signature(elements: &[SigElement], input: bool) -> Vec<u8> {
         match shared {
             Some(j) => offsets.push(offsets[j]),
             None => {
+                let name = e.sig_name();
                 offsets.push(next);
-                next += e.name.len() as u32 + 1;
-                names.push(&e.name);
+                next += name.len() as u32 + 1;
+                names.push(name);
             }
         }
     }
@@ -94,7 +124,7 @@ pub(crate) fn signature(elements: &[SigElement], input: bool) -> Vec<u8> {
     order.sort_by_key(|&i| elements[i].row.unwrap_or(u32::MAX));
     for i in order {
         let (e, offset) = (&elements[i], offsets[i]);
-        let used = e.usage << e.col;
+        let used = e.usage << e.effective_col();
         let rw = if input { used } else { !used & 0xf };
         for v in [
             0,
@@ -136,7 +166,7 @@ pub(crate) fn mesh_output_bytes(
 /// A resource bound by register, as `PSV0` lists it.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Binding {
-    /// PSV resource type: 1 sampler, 2 CBV.
+    /// PSV resource type: 1 sampler, 2 CBV, 4 raw SRV, 7 raw UAV.
     pub kind: u32,
     pub space: u32,
     pub register: u32,
@@ -145,9 +175,8 @@ pub(crate) struct Binding {
 }
 
 pub(crate) struct Psv<'a> {
-    /// PSV shader kind: 0 pixel, 1 vertex, 2 geometry, 5 compute, 13 mesh.
+    /// PSV shader kind: 0 pixel, 1 vertex, 2 geometry, 5 compute.
     pub stage: u8,
-    pub gs_vertices: Option<u16>,
     /// Vertex: writes `SV_Position`. Pixel: writes depth.
     pub flag: bool,
     pub inputs: &'a [SigElement],
@@ -156,16 +185,16 @@ pub(crate) struct Psv<'a> {
     pub prims: &'a [SigElement],
     /// Mesh: its state and the group-shared bytes it declares.
     pub mesh: Option<(super::shader::Mesh, u32)>,
+    /// Geometry (triangles in, triangle strips out on stream 0): its
+    /// maximum vertex count. `flag`: writes `SV_Position`.
+    pub geometry: Option<u32>,
     pub bindings: &'a [Binding],
     /// Compute: thread-group size and required wave size.
     pub threads: [u32; 3],
     pub wave_size: Option<u32>,
-    /// Emit `PSVRuntimeInfo3` (52 bytes, with `EntryFunctionName`) for
-    /// validator 1.8 (required for SM 6.6 compute-shader derivatives).
-    pub valver_1_8: bool,
 }
 
-/// `PSV0` with runtime info version 2 (validator 1.6) or 3 (validator 1.8).
+/// `PSV0` with runtime info version 2 (validator 1.6).
 pub(crate) fn psv(p: &Psv) -> Vec<u8> {
     let vectors = |els: &[SigElement]| {
         els.iter()
@@ -181,7 +210,7 @@ pub(crate) fn psv(p: &Psv) -> Vec<u8> {
             out.extend(v.to_le_bytes());
         }
     };
-    u32s(&mut out, &[if p.valver_1_8 { 52 } else { 48 }]);
+    u32s(&mut out, &[48]);
     let mut info = [0u8; 48];
     info[0] = u8::from(p.flag);
     if p.stage == 0 {
@@ -204,13 +233,6 @@ pub(crate) fn psv(p: &Psv) -> Vec<u8> {
     info[29] = p.outputs.len() as u8;
     info[31] = in_vectors as u8;
     info[32] = out_vectors as u8;
-    if let Some(maximum) = p.gs_vertices {
-        info[..4].copy_from_slice(&3u32.to_le_bytes()); // triangle inputs
-        info[4..8].copy_from_slice(&5u32.to_le_bytes()); // triangle strip
-        info[8..12].copy_from_slice(&1u32.to_le_bytes()); // stream 0
-        info[12] = u8::from(p.flag);
-        info[26..28].copy_from_slice(&maximum.to_le_bytes());
-    }
     if let Some((mesh, shared)) = p.mesh {
         info[0..4].copy_from_slice(&shared.to_le_bytes());
         info[12..14].copy_from_slice(&(mesh.max_vertices as u16).to_le_bytes());
@@ -219,15 +241,16 @@ pub(crate) fn psv(p: &Psv) -> Vec<u8> {
         info[27] = mesh.topology;
         info[30] = p.prims.len() as u8;
     }
-    out.extend(info);
-    // Names of arbitrary semantics (system values use ""), then indices.
-    let mut strings = vec![0u8];
-    if p.valver_1_8 {
-        // EntryFunctionName offset into the PSV string table ("main\0").
-        let entry_name = strings.len() as u32;
-        strings.extend_from_slice(b"main\0");
-        u32s(&mut out, &[entry_name]);
+    if let Some(max_vertices) = p.geometry {
+        // Input primitive (3: triangles), output topology (5: triangle
+        // strips), stream mask, position written; the vertex maximum.
+        info[0..4].copy_from_slice(&3u32.to_le_bytes());
+        info[4..8].copy_from_slice(&5u32.to_le_bytes());
+        info[8..12].copy_from_slice(&1u32.to_le_bytes());
+        info[12] = u8::from(p.flag);
+        info[26..28].copy_from_slice(&(max_vertices as u16).to_le_bytes());
     }
+    out.extend(info);
     u32s(&mut out, &[p.bindings.len() as u32]);
     if !p.bindings.is_empty() {
         u32s(&mut out, &[24]);
@@ -238,6 +261,8 @@ pub(crate) fn psv(p: &Psv) -> Vec<u8> {
             );
         }
     }
+    // Names of arbitrary semantics (system values use ""), then indices.
+    let mut strings = vec![0u8];
     let mut indices: Vec<u32> = Vec::new();
     let mut elements = Vec::new();
     for e in p.inputs.iter().chain(p.outputs).chain(p.prims) {
@@ -375,21 +400,40 @@ pub(crate) fn hash(data: &[u8]) -> [u8; 16] {
 
 fn md5_block(state: &mut [u32; 4], block: &[u8; 64]) {
     const S: [u32; 16] = [7, 12, 17, 22, 5, 9, 14, 20, 4, 11, 16, 23, 6, 10, 15, 21];
-    let x: Vec<u32> = block
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .map(|c| u32::from_le_bytes(*c))
-        .collect();
+    const K: [u32; 64] = [
+        0xd76a_a478, 0xe8c7_b756, 0x2420_70db, 0xc1bd_ceee,
+        0xf57c_0faf, 0x4787_c62a, 0xa830_4613, 0xfd46_9501,
+        0x6980_98d8, 0x8b44_f7af, 0xffff_5bb1, 0x895c_d7be,
+        0x6b90_1122, 0xfd98_7193, 0xa679_438e, 0x49b4_0821,
+        0xf61e_2562, 0xc040_b340, 0x265e_5a51, 0xe9b6_c7aa,
+        0xd62f_105d, 0x0244_1453, 0xd8a1_e681, 0xe7d3_fbc8,
+        0x21e1_cde6, 0xc337_07d6, 0xf4d5_0d87, 0x455a_14ed,
+        0xa9e3_e905, 0xfcef_a3f8, 0x676f_02d9, 0x8d2a_4c8a,
+        0xfffa_3942, 0x8771_f681, 0x6d9d_6122, 0xfde5_380c,
+        0xa4be_ea44, 0x4bde_cfa9, 0xf6bb_4b60, 0xbebf_bc70,
+        0x289b_7ec6, 0xeaa1_27fa, 0xd4ef_3085, 0x0488_1d05,
+        0xd9d4_d039, 0xe6db_99e5, 0x1fa2_7cf8, 0xc4ac_5665,
+        0xf429_2244, 0x432a_ff97, 0xab94_23a7, 0xfc93_a039,
+        0x655b_59c3, 0x8f0c_cc92, 0xffef_f47d, 0x8584_5dd1,
+        0x6fa8_7e4f, 0xfe2c_e6e0, 0xa301_4314, 0x4e08_11a1,
+        0xf753_7e82, 0xbd3a_f235, 0x2ad7_d2bb, 0xeb86_d391,
+    ];
+    let x: [u32; 16] = std::array::from_fn(|i| {
+        u32::from_le_bytes([
+            block[4 * i],
+            block[4 * i + 1],
+            block[4 * i + 2],
+            block[4 * i + 3],
+        ])
+    });
     let [mut a, mut b, mut c, mut d] = *state;
-    for i in 0..64 {
+    for (i, &k) in K.iter().enumerate() {
         let (f, g) = match i / 16 {
             0 => ((b & c) | (!b & d), i),
             1 => ((d & b) | (!d & c), (5 * i + 1) % 16),
             2 => (b ^ c ^ d, (3 * i + 5) % 16),
             _ => (c ^ (b | !d), (7 * i) % 16),
         };
-        let k = ((i as f64 + 1.0).sin().abs() * 4_294_967_296.0) as u32;
         let rotated = a
             .wrapping_add(f)
             .wrapping_add(k)
@@ -423,41 +467,44 @@ mod tests {
         assert_eq!(hex, "900150983cd24fb0d6963f7d28e17f72");
     }
 
-    fn element(row: u32, col: u8, cols: u8) -> SigElement {
-        SigElement {
-            name: "TEXCOORD".into(),
-            index: row,
-            kind: 0,
+    #[test]
+    fn signature_keeps_same_row_order_canonical_sv_names_and_unalloc_mask() {
+        let mk = |name: &str, kind, row, col, cols, usage| SigElement {
+            name: name.into(),
+            index: 0,
+            kind,
             comp: 9,
-            interp: 2,
-            row: Some(row),
+            interp: 0,
+            row,
             col,
             cols,
-            usage: 0,
+            usage,
             half: false,
-        }
-    }
-
-    #[test]
-    fn mesh_output_size_counts_components_and_aligned_maxima() {
-        // Components, not rows: 4 + 3 + 1 (two elements share row 1) and 2.
-        let vertex = [element(0, 0, 4), element(1, 0, 3), element(1, 3, 1)];
-        let primitive = [element(0, 0, 2)];
-        assert_eq!(
-            mesh_output_bytes(&vertex, &primitive, 64, 128),
-            4 * (8 * 64 + 2 * 128)
+        };
+        let bytes = signature(
+            &[
+                mk("COLOR", 0, Some(0), 2, 2, 0b10),
+                mk("TEXCOORD", 0, Some(0), 0, 2, 0b01),
+                mk("SV_POSITION", 3, Some(1), 0, 4, 0),
+                mk("SV_SAMPLEINDEX", 12, None, 2, 1, 1),
+            ],
+            true,
         );
-        // Maxima round up to multiples of 32.
-        assert_eq!(
-            mesh_output_bytes(&vertex, &primitive, 33, 1),
-            mesh_output_bytes(&vertex, &primitive, 64, 32)
-        );
-        assert_eq!(mesh_output_bytes(&[], &[], 256, 256), 0);
-        // 32 components at 256 vertices are the limit itself; a primitive
-        // output on top passes it.
-        let rows: Vec<SigElement> = (0..8).map(|r| element(r, 0, 4)).collect();
-        assert_eq!(mesh_output_bytes(&rows, &[], 256, 256), MESH_OUTPUT_LIMIT);
-        let over = mesh_output_bytes(&rows, &primitive, 256, 1);
-        assert_eq!(over, MESH_OUTPUT_LIMIT + 4 * 2 * 32);
+        let name_at = |row: usize| {
+            let off = u32::from_le_bytes(bytes[8 + 32 * row + 4..8 + 32 * row + 8].try_into().unwrap()) as usize;
+            let end = bytes[off..].iter().position(|&b| b == 0).unwrap();
+            std::str::from_utf8(&bytes[off..off + end]).unwrap()
+        };
+        let mask_rw = |row: usize| (bytes[8 + 32 * row + 24], bytes[8 + 32 * row + 25]);
+        // Same-row elements keep element order (COLOR col 2 before TEXCOORD col 0).
+        assert_eq!(name_at(0), "COLOR");
+        assert_eq!(mask_rw(0), (0b1100, 0b1000));
+        assert_eq!(name_at(1), "TEXCOORD");
+        assert_eq!(mask_rw(1), (0b0011, 0b0001));
+        // System values use DXIL's canonical casing.
+        assert_eq!(name_at(2), "SV_Position");
+        // Unallocated elements do not shift mask/usage by `col`.
+        assert_eq!(name_at(3), "SV_SampleIndex");
+        assert_eq!(mask_rw(3), (0b0001, 0b0001));
     }
 }

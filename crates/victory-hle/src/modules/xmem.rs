@@ -18,11 +18,10 @@ use windows_sys::Win32::Foundation::{
 };
 use windows_sys::Win32::System::Memory::{
     CreateFileMappingW, MEM_ADDRESS_REQUIREMENTS, MEM_COMMIT, MEM_EXTENDED_PARAMETER,
-    MEM_PRESERVE_PLACEHOLDER, MEM_PRIVATE, MEM_RELEASE, MEM_REPLACE_PLACEHOLDER, MEM_RESERVE,
+    MEM_PRESERVE_PLACEHOLDER, MEM_RELEASE, MEM_REPLACE_PLACEHOLDER, MEM_RESERVE,
     MEM_RESERVE_PLACEHOLDER, MEMORY_BASIC_INFORMATION, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile3,
     MemExtendedParameterAddressRequirements, PAGE_NOACCESS, PAGE_READWRITE, SEC_COMMIT,
-    SEC_RESERVE, VirtualAlloc, VirtualAlloc2, VirtualFree, VirtualQuery,
-    VirtualQueryEx,
+    SEC_RESERVE, UnmapViewOfFile2, VirtualAlloc, VirtualAlloc2, VirtualFree, VirtualQueryEx,
 };
 use windows_sys::Win32::System::ProcessStatus::{
     K32GetPerformanceInfo, K32GetProcessMemoryInfo, PERFORMANCE_INFORMATION,
@@ -73,8 +72,8 @@ const MEM_WRITE_WATCH: u32 = 0x20_0000;
 /// 32-bit memory; else from 4 GiB (kept for 32-bit requests, which the
 /// title's big pools would otherwise crowd out) up to 46 down to 40 bits
 /// from the field at bit 12, or 40 bits without one: the console keeps
-/// title memory there, and its ray-tracing structures must be (Grand Theft
-/// Auto VI's BVH builder refuses one above; the title asks for its GPU heap
+/// title memory there, and its ray-tracing structures must be (
+/// the title's BVH builder refuses one above; the title asks for its GPU heap
 /// with no field). Decision 0001.
 fn address_range(flags: u64) -> (usize, usize) {
     let bits = match (flags & ADDRESS_32BIT, flags >> 12 & 7) {
@@ -109,7 +108,7 @@ pub extern "system" fn XMemVirtualAlloc(
     // A reservation of 64 KiB pages takes physical pages later
     // (`XMemMapPhysicalPages`); on the host only a placeholder can.
     // shortcut: committing part of such a reservation later would fail
-    // (Grand Theft Auto VI's 23 calls never do); replace that part of the
+    // (the title's 23 calls never do); replace that part of the
     // placeholder then.
     let placeholder = kind & PAGES_64K == PAGES_64K && kind & MEM_COMMIT == 0;
     if placeholder {
@@ -177,7 +176,7 @@ pub struct BasicInformation {
 }
 
 // shortcut: every committed page reports graphics memory and no tag, since
-// all of it is GPU-reachable here (Grand Theft Auto VI's BVH builder, the
+// all of it is GPU-reachable here (the title's BVH builder, the
 // only caller, wants graphics memory); remember the flags of
 // `XMemVirtualAlloc` regions if a title tells CPU-only memory apart.
 pub extern "system" fn XMemVirtualQuery(
@@ -222,7 +221,7 @@ type AllocRoutine = extern "system" fn(usize, u64) -> *mut c_void;
 type FreeRoutine = extern "system" fn(*mut c_void, u64);
 
 /// The allocation and free routines the title's exe exports as
-/// `__XMemAllocationHooks__` (Grand Theft Auto VI does): `XMemAlloc` and
+/// `__XMemAllocationHooks__` (the title does): `XMemAlloc` and
 /// `XMemFree` call them, for the title's own calls and its middleware's;
 /// the `…Default` exports do not.
 fn hooks() -> [usize; 2] {
@@ -292,7 +291,7 @@ pub extern "system" fn XMemAllocDefault(size: usize, attributes: u64) -> *mut c_
     };
     // shortcut: the host heap's addresses lie above 2^40, unlike the
     // console's; nothing seen builds ray-tracing structures in this memory
-    // (Grand Theft Auto VI uses its GPU heap). Sub-allocate from a
+    // (the title uses its GPU heap). Sub-allocate from a
     // reservation below 2^40 if one does.
     // SAFETY: the layout has a non-zero size.
     let block = unsafe { alloc(layout) };
@@ -400,7 +399,7 @@ pub extern "system" fn XMemAllocatePhysicalPages(
         return 0;
     };
     // A pagefile-backed section of `size` bytes, its pages committed when
-    // first mapped or written (`commit`): Grand Theft Auto VI asks for 6.1
+    // first mapped or written (`commit`): the title asks for 6.1
     // GiB at once, which a busy host often cannot commit (error 1450).
     // SAFETY: plain section creation.
     let handle = unsafe {
@@ -429,6 +428,9 @@ pub extern "system" fn XMemAllocatePhysicalPages(
         flags = format_args!("{flags:#x}"),
         "XMemAllocatePhysicalPages"
     );
+    // For the GPU side's in-place census: only a committed section can be
+    // opened as a host heap.
+    victory_gpu::title_memory_section(handle as usize, size as u64, on_wine());
     let section = Arc::new(Section(handle));
     let mut physical = physical();
     let first = physical.next_page;
@@ -447,7 +449,7 @@ pub extern "system" fn XMemAllocatePhysicalPages(
 }
 
 /// Page numbers count 4 KiB frames, so a 64 KiB page's is a multiple of
-/// 16: Grand Theft Auto VI keeps them as 21-bit `number >> 4` and rebuilds
+/// 16: the title keeps them as 21-bit `number >> 4` and rebuilds
 /// them with `<< 4` (128 GiB of pages at most).
 const FRAMES: usize = PAGE >> 12;
 
@@ -534,6 +536,12 @@ fn runs(pages: &[usize], offset: usize, len: usize) -> Option<Vec<(Slice, usize)
     Some(runs)
 }
 
+/// Whether every page under `[offset, offset + len)` is known (a write that
+/// fails with them known is a host failure).
+pub(crate) fn pages_known(pages: &[usize], offset: usize, len: usize) -> bool {
+    runs(pages, offset, len).is_some()
+}
+
 /// Copies `data` into physical pages, from `offset` bytes into the first,
 /// whether or not they are mapped anywhere (DirectStorage destinations).
 /// One view per run of consecutive pages, not one per page: each view
@@ -550,6 +558,9 @@ pub(crate) fn write_physical(pages: &[usize], offset: usize, data: &[u8]) -> boo
         };
         let k = (n * PAGE - within).min(data.len() - done);
         view.bytes()[within..within + k].copy_from_slice(&data[done..done + k]);
+        // The title's views of these pages show new bytes with no fault of
+        // theirs: the guard over them is told (`victory_gpu`).
+        victory_gpu::title_memory_written(slice.section.0 as usize, (slice.index * PAGE + within) as u64, k);
         (within, done) = (0, done + k);
     }
     true
@@ -562,12 +573,21 @@ pub(crate) struct PageWindow {
     view: View,
     within: usize,
     len: usize,
+    /// The section the bytes lie in, and their offset in it.
+    section: usize,
+    offset: u64,
 }
 
 impl PageWindow {
     pub(crate) fn bytes(&mut self) -> &mut [u8] {
         let (within, len) = (self.within, self.len);
         &mut self.view.bytes()[within..within + len]
+    }
+
+    /// The bytes were written (or the write was tried): the title's views
+    /// of them are told (`victory_gpu`), as [`write_physical`] tells.
+    pub(crate) fn written(&self) {
+        victory_gpu::title_memory_written(self.section, self.offset, self.len);
     }
 }
 
@@ -581,10 +601,13 @@ pub(crate) fn page_window(pages: &[usize], offset: usize, len: usize) -> Option<
     let [(slice, n)] = runs.as_slice() else {
         return None;
     };
+    let within = offset % PAGE;
     Some(PageWindow {
         view: View::map(slice, *n)?,
-        within: offset % PAGE,
+        within,
         len,
+        section: slice.section.0 as usize,
+        offset: (slice.index * PAGE + within) as u64,
     })
 }
 
@@ -597,6 +620,13 @@ pub extern "system" fn XMemMapPhysicalPages(
 ) -> *mut c_void {
     let base = address as usize;
     let mut physical = physical();
+    // Until the pages are mapped again: `unmap` takes whole views away and
+    // maps what stays of them again, and a mapped view is a reservation
+    // until it is committed. A read of title memory in place must not fall
+    // into that gap (`victory_gpu::title_memory_remapping`); reads of other
+    // bytes go on.
+    let (from, to) = reach(&physical, base, n * PAGE);
+    let _changing = victory_gpu::title_memory_remapping(from, to - from);
     unmap(&mut physical, base, n * PAGE);
     if pages.is_null() {
         return address;
@@ -609,7 +639,7 @@ pub extern "system" fn XMemMapPhysicalPages(
             tracing::warn!(page = pages[i], "XMemMapPhysicalPages: unknown page");
             return std::ptr::null_mut();
         };
-        // One mapping per run of consecutive slices of one section.
+        // One view per run of consecutive slices of one section.
         let run = 1 + pages[i + 1..]
             .iter()
             .zip(1..)
@@ -628,7 +658,7 @@ pub extern "system" fn XMemMapPhysicalPages(
 }
 
 /// One page at each address; null `pages`, or a page number 0, unmaps
-/// (Grand Theft Auto VI passes 0 for addresses to clear).
+/// (the title passes 0 for addresses to clear).
 pub extern "system" fn XMemMapPhysicalPagesScatter(
     addresses: *const *mut c_void,
     n: usize,
@@ -658,12 +688,15 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
 
 /// Maps the physical pages shown at `[from, from + len)` at `to` as well,
 /// in place of what `to` shows; `from` 0 unmaps. The GPU's page-mapping
-/// copies (`victory_gpu`, queue `CopyPageMappingsBatchX`): Grand Theft Auto
-/// VI maps pages into a pool view, then has the GPU map them into its tiled
+/// copies (`victory_gpu`, queue `CopyPageMappingsBatchX`):
+/// the title maps pages into a pool view, then has the GPU map them into its tiled
 /// heap. Page by page; false if a source page is not mapped physical memory.
 pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
     let (to, from, len) = (to as usize, from as usize, len as usize);
     let mut physical = physical();
+    // As in `XMemMapPhysicalPages`: no read in place meets the gap.
+    let (start, end) = reach(&physical, to, len);
+    let _changing = victory_gpu::title_memory_remapping(start, end - start);
     unmap(&mut physical, to, len);
     for k in (0..len).step_by(PAGE) {
         if from == 0 {
@@ -690,52 +723,17 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
 }
 
 /// Maps `slice` and the slices after it over `[base, base + len)`, which
-/// must be placeholders. A view replaces exactly one placeholder, and a
-/// reservation is often several by now (each mapping splits it at its
-/// ends, unmapping does not join the pieces, titles split their own), so
-/// the range is split at its two ends and each placeholder in it gets a
-/// view of its part. Placeholders are never joined: that would also join
-/// separate reservations, or pieces the title split, for good. All or
-/// nothing: if a view fails, those made before it are placeholders again.
+/// must lie in one placeholder.
 fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
-    let end = base + len;
-    split_at(base);
-    split_at(end);
-    let mut made: Vec<(usize, usize, Slice)> = Vec::new();
-    let mut at = base;
-    while at < end {
-        // What is not a placeholder fails in `map_view`.
-        let next = placeholder(at).map_or(end, |(_, stop)| stop.min(end));
-        let offset = at - base;
-        let part = Slice {
-            index: slice.index + offset / PAGE,
-            section: slice.section.clone(),
-        };
-        // A view must start on a page of the run to show its slice.
-        if !offset.is_multiple_of(PAGE) || !map_view(at, next - at, &part) {
-            for &(view, len, _) in &made {
-                // SAFETY: a view made above, back to its placeholder.
-                unsafe { victory_gpu::unmap_title_view(view, len) };
-            }
-            return false;
-        }
-        made.push((at, next - at, part));
-        at = next;
-    }
-    for (at, len, part) in made {
-        // New contents, read-write: the GPU side's copies no longer guard it.
-        victory_gpu::title_memory_remapped(at, len);
-        physical.views.insert(at, (len, part));
-    }
-    true
-}
-
-/// Replaces the placeholder `[base, base + len)` with a view of `slice` and
-/// the slices after it, committed.
-fn map_view(base: usize, len: usize, slice: &Slice) -> bool {
-    // SAFETY: replaces the placeholder `[base, base + len)` with a view of
-    // the section; the host refuses anything that is not that placeholder.
+    // SAFETY: splits the placeholder around the range (failing harmlessly
+    // when the range is the whole placeholder), then maps the section
+    // there; both act only on placeholders.
     let view = unsafe {
+        VirtualFree(
+            base as *mut c_void,
+            len,
+            MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER,
+        );
         MapViewOfFile3(
             slice.section.0,
             GetCurrentProcess(),
@@ -759,49 +757,15 @@ fn map_view(base: usize, len: usize, slice: &Slice) -> bool {
     }
     if !commit(base, len) {
         // SAFETY: the view just mapped, back to a placeholder.
-        unsafe { victory_gpu::unmap_title_view(base, len) };
+        unsafe { UnmapViewOfFile2(GetCurrentProcess(), view, MEM_PRESERVE_PLACEHOLDER) };
         return false;
     }
+    // New contents, read-write: the GPU side's copies no longer guard it.
+    victory_gpu::title_memory_remapped(base, len);
+    // What the range shows now, for the GPU side's in-place census.
+    victory_gpu::title_memory_view(base, len, slice.section.0 as usize, (slice.index * PAGE) as u64);
+    physical.views.insert(base, (len, slice));
     true
-}
-
-/// The start and end of the placeholder holding `at`, if it may be one
-/// (other reserved memory looks the same, but the host refuses to split it
-/// or map over it).
-fn placeholder(at: usize) -> Option<(usize, usize)> {
-    // SAFETY: plain data; zero is a valid value.
-    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
-    let size = size_of::<MEMORY_BASIC_INFORMATION>();
-    // SAFETY: a query of our own address space into `info`.
-    let found = unsafe { VirtualQuery(at as *const c_void, &mut info, size) } == size;
-    (found && info.State == MEM_RESERVE && info.Type == MEM_PRIVATE).then(|| {
-        (
-            info.AllocationBase as usize,
-            info.BaseAddress as usize + info.RegionSize,
-        )
-    })
-}
-
-/// Splits the placeholder holding `at` in two there, if it starts below.
-/// The same call frees reserved memory that replaced a placeholder back to
-/// one, committed pages and all, so everything below `at` in it must be
-/// reserved: nothing committed is ever freed here.
-fn split_at(at: usize) {
-    if let Some((start, _)) = placeholder(at)
-        && start < at
-        && placeholder(start).is_some_and(|(_, stop)| stop >= at)
-    {
-        // SAFETY: `[start, at)` is reserved and holds no data; the host
-        // fails the call on anything but a placeholder or memory that
-        // replaced one, and then changes nothing.
-        unsafe {
-            VirtualFree(
-                start as *mut c_void,
-                at - start,
-                MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER,
-            )
-        };
-    }
 }
 
 /// Commits the section pages a view shows (once per page, whichever view).
@@ -852,6 +816,29 @@ fn commit_limit_message(
     message
 }
 
+/// Start and end of the bytes whose mapping `unmap(physical, base, len)`
+/// and mapping `[base, base + len)` again change: the range, and the whole
+/// of the views reaching out of it (`unmap` takes them away and maps what
+/// stays of them again).
+fn reach(physical: &Physical, base: usize, len: usize) -> (usize, usize) {
+    let end = base.saturating_add(len);
+    if len == 0 {
+        return (base, end); // `unmap` changes nothing
+    }
+    let mut reach = (base, end);
+    // As `unmap` finds them: the view holding `base`, the last starting
+    // inside (views do not overlap).
+    if let Some((&at, &(size, _))) = physical.views.range(..=base).next_back()
+        && at + size > base
+    {
+        reach = (at, end.max(at + size));
+    }
+    if let Some((&at, &(size, _))) = physical.views.range(base + 1..end).next_back() {
+        reach.1 = reach.1.max(at + size);
+    }
+    reach
+}
+
 /// Returns `[base, base + len)` to placeholders; views reaching past it
 /// are mapped again outside it.
 fn unmap(physical: &mut Physical, base: usize, len: usize) {
@@ -878,8 +865,17 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
         let Some((size, slice)) = physical.views.remove(&at) else {
             continue;
         };
+        victory_gpu::title_memory_remapped(at, size);
         // SAFETY: a view we mapped; it becomes a placeholder again.
-        unsafe { victory_gpu::unmap_title_view(at, size) };
+        unsafe {
+            UnmapViewOfFile2(
+                GetCurrentProcess(),
+                MEMORY_MAPPED_VIEW_ADDRESS {
+                    Value: at as *mut c_void,
+                },
+                MEM_PRESERVE_PLACEHOLDER,
+            )
+        };
         if at < base {
             map(physical, at, base - at, slice.clone());
         }
@@ -931,6 +927,25 @@ pub extern "system" fn XMemGetWorkingSetStatistics(_which: u32, out: *mut Workin
         gpu_optimal_limit: gpu_optimal,
         ..Default::default()
     };
+    // What the title is told, logged at the first asking and at every
+    // 1,024th: "used" is all the process has committed, the layer's own
+    // memory and the card's included (27 GB in run 60's gameplay against a
+    // limit of 13.5 GB). A title that budgets its streaming from these two
+    // figures believes it is far over its limit.
+    // shortcut: the figure is not yet the title's own memory alone (its
+    // heaps and the pages it mapped); count those if this line shows the
+    // title asking.
+    static ASKED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let asked = ASKED.fetch_add(1, Ordering::Relaxed);
+    if asked.is_multiple_of(1024) {
+        tracing::info!(
+            asked = asked + 1,
+            which = _which,
+            limit_mb = stats.title_limit >> 20,
+            used_mb = stats.title_used >> 20,
+            "the title asks how much memory it uses"
+        );
+    }
     // SAFETY: checked non-null; the title passes room for the structure.
     unsafe { out.write(stats) };
     1
@@ -1175,6 +1190,57 @@ mod tests {
         assert_eq!(XMemIsToolsMemAvailable(), 0);
     }
 
+    /// A thread that reads a mapped page in place, as the GPU side reads a
+    /// texture, never meets the moment in which the runtime has taken the
+    /// page's view away to map it again: mapping the same pages at the same
+    /// address unmaps the view and maps a new one, and without the lock the
+    /// reader faults on a page "reserved, never committed" (the crashes of
+    /// runs 71 and 74).
+    #[test]
+    fn a_read_in_place_never_meets_the_gap_of_a_remapping() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let mut pages = [0usize; 3];
+        let mut n = 3;
+        assert_eq!(XMemAllocatePhysicalPages(0, &mut n, pages.as_mut_ptr()), 1);
+        let a = XMemVirtualAlloc(
+            std::ptr::null_mut(),
+            3 * PAGE,
+            MEM_RESERVE | PAGES_64K,
+            0,
+            PAGE_READWRITE,
+        );
+        assert!(!a.is_null());
+        assert_eq!(XMemMapPhysicalPages(a, 3, pages.as_ptr()), a);
+        // SAFETY: mapped read-write.
+        unsafe { a.cast::<u8>().write(1) };
+        let first = a as usize;
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let reader = {
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                let mut reads = 0u64;
+                while !stop.load(Ordering::Relaxed) {
+                    let _reading = victory_gpu::title_memory_reading(first, 1);
+                    // SAFETY: the page is mapped whenever no change of
+                    // mapping is under way, and none is while `_reading`
+                    // is held.
+                    assert_eq!(unsafe { (first as *const u8).read_volatile() }, 1);
+                    reads += 1;
+                }
+                reads
+            })
+        };
+        for _ in 0..2000 {
+            // The same pages at the same address: the view goes and comes
+            // back, with the same bytes.
+            assert_eq!(XMemMapPhysicalPages(a, 3, pages.as_ptr()), a);
+        }
+        stop.store(true, Ordering::Relaxed);
+        assert!(reader.join().expect("the reader never faulted") > 0);
+        assert_eq!(XMemMapPhysicalPages(a, 3, std::ptr::null()), a);
+        assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
+    }
+
     #[test]
     fn mapping_no_pages_changes_nothing() {
         let pages = allocate(2);
@@ -1301,138 +1367,5 @@ mod tests {
         assert!(page_window(&[a[0], b[0]], 0, PAGE).is_some());
         assert_eq!(XMemFreePhysicalPages(3, a.as_ptr()), 1);
         assert_eq!(XMemFreePhysicalPages(1, b.as_ptr()), 1);
-    }
-
-    /// `n` physical pages (consecutive slices of one section) and a
-    /// reservation of `n` 64 KiB pages for them.
-    fn pages_and_reservation(n: usize) -> (Vec<usize>, *mut c_void) {
-        let mut pages = vec![0usize; n];
-        let mut count = n;
-        assert_eq!(
-            XMemAllocatePhysicalPages(0, &mut count, pages.as_mut_ptr()),
-            1
-        );
-        let reservation = XMemVirtualAlloc(
-            std::ptr::null_mut(),
-            n * PAGE,
-            MEM_RESERVE | PAGES_64K,
-            0,
-            PAGE_READWRITE,
-        );
-        assert!(!reservation.is_null());
-        (pages, reservation)
-    }
-
-    /// Unmapping part of a run leaves the range as several host
-    /// placeholders; mapping a run over all of them again works, and the
-    /// pages keep what was written through the first mapping.
-    #[test]
-    fn a_run_maps_again_after_a_partial_unmap() {
-        let (pages, a) = pages_and_reservation(3);
-        let at = |page: usize| a.wrapping_byte_add(page * PAGE);
-        assert_eq!(XMemMapPhysicalPages(a, 3, pages.as_ptr()), a);
-        // SAFETY: mapped read-write.
-        unsafe {
-            for page in 0..3 {
-                at(page).cast::<u8>().write(10 + page as u8);
-            }
-        }
-        assert_eq!(XMemMapPhysicalPages(at(1), 1, std::ptr::null()), at(1));
-        assert_eq!(query(at(1)).host.State, MEM_RESERVE);
-
-        assert_eq!(XMemMapPhysicalPages(a, 3, pages.as_ptr()), a);
-        for page in 0..3 {
-            assert_eq!(query(at(page)).host.State, MEM_COMMIT, "page {page}");
-            // SAFETY: mapped read-write.
-            assert_eq!(unsafe { at(page).cast::<u8>().read() }, 10 + page as u8);
-        }
-        assert_eq!(XMemMapPhysicalPages(a, 3, std::ptr::null()), a);
-        assert_eq!(query(a).host.State, MEM_RESERVE);
-        assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
-    }
-
-    /// A run that starts inside one host placeholder and ends inside the
-    /// next (left by an earlier, shorter run) maps, and the pages around it
-    /// stay unmapped.
-    #[test]
-    fn a_run_maps_across_two_placeholders() {
-        let (pages, a) = pages_and_reservation(4);
-        let at = |page: usize| a.wrapping_byte_add(page * PAGE);
-        // Mapping and unmapping pages 0-1 splits the reservation in two.
-        assert_eq!(XMemMapPhysicalPages(a, 2, pages.as_ptr()), a);
-        assert_eq!(XMemMapPhysicalPages(a, 2, std::ptr::null()), a);
-
-        assert_eq!(XMemMapPhysicalPages(at(1), 2, pages[1..].as_ptr()), at(1));
-        assert_eq!(query(a).host.State, MEM_RESERVE);
-        assert_eq!(query(at(1)).host.State, MEM_COMMIT);
-        assert_eq!(query(at(2)).host.State, MEM_COMMIT);
-        assert_eq!(query(at(3)).host.State, MEM_RESERVE);
-        // Page 3, split off by the run, still takes a mapping: the run's
-        // last page shows there too.
-        // SAFETY: mapped read-write.
-        unsafe {
-            at(2).cast::<u8>().write(42);
-            assert_eq!(XMemMapPhysicalPages(at(3), 1, pages[2..].as_ptr()), at(3));
-            assert_eq!(at(3).cast::<u8>().read(), 42);
-        }
-        assert_eq!(XMemMapPhysicalPages(a, 4, std::ptr::null()), a);
-        assert_eq!(XMemFreePhysicalPages(4, pages.as_ptr()), 1);
-    }
-
-    /// Placeholders a run spans are never joined: a piece the title split
-    /// off itself is still its own after the run is unmapped, so the title
-    /// can release it.
-    #[test]
-    fn a_run_keeps_the_placeholders_it_spans() {
-        let (pages, a) = pages_and_reservation(4);
-        let at = |page: usize| a.wrapping_byte_add(page * PAGE);
-        // SAFETY: splits the reservation's placeholder, as a title does.
-        let split = unsafe { VirtualFree(a, 2 * PAGE, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) };
-        assert_ne!(split, 0);
-        assert_eq!(XMemMapPhysicalPages(a, 4, pages.as_ptr()), a);
-        assert_eq!(XMemMapPhysicalPages(a, 4, std::ptr::null()), a);
-        let info = query(at(2)).host;
-        assert_eq!((info.AllocationBase, info.RegionSize), (at(2), 2 * PAGE));
-        // SAFETY: the title's own piece, unmapped.
-        assert_ne!(unsafe { VirtualFree(at(2), 0, MEM_RELEASE) }, 0);
-        assert_eq!(XMemFreePhysicalPages(4, pages.as_ptr()), 1);
-    }
-
-    /// A run whose second part is no placeholder (memory committed in place
-    /// of one) fails: its first part is unmapped again, and the committed
-    /// memory, which the run ends inside, keeps its data.
-    #[test]
-    fn a_failed_run_leaves_no_view() {
-        let (pages, a) = pages_and_reservation(3);
-        let at = |page: usize| a.wrapping_byte_add(page * PAGE);
-        // SAFETY: splits the placeholder, makes pages 1-2 an ordinary
-        // allocation in place and commits page 1 of it.
-        unsafe {
-            assert_ne!(
-                VirtualFree(a, PAGE, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER),
-                0
-            );
-            let p = VirtualAlloc2(
-                GetCurrentProcess(),
-                at(1),
-                2 * PAGE,
-                MEM_RESERVE | MEM_REPLACE_PLACEHOLDER,
-                PAGE_READWRITE,
-                std::ptr::null_mut(),
-                0,
-            );
-            assert_eq!(p, at(1));
-            assert!(!VirtualAlloc(at(1), PAGE, MEM_COMMIT, PAGE_READWRITE).is_null());
-            at(1).cast::<u8>().write(99);
-        }
-        assert!(XMemMapPhysicalPages(a, 2, pages.as_ptr()).is_null());
-        assert_eq!(query(a).host.State, MEM_RESERVE);
-        assert_eq!(query(at(1)).host.State, MEM_COMMIT);
-        // SAFETY: still committed.
-        assert_eq!(unsafe { at(1).cast::<u8>().read() }, 99);
-        // Page 0 is a placeholder again: it takes a mapping.
-        assert_eq!(XMemMapPhysicalPages(a, 1, pages.as_ptr()), a);
-        assert_eq!(XMemMapPhysicalPages(a, 1, std::ptr::null()), a);
-        assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
     }
 }

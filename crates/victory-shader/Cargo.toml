@@ -9,7 +9,7 @@ publish.workspace = true
 
 [dependencies]
 thiserror.workspace = true
-miniz_oxide.workspace = true
+zlib-rs.workspace = true
 
 [build-dependencies]
 blake3.workspace = true
@@ -19,6 +19,10 @@ blake3.workspace = true
 host = ["dep:windows"]
 # Debugging switches (emitted-module dumps and the like).
 diagnostics = []
+
+[[bench]]
+name = "guard_runs"
+harness = false
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true, features = ["Win32_System_LibraryLoader"] }

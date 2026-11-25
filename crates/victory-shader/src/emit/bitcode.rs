@@ -7,8 +7,23 @@
 
 use std::collections::HashMap;
 
+pub mod census;
+pub mod opt;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) struct Ty(u32);
+
+/// What the lowering made an instruction for, where it says so (counted by
+/// [`census`], nothing else reads it).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Tag {
+    /// The select that keeps a register's old value in lanes a guard masks.
+    Guard,
+    /// An index clamp the translation adds (the console has none).
+    Clamp,
+    /// The iteration counter and limit test the translation adds to a loop.
+    Counter,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum TypeDef {
@@ -93,13 +108,12 @@ pub(crate) enum Cast {
     FpToSi = 4,
     UiToFp = 5,
     SiToFp = 6,
-    FPTrunc = 7,
     Bitcast = 11,
 }
 
 /// Compare predicates: floats 0-15, integers 32-41.
-#[allow(dead_code)]
 pub(crate) mod pred {
+    #[allow(dead_code)]
     pub const FALSE: u8 = 0;
     pub const OEQ: u8 = 1;
     pub const OGT: u8 = 2;
@@ -211,6 +225,8 @@ pub(crate) struct Module {
     blocks: Vec<Block>,
     mds: Vec<MdDef>,
     named: Vec<(String, Vec<Md>)>,
+    /// See [`Tag`]: by instruction.
+    tags: HashMap<u32, Tag>,
 }
 
 impl Module {
@@ -301,8 +317,6 @@ impl Module {
     }
 
     /// The value of an integer constant; `None` for anything else.
-    // In this tree #160's sample forms replace main's only caller.
-    #[allow(dead_code)]
     pub fn int_value(&self, v: V) -> Option<i64> {
         match v {
             V::Const(i) => match self.consts[i as usize].1 {
@@ -363,22 +377,19 @@ impl Module {
         g
     }
 
+    /// Notes what instruction `v` is for (see [`Tag`]); only when modules
+    /// are counted.
+    pub fn tag(&mut self, v: V, tag: Tag) {
+        if let V::Inst(i) = v
+            && census::enabled()
+        {
+            self.tags.insert(i, tag);
+        }
+    }
+
     pub fn new_block(&mut self) -> usize {
         self.blocks.push(Block::default());
         self.blocks.len() - 1
-    }
-
-    /// The bits of an integer or float constant (integers as stored,
-    /// sign-extended).
-    pub fn known(&self, v: V) -> Option<i64> {
-        match v {
-            V::Const(i) => match self.consts[i as usize].1 {
-                Const::Int(x) => Some(x),
-                Const::Float(bits) => Some(i64::from(bits)),
-                _ => None,
-            },
-            _ => None,
-        }
     }
 
     pub fn type_of(&self, v: V) -> Ty {
@@ -505,27 +516,6 @@ impl Module {
     }
     pub fn named_md(&mut self, name: &str, nodes: Vec<Md>) {
         self.named.push((name.into(), nodes));
-    }
-
-    #[cfg(test)]
-    pub(crate) fn has_dx_op(&self, name: &str, opcode: i64) -> bool {
-        self.insts.iter().any(|inst| match &inst.op {
-            Op::Call(fid, args) => {
-                self.funcs[*fid as usize].name == name
-                    && matches!(
-                        args.first(),
-                        Some(V::Const(cid)) if matches!(self.consts[*cid as usize].1, Const::Int(n) if n == opcode)
-                    )
-            }
-            _ => false,
-        })
-    }
-
-    #[cfg(test)]
-    pub(crate) fn has_cmp(&self, predicate: u8) -> bool {
-        self.insts
-            .iter()
-            .any(|inst| matches!(inst.op, Op::Cmp(p, _, _) if p == predicate))
     }
 
     /// The module as bitcode.
@@ -738,7 +728,7 @@ impl Module {
             let blk = &self.blocks[b];
             if let (Some(Term::Br(h)), true, [p]) = (
                 blk.term,
-                blk.phis.is_empty() && blk.body.is_empty(),
+                blk.phis.iter().all(|&i| !live[i as usize]) && blk.body.is_empty(),
                 &preds[b][..],
             ) && pos[h] < pos[b]
                 && !succs(*p).contains(&h)
@@ -1205,6 +1195,45 @@ mod tests {
         assert!(live[ids(read)] && live[ids(sum)]);
         assert!(!live[ids(unread)] && !live[ids(cyc_a)] && !live[ids(cyc_b)]);
         assert_eq!(live, live_by_passes(&m));
+    }
+
+    #[test]
+    fn empty_latch_with_dead_phis_is_folded() {
+        // Two identical loops except one has an unread phi in its empty latch;
+        // both must fold the latch and emit identical bitcode.
+        let build = |with_dead_phi: bool| {
+            let mut m = Module::default();
+            let i32t = m.int(32);
+            let void = m.void();
+            let fty = m.func_ty(void, vec![i32t]);
+            let f = m.function("sink", fty, Some(Attr::NoUnwind), false);
+            let main_ty = m.func_ty(void, vec![]);
+            m.function("main", main_ty, None, true);
+            let (entry, head, body, latch, exit) = (
+                m.new_block(),
+                m.new_block(),
+                m.new_block(),
+                m.new_block(),
+                m.new_block(),
+            );
+            let (z, one, ten) = (m.i32(0), m.i32(1), m.i32(10));
+            m.terminate(entry, Term::Br(head));
+            let i = m.phi(head, i32t);
+            m.terminate(head, Term::Br(body));
+            let next = m.bin(body, Bin::Add, i, one);
+            let cond = m.cmp(body, pred::IULT, next, ten);
+            m.terminate(body, Term::CondBr(cond, latch, exit));
+            if with_dead_phi {
+                let dead = m.phi(latch, i32t);
+                m.set_phi(dead, vec![(next, body)]);
+            }
+            m.terminate(latch, Term::Br(head));
+            m.set_phi(i, vec![(z, entry), (next, latch)]);
+            let _ = m.call(exit, f, vec![next]);
+            m.terminate(exit, Term::Ret);
+            m.write()
+        };
+        assert_eq!(build(false), build(true));
     }
 
     #[test]

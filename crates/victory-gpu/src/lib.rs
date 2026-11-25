@@ -31,13 +31,13 @@ pub mod frame;
 mod host;
 #[cfg(windows)]
 mod indirect;
+#[cfg(windows)]
+mod inplace;
 pub mod list;
 pub mod object;
 pub mod pipeline;
 #[cfg(windows)]
 mod primitive;
-#[cfg(all(windows, feature = "diagnostics"))]
-mod profile;
 pub mod query;
 pub mod queue;
 pub mod resource;
@@ -47,8 +47,11 @@ mod sampler;
 #[cfg(windows)]
 pub mod shader_cache;
 #[cfg(windows)]
+mod memory;
+#[cfg(windows)]
 mod shadow;
 pub mod signature;
+mod switch;
 #[cfg(windows)]
 mod texture;
 #[cfg(windows)]
@@ -56,5 +59,12 @@ mod watch;
 
 #[cfg(windows)]
 pub use host::on_failure;
+#[cfg(all(windows, target_arch = "x86_64"))]
+pub use host::write_title_memory;
 #[cfg(windows)]
-pub use watch::{kernel_will_write, kernel_wrote, title_memory_remapped, unmap_title_view};
+pub use inplace::{title_memory_freeing, title_memory_section, title_memory_view};
+#[cfg(windows)]
+pub use watch::{
+    title_memory_reading, title_memory_remapped, title_memory_remapping, title_memory_written,
+    writing as kernel_will_write,
+};

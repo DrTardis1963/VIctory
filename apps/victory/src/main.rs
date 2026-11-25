@@ -21,10 +21,6 @@ use clap::{Parser, Subcommand, ValueEnum};
     about = "Run an Xbox Series title natively on Windows"
 )]
 struct Cli {
-    /// Write structured diagnostics to a new file outside every VIctory checkout.
-    #[arg(long, global = true, value_name = "FILE")]
-    diagnostic_jsonl: Option<PathBuf>,
-
     #[command(subcommand)]
     command: Command,
 }
@@ -79,22 +75,27 @@ enum Command {
         /// else the newest Windows SDK's).
         #[arg(long)]
         validate: bool,
-        /// Also create a host D3D12 pipeline for each emitted shader
-        /// (translated for this host's wave sizes unless --host-lanes says).
+        /// Also create a host D3D12 pipeline for each emitted shader.
         #[arg(long)]
         pipelines: bool,
-        /// Translate for a host whose waves are MIN-MAX lanes (32-32 for
-        /// NVIDIA, 32-64 for AMD RDNA): shaders that need another wave size
-        /// are listed as failures. Default: any wave size.
-        #[arg(long, value_name = "MIN-MAX", value_parser = parse_lanes)]
-        host_lanes: Option<(u32, u32)>,
         /// Print one line per program and outcome.
         #[arg(long)]
         list: bool,
         /// Write translated shaders into `<cache_dir>/shaders` to warm the
-        /// runtime shader cache ahead of time.
+        /// runtime shader cache ahead of time (any build with the same
+        /// translator sources reads them); shaders already there are skipped.
         #[arg(long)]
         write_cache: bool,
+        /// Only the shaders earlier runs used (`used-shaders.txt` in the
+        /// shader cache; every shader while there is no list yet).
+        #[arg(long, requires = "write_cache")]
+        used_only: bool,
+        /// Translate as for a host whose waves are MIN-MAX lanes (32-32 for
+        /// NVIDIA): sets the widest host wave, MAX, as a run on that GPU
+        /// does (this translator does not use MIN). Default: with
+        /// --write-cache, this GPU's.
+        #[arg(long, value_name = "MIN-MAX", value_parser = parse_lanes)]
+        host_lanes: Option<(u32, u32)>,
         /// Worker threads (default: every logical core).
         #[arg(long)]
         jobs: Option<usize>,
@@ -143,20 +144,7 @@ fn main() -> Result<()> {
         return Ok(());
     }
     let cli = Cli::parse();
-    if let Some(path) = cli.diagnostic_jsonl
-        && victory_core::diagnostics::start(&path).is_err()
-    {
-        eprintln!(
-            "VIctory: cannot create diagnostic output (expected a new file outside the source tree)"
-        );
-    }
-    let result = dispatch(cli.command);
-    victory_core::diagnostics::finish(result.is_ok());
-    result
-}
-
-fn dispatch(command: Command) -> Result<()> {
-    match command {
+    match cli.command {
         Command::Inspect {
             file,
             imports,
@@ -179,9 +167,20 @@ fn dispatch(command: Command) -> Result<()> {
             pipelines,
             list,
             write_cache,
-            jobs,
+            used_only,
             host_lanes,
-        } => translate::run(paths, validate, pipelines, list, write_cache, jobs, host_lanes),
+            jobs,
+        } => {
+            // `VICTORY_VIEW_LIMIT=<null slot>`: translate as on a host whose view heap is capped
+            if let Some(n) = std::env::var("VICTORY_VIEW_LIMIT").ok().and_then(|v| v.parse().ok()) {
+                victory_shader::emit::set_view_heap_limit(n);
+            }
+            // `VICTORY_HOST_WAVE=32`: translate as for a GPU whose waves are at most 32 lanes
+            if let Some(n) = std::env::var("VICTORY_HOST_WAVE").ok().and_then(|v| v.parse().ok()) {
+                victory_shader::emit::set_host_max_wave(n);
+            }
+            translate::run(paths, validate, pipelines, list, write_cache, used_only, host_lanes, jobs)
+        }
         Command::Run {
             exe,
             unimplemented,
@@ -192,23 +191,6 @@ fn dispatch(command: Command) -> Result<()> {
         } => run::run(&exe, unimplemented, strict, execute, console),
         Command::Config => show_config(),
     }
-}
-
-/// `MIN-MAX` lanes per wave, or one size `N`.
-fn parse_lanes(s: &str) -> Result<(u32, u32), String> {
-    let (a, b) = s.split_once('-').unwrap_or((s, s));
-    let n = |x: &str| {
-        x.trim()
-            .parse::<u32>()
-            .ok()
-            .filter(|n| n.is_power_of_two() && (4..=128).contains(n))
-            .ok_or_else(|| format!("{x:?} is not a wave size (4 to 128, a power of two)"))
-    };
-    let (a, b) = (n(a)?, n(b)?);
-    if a > b {
-        return Err(format!("{a} is more than {b}"));
-    }
-    Ok((a, b))
 }
 
 fn show_config() -> Result<()> {
@@ -224,21 +206,11 @@ fn show_config() -> Result<()> {
             .as_ref()
             .map_or("(none)".into(), |p| p.display().to_string())
     );
-    // Where each value came from, so it is clear which setting to change.
-    let o = cfg.origins;
-    println!("game_dir    : {}  [{}]", status(&cfg.game_dir), o.game_dir);
-    println!(
-        "cache_dir   : {}  [{}]",
-        cfg.cache_dir.display(),
-        o.cache_dir
-    );
-    println!("data_dir    : {}  [{}]", cfg.data_dir.display(), o.data_dir);
+    println!("game_dir    : {}", status(&cfg.game_dir));
+    println!("cache_dir   : {}", cfg.cache_dir.display());
+    println!("data_dir    : {}", cfg.data_dir.display());
     for t in &cfg.test_titles {
-        println!(
-            "test_title  : {}  [{}]",
-            status(&Some(t.clone())),
-            o.test_titles
-        );
+        println!("test_title  : {}", status(&Some(t.clone())));
     }
     for p in cfg
         .game_dir
@@ -251,6 +223,23 @@ fn show_config() -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// `--host-lanes MIN-MAX` (or one size for both).
+fn parse_lanes(s: &str) -> Result<(u32, u32), String> {
+    let (a, b) = s.split_once('-').unwrap_or((s, s));
+    let n = |x: &str| {
+        x.trim()
+            .parse::<u32>()
+            .ok()
+            .filter(|n| n.is_power_of_two() && (4..=128).contains(n))
+            .ok_or_else(|| format!("{x:?} is not a wave size (4 to 128, a power of two)"))
+    };
+    let (a, b) = (n(a)?, n(b)?);
+    if a > b {
+        return Err(format!("{a} is more than {b}"));
+    }
+    Ok((a, b))
 }
 
 /// Paths given on the command line, or the configured game + test titles.

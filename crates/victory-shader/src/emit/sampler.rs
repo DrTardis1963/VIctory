@@ -4,8 +4,7 @@
 //! Word 0: address modes x, y, z (bits 0-8, 3 each), log2 of the maximum
 //! anisotropy (9-11), comparison function (12-14), reduction (29-30: 0
 //! filtering, 1 minimum, 2 maximum). Word 1: minimum and maximum LOD
-//! (0-11, 12-23, unsigned 4.8). Word 2: LOD bias (0-13, signed 5.8; D3D12
-//! takes -16 to 15.99, so the rest of the field's range is clamped),
+//! (0-11, 12-23, unsigned 4.8). Word 2: LOD bias (0-13, signed 5.8),
 //! magnification and minification filters (20-21, 22-23: point, linear,
 //! anisotropic point, anisotropic linear), mip filter (26-27: none, point,
 //! linear). Word 3: border colour (30-31: transparent black, opaque black,
@@ -14,10 +13,6 @@
 //! Comparison is the sampling instruction's, not the sampler's: the console
 //! encodes a comparison function in every sampler (D3D's default, less or
 //! equal, when unused).
-
-/// `D3D12_MIP_LOD_BIAS_MIN` and `D3D12_MIP_LOD_BIAS_MAX`: a root signature
-/// with a static sampler outside them is refused.
-const MIP_LOD_BIAS: (f32, f32) = (-16.0, 15.99);
 
 /// A static sampler in D3D12 terms; the integers are the `D3D12_FILTER`,
 /// `D3D12_TEXTURE_ADDRESS_MODE`, `D3D12_COMPARISON_FUNC` and
@@ -39,6 +34,18 @@ pub struct StaticSampler {
 impl Eq for StaticSampler {}
 
 impl StaticSampler {
+    /// The filter supported by the host device. Anisotropic point-mip
+    /// filtering is optional (`D3D12_OPTIONS19`); older devices retain the
+    /// previous linear-mip approximation. Comparison/min/max reduction
+    /// bits and the sampler's LOD bounds are unchanged.
+    pub fn filter_for_host(&self, aniso_point_mip_supported: bool) -> u32 {
+        if !aniso_point_mip_supported && self.filter & !0x180 == 0x54 {
+            self.filter | 1
+        } else {
+            self.filter
+        }
+    }
+
     /// Decodes the four sampler words.
     pub fn from_words(w: [u32; 4]) -> Self {
         let bits = |word: u32, at: u32, n: u32| word >> at & ((1 << n) - 1);
@@ -52,7 +59,7 @@ impl StaticSampler {
             _ => 0,
         };
         let filter = if mag >= 2 || min >= 2 {
-            0x55 | reduction << 7
+            0x54 | u32::from(mip == 2) | reduction << 7
         } else {
             (min & 1) << 4 | (mag & 1) << 2 | u32::from(mip == 2) | reduction << 7
         };
@@ -66,8 +73,7 @@ impl StaticSampler {
         StaticSampler {
             filter,
             address: [0, 3, 6].map(|at| address(bits(w[0], at, 3))),
-            mip_lod_bias: (((bits(w[2], 0, 14) << 18) as i32 >> 18) as f32 / 256.0)
-                .clamp(MIP_LOD_BIAS.0, MIP_LOD_BIAS.1),
+            mip_lod_bias: ((bits(w[2], 0, 14) << 18) as i32 >> 18) as f32 / 256.0,
             max_anisotropy: 1 << bits(w[0], 9, 3).min(4),
             comparison: bits(w[0], 12, 3) + 1,
             // shortcut: a custom border colour (type 3, a table entry) becomes
@@ -129,16 +135,53 @@ mod tests {
         );
     }
 
-    /// The bias field reaches -32 to 31.99; D3D12 refuses a static sampler
-    /// past -16 or 15.99, so those ends are clamped and the rest kept.
     #[test]
-    fn lod_bias_stays_in_the_host_range() {
-        let bias = |field: u32| StaticSampler::from_words([0, 0, field, 0]).mip_lod_bias;
-        assert_eq!(bias(0x0FFF), 15.99, "15.996 clamps");
-        assert_eq!(bias(0x1FFF), 15.99, "31.996 clamps");
-        assert_eq!(bias(0x2000), -16.0, "-32 clamps");
-        assert_eq!(bias(0x3000), -16.0, "-16 is kept");
-        assert_eq!(bias(0x0E80), 14.5, "in range is kept");
-        assert_eq!(bias(0x3F80), -0.5, "negative in range is kept");
+    fn anisotropic_samplers_preserve_mip_point_filtering() {
+        for (reduction, base) in [(0u32, 0x54u32), (1, 0x154), (2, 0x1D4)] {
+            let w0 = reduction << 29;
+            for mip in [0u32, 1] {
+                let w2 = (mip << 26) | 0x00F0_0000; // mag = 3, min = 3
+                let s = StaticSampler::from_words([w0, 0x00FF_F000, w2, 0]);
+                assert_eq!(s.filter, base, "reduction={reduction} mip={mip}");
+            }
+            let w2 = (2 << 26) | 0x00F0_0000; // mip = 2 (linear)
+            let s = StaticSampler::from_words([w0, 0x00FF_F000, w2, 0]);
+            assert_eq!(s.filter, base | 1, "reduction={reduction} mip=2");
+        }
+        // Mixed anisotropic mag (2) with linear min (1) and point mip (1).
+        let mixed = StaticSampler::from_words([0, 0, (1 << 26) | (1 << 22) | (2 << 20), 0]);
+        assert_eq!(mixed.filter, 0x54);
+    }
+
+    #[test]
+    fn host_filter_falls_back_without_changing_reduction_or_lod() {
+        for (filter, fallback) in [(0x54, 0x55), (0xD4, 0xD5), (0x154, 0x155), (0x1D4, 0x1D5)] {
+            for mip in [0u32, 1] {
+                let s = StaticSampler {
+                    filter,
+                    ..StaticSampler::from_words([0, 0x0054_0100, (mip << 26) | 0x00F0_0000, 0])
+                };
+                assert_eq!(s.filter_for_host(false), fallback);
+                assert_eq!(s.filter_for_host(true), filter);
+                assert_eq!(
+                    (s.min_lod, s.max_lod),
+                    if mip == 0 { (0.0, 0.0) } else { (1.0, 5.25) }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn host_filter_keeps_other_filters_unchanged() {
+        for reduction in [0, 0x80, 0x100, 0x180] {
+            for base in [0, 1, 4, 5, 0x10, 0x11, 0x14, 0x15, 0x55] {
+                let s = StaticSampler {
+                    filter: base | reduction,
+                    ..StaticSampler::from_words([0; 4])
+                };
+                assert_eq!(s.filter_for_host(false), s.filter);
+                assert_eq!(s.filter_for_host(true), s.filter);
+            }
+        }
     }
 }

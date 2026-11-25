@@ -2,7 +2,7 @@
 //! to begin. Ours is a clock started by the first interval set, ticking
 //! once per interval; the token is the frame number. Each event kind
 //! (origin, vblank, flip) happens once per tick, so two waits for the same
-//! kind never end on the same tick: Grand Theft Auto VI polls the origin
+//! kind never end on the same tick: the title polls the origin
 //! with "token on time-out" (starting its next frame at once) and is paced
 //! by a blocking wait for the flip before each present.
 //!
@@ -49,13 +49,11 @@ pub(crate) extern "system" fn set_interval(
     _period: u32,
     _flags: u32,
 ) -> HRESULT {
-    let asked = match length {
+    let interval = match length {
         0 => SIXTIETH,
         us => Duration::from_micros(u64::from(us)),
     };
-    let fps = std::env::var("VICTORY_FPS").ok().and_then(|v| v.trim().parse().ok());
-    let interval = at_most_fps(asked, fps);
-    tracing::info!(?interval, ?asked, "frame interval");
+    tracing::info!(?interval, "frame interval");
     // A new interval starts from now, after the last tick handed out.
     let first = LAST
         .iter()
@@ -68,15 +66,6 @@ pub(crate) extern "system" fn set_interval(
         first,
     });
     S_OK
-}
-
-/// `VICTORY_FPS`: the title's interval, shortened to one frame per `1/fps`
-/// second (Grand Theft Auto VI asks for 30).
-fn at_most_fps(asked: Duration, fps: Option<u32>) -> Duration {
-    match fps {
-        Some(fps @ 1..=1000) => asked.min(Duration::from_secs(1) / fps),
-        _ => asked,
-    }
 }
 
 /// Device method: events are scheduled at every tick.
@@ -117,10 +106,24 @@ fn next_tick(kind: u32, limit: Duration) -> (u64, Duration) {
     });
     let elapsed = c.start.elapsed().as_nanos();
     let interval = c.interval.as_nanos().max(1);
-    let tick =
-        (c.first + (elapsed / interval + 1) as u64).max(last(kind).load(Ordering::Relaxed) + 1);
+    let taken = last(kind).load(Ordering::Relaxed);
+    let mut tick = (c.first + (elapsed / interval + 1) as u64).max(taken + 1);
     let at = u128::from(tick - c.first) * interval;
-    let wait = Duration::from_nanos(at.saturating_sub(elapsed) as u64);
+    let mut wait = Duration::from_nanos(at.saturating_sub(elapsed) as u64);
+    // A blocking wait for an event that has happened since the last wait
+    // for it ended (a frame took longer than a tick) ends at once, on the
+    // tick that passed: sleeping on to the next one cost 17 ms of every
+    // 730 ms frame (run 58: "2.0 frame waits sleeping 16.8 ms"). Polls (a
+    // time-out shorter than a tick) answer as before.
+    // `VICTORY_LATE_WAITS=1` sleeps to the next tick, as before.
+    static SLEEP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*SLEEP.get_or_init(|| std::env::var_os("VICTORY_LATE_WAITS").is_some_and(|v| v == "1"))
+        && limit >= wait
+        && tick > taken + 1
+    {
+        tick -= 1;
+        wait = Duration::ZERO;
+    }
     if wait <= limit {
         last(kind).fetch_max(tick, Ordering::Relaxed);
     }
@@ -149,6 +152,12 @@ pub(crate) extern "system" fn wait(
         std::thread::sleep(wait);
         S_OK
     };
+    #[cfg(all(windows, feature = "diagnostics"))]
+    {
+        use crate::copystat::{C, add};
+        add(C::PaceWaits, 1);
+        add(C::PaceUs, wait.min(limit).as_micros() as u64);
+    }
     // A frame begun on a time-out takes no tick: its flip still does.
     if origin && (hr == S_OK || flags & TOKEN_ON_TIMEOUT != 0) {
         // Tokens count frames (consecutive), not ticks.
@@ -190,15 +199,6 @@ pub(crate) extern "system" fn statistics(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn fps_only_shortens_the_interval() {
-        let thirtieth = Duration::from_micros(33_333);
-        assert_eq!(at_most_fps(thirtieth, None), thirtieth);
-        assert_eq!(at_most_fps(thirtieth, Some(0)), thirtieth);
-        assert_eq!(at_most_fps(thirtieth, Some(60)), Duration::from_secs(1) / 60);
-        assert_eq!(at_most_fps(SIXTIETH, Some(30)), SIXTIETH);
-    }
 
     #[test]
     fn waits_end_on_ticks_and_count_frames() {
@@ -248,7 +248,7 @@ mod tests {
 
     /// Two waits for one kind that begin together (two threads) take two
     /// ticks: the first takes its tick before it sleeps. A time-out takes
-    /// none. The old code marked the tick after the sleep, so both got it.
+    /// none. Marking the tick after the sleep gave both the same one.
     #[test]
     fn waits_begun_together_take_different_ticks() {
         const VBLANK: u32 = 1;

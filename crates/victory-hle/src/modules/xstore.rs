@@ -7,7 +7,7 @@
 
 use std::ffi::{c_char, c_void};
 
-use super::xasync::{self, AsyncBlock, E_ILLEGAL_METHOD_CALL, E_INVALIDARG};
+use super::xasync::{self, AsyncBlock, E_ILLEGAL_METHOD_CALL};
 use super::xgameruntime::{
     Guid, HRESULT, Interface, Methods, Object, S_OK, add_ref, missing, put, put_string, text, token,
 };
@@ -20,7 +20,7 @@ pub const PROVIDER: Guid = Guid::new(
     0x448c,
     [0xb9, 0x2b, 0x39, 0x60, 0xfb, 0x5b, 0xd3, 0x0c],
 );
-/// As Grand Theft Auto VI (2026) asks for it; every slot it calls takes
+/// As the title (2026) asks for it; every slot it calls takes
 /// the public API's arguments in the 2020 order.
 pub const IID_2026: Guid = Guid::new(
     0xb09d_803c,
@@ -301,8 +301,7 @@ extern "system" fn install_async(
 }
 
 /// The game's own store id maps to its installation; nothing else is
-/// installed, and any other id gets the documented E_INVALIDARG (not
-/// XPackage's "could not resolve" error).
+/// installed.
 extern "system" fn package_identifier(
     _: This,
     store_id: *const c_char,
@@ -314,7 +313,7 @@ extern "system" fn package_identifier(
         Some(id) if !title.store_id.is_empty() && id == title.store_id => {
             put_string(&xpackage::identifier(), size, buffer, std::ptr::null_mut())
         }
-        _ => E_INVALIDARG,
+        _ => xpackage::NO_PACKAGE,
     }
 }
 
@@ -476,16 +475,5 @@ mod tests {
         assert!(!method::<extern "system" fn(This, Handle) -> bool>(
             &OBJECT, 0xb0
         )(this, l));
-    }
-
-    #[test]
-    fn a_store_id_without_a_package_is_an_invalid_argument() {
-        type Query = extern "system" fn(This, *const c_char, usize, *mut u8) -> HRESULT;
-        let query = method::<Query>(&OBJECT, 0x208);
-        let mut id = [0u8; 33];
-        assert_eq!(
-            query(&OBJECT, c"9NOTINSTALLED".as_ptr(), 33, id.as_mut_ptr()),
-            E_INVALIDARG
-        );
     }
 }

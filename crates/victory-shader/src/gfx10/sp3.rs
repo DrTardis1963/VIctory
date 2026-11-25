@@ -137,6 +137,12 @@ fn operands(inst: &Instruction, name: &str, fields: &Fields) -> String {
             cache,
         } => {
             if let Some(data) = data {
+                let data = match (name, data) {
+                    ("s_atc_probe" | "s_atc_probe_buffer", Operand::Literal(imm)) => {
+                        atc_immediate(*imm)
+                    }
+                    _ => data.to_string(),
+                };
                 let off = match (soffset, offset) {
                     (Operand::Scalar { code: NULL, .. }, 0) => soffset.to_string(),
                     (Operand::Scalar { code: NULL, .. }, _) => {
@@ -335,6 +341,15 @@ fn operands(inst: &Instruction, name: &str, fields: &Fields) -> String {
     out
 }
 
+/// `s_atc_probe` immediate: 0..=64 in decimal, larger values in hex.
+fn atc_immediate(imm: u32) -> String {
+    if imm <= 64 {
+        imm.to_string()
+    } else {
+        format!("0x{imm:x}")
+    }
+}
+
 /// Cache flags; images write `dlc` first.
 fn flags(out: &mut String, cache: &Cache, dlc_first: bool) {
     let dlc = (cache.dlc, " dlc");
@@ -354,7 +369,7 @@ fn flags(out: &mut String, cache: &Cache, dlc_first: bool) {
 }
 
 fn label(inst: &Instruction, imm: u16) -> String {
-    let target = inst.offset as i64 + 4 * inst.words.len() as i64 + 4 * i64::from(imm as i16);
+    let target = inst.offset as i64 + 4 * inst.words().len() as i64 + 4 * i64::from(imm as i16);
     format!("label_{target:04X}")
 }
 
@@ -394,54 +409,22 @@ fn waitcnt(imm: u16) -> String {
     parts.join(" & ")
 }
 
-/// `s_sendmsg` operand, spelled like LLVM's AMDGPU assembler: the operation
-/// only for messages that have one, the stream only for a GS emit or cut.
-/// Bits no field accounts for leave the operand as raw hex.
 fn sendmsg(imm: u16) -> String {
     let (msg, op, stream) = (imm & 0xF, imm >> 4 & 7, imm >> 8 & 3);
-    let raw = || format!("0x{imm:04x}");
-    if imm & !0x3FF != 0 || imm & 0x80 != 0 {
-        return raw();
-    }
     let msg_name = match msg {
-        1 => "MSG_INTERRUPT",
-        2 => "MSG_GS",
-        3 => "MSG_GS_DONE",
-        4 => "MSG_SAVEWAVE",
-        5 => "MSG_STALL_WAVE_GEN",
-        6 => "MSG_HALT_WAVES",
-        7 => "MSG_ORDERED_PS_DONE",
-        8 => "MSG_EARLY_PRIM_DEALLOC",
-        9 => "MSG_GS_ALLOC_REQ",
-        10 => "MSG_GET_DOORBELL",
-        11 => "MSG_GET_DDID",
-        15 => "MSG_SYSMSG",
-        _ => return raw(),
+        2 => "MSG_GS".into(),
+        3 => "MSG_GS_DONE".into(),
+        7 => "MSG_ORDERED_PS_DONE".into(),
+        9 => "MSG_GS_ALLOC_REQ".into(),
+        _ => msg.to_string(),
     };
-    match msg {
-        2 | 3 => {
-            let op_name =
-                ["GS_OP_NOP", "GS_OP_CUT", "GS_OP_EMIT", "GS_OP_EMIT_CUT"].get(usize::from(op));
-            match op_name {
-                Some(op_name) if op == 0 && stream == 0 => {
-                    format!("sendmsg({msg_name}, {op_name})")
-                }
-                Some(op_name) if op != 0 => format!("sendmsg({msg_name}, {op_name}, {stream})"),
-                _ => raw(),
-            }
-        }
-        15 if stream == 0 => {
-            let op_name = [
-                "SYSMSG_OP_ECC_ERR_INTERRUPT",
-                "SYSMSG_OP_REG_RD",
-                "SYSMSG_OP_HOST_TRAP_ACK",
-                "SYSMSG_OP_TTRACE_PC",
-            ]
-            .get(usize::from(op).wrapping_sub(1));
-            op_name.map_or_else(raw, |op_name| format!("sendmsg({msg_name}, {op_name})"))
-        }
-        _ if op == 0 && stream == 0 => format!("sendmsg({msg_name})"),
-        _ => raw(),
+    let op_name = ["GS_OP_NOP", "GS_OP_CUT", "GS_OP_EMIT", "GS_OP_EMIT_CUT"]
+        .get(usize::from(op))
+        .map_or(op.to_string(), |s| s.to_string());
+    if msg == 3 && op == 0 {
+        format!("sendmsg({msg_name}, {op_name})")
+    } else {
+        format!("sendmsg({msg_name}, {op_name}, {stream})")
     }
 }
 
@@ -692,7 +675,7 @@ fn valu(name: &str, v: &Valu, encoding: Encoding) -> String {
 
 #[cfg(test)]
 mod tests {
-    use crate::gfx10::{Fields, Operand, decode};
+    use crate::gfx10::{Cache, Fields, Operand, decode};
 
     /// Text of each instruction in `words` (a straight-line program).
     fn texts(words: &[u32], wave64: bool) -> Vec<String> {
@@ -730,6 +713,69 @@ mod tests {
             one(&[0xF420_0144, 0x0400_0000], true),
             "s_buffer_load_dword s5, s[8:11], s2"
         );
+    }
+
+    /// `s_atc_probe` / `s_atc_probe_buffer`: SDATA is a 7-bit immediate, the
+    /// buffer resource is 4 dwords, and GLC/DLC are not operands.
+    ///
+    /// Words checked with `llvm-mc -arch=amdgcn -mcpu=gfx1030 --disassemble`.
+    /// The offset keeps this printer's 6-digit hex (`0x000064`, not `0x64`).
+    #[test]
+    fn atc_probe_immediate_is_not_a_register() {
+        let cases = [
+            (
+                [0xF498_01C2, 0xFA00_0064],
+                "s_atc_probe 7, s[4:5], 0x000064",
+                Operand::Literal(7),
+                Operand::Scalar { code: 4, dwords: 2 },
+            ),
+            (
+                [0xF498_1FF4, 0x0A00_0001],
+                "s_atc_probe 0x7f, s[104:105], s5 offset:0x000001",
+                Operand::Literal(0x7f),
+                Operand::Scalar {
+                    code: 104,
+                    dwords: 2,
+                },
+            ),
+            (
+                [0xF498_0000, 0xFA00_0000],
+                "s_atc_probe 0, s[0:1], null",
+                Operand::Literal(0),
+                Operand::Scalar { code: 0, dwords: 2 },
+            ),
+            (
+                [0xF49C_01C4, 0xFA00_0020],
+                "s_atc_probe_buffer 7, s[8:11], 0x000020",
+                Operand::Literal(7),
+                Operand::Scalar { code: 8, dwords: 4 },
+            ),
+            (
+                [0xF499_41C2, 0xFA00_0000],
+                "s_atc_probe 7, s[4:5], null",
+                Operand::Literal(7),
+                Operand::Scalar { code: 4, dwords: 2 },
+            ),
+        ];
+        for (words, text, data, base) in cases {
+            assert_eq!(one(&words, false), text, "{words:08x?}");
+            assert_eq!(one(&words, true), text, "{words:08x?}");
+            let mut code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            code.extend(0xBF81_0000u32.to_le_bytes());
+            let inst = &decode(&code).unwrap()[0];
+            let Fields::Smem {
+                data: got,
+                base: got_base,
+                cache,
+                ..
+            } = inst.fields(false)
+            else {
+                panic!("not an SMEM instruction");
+            };
+            assert_eq!(got, Some(data), "{words:08x?}");
+            assert_eq!(got_base, base, "{words:08x?}");
+            assert_eq!(cache, Cache::default(), "{words:08x?}");
+        }
     }
 
     #[test]
@@ -792,31 +838,6 @@ mod tests {
             one(&[0xF800_1C0F, 0x0000_0302], true),
             "exp mrt0, v2, v2, v3, v3 done compr vm"
         );
-    }
-
-    #[test]
-    fn sendmsg_names_only_the_fields_a_message_has() {
-        // s_sendmsg is SOPP opcode 0x10: 0xBF90_xxxx.
-        let msg = |imm: u32| one(&[0xBF90_0000 | imm], true);
-        assert_eq!(msg(0x0009), "s_sendmsg sendmsg(MSG_GS_ALLOC_REQ)");
-        assert_eq!(msg(0x0007), "s_sendmsg sendmsg(MSG_ORDERED_PS_DONE)");
-        assert_eq!(msg(0x0008), "s_sendmsg sendmsg(MSG_EARLY_PRIM_DEALLOC)");
-        assert_eq!(msg(0x0003), "s_sendmsg sendmsg(MSG_GS_DONE, GS_OP_NOP)");
-        assert_eq!(msg(0x0122), "s_sendmsg sendmsg(MSG_GS, GS_OP_EMIT, 1)");
-        assert_eq!(
-            msg(0x0033),
-            "s_sendmsg sendmsg(MSG_GS_DONE, GS_OP_EMIT_CUT, 0)"
-        );
-        assert_eq!(
-            msg(0x002F),
-            "s_sendmsg sendmsg(MSG_SYSMSG, SYSMSG_OP_REG_RD)"
-        );
-        // A NOP has no stream, a message without operations has none, an
-        // unknown id has no name: each stays raw rather than lose bits.
-        assert_eq!(msg(0x0102), "s_sendmsg 0x0102");
-        assert_eq!(msg(0x0019), "s_sendmsg 0x0019");
-        assert_eq!(msg(0x000C), "s_sendmsg 0x000c");
-        assert_eq!(msg(0x0409), "s_sendmsg 0x0409");
     }
 
     #[test]

@@ -4,37 +4,6 @@ use anyhow::{Context, Result};
 
 use crate::{Console, Unimplemented};
 
-#[cfg(any(windows, test))]
-const SKIP_CPU_CHECK_ENV: &str = "VICTORY_SKIP_CPU_CHECK";
-
-#[cfg(any(windows, test))]
-fn skip_cpu_check(value: Option<&str>) -> bool {
-    value == Some("1")
-}
-
-#[cfg(any(windows, test))]
-fn check_cpu_features_with(has_avx2: bool, skip_env: Option<&str>) -> Result<()> {
-    if has_avx2 || skip_cpu_check(skip_env) {
-        return Ok(());
-    }
-    anyhow::bail!(
-        "this CPU does not support AVX2, which Xbox Series titles require; \
-         set {SKIP_CPU_CHECK_ENV}=1 to bypass this check (for example under CPU emulation such as Intel SDE)"
-    );
-}
-
-/// Pre-flight check before executing title code: Xbox Series binaries are
-/// compiled for Zen 2 and require AVX2.
-#[cfg(windows)]
-fn check_cpu_features() -> Result<()> {
-    #[cfg(target_arch = "x86_64")]
-    let has_avx2 = std::arch::is_x86_feature_detected!("avx2");
-    #[cfg(not(target_arch = "x86_64"))]
-    let has_avx2 = true;
-    let skip = std::env::var(SKIP_CPU_CHECK_ENV).ok();
-    check_cpu_features_with(has_avx2, skip.as_deref())
-}
-
 #[cfg(windows)]
 pub fn run(
     exe: &Path,
@@ -44,36 +13,29 @@ pub fn run(
     console: Console,
 ) -> Result<()> {
     use std::sync::Arc;
-    use victory_core::diagnostics::{self, IoOperation};
     use victory_hle::{HleResolver, HostPolicy};
     use victory_loader::{BindReport, UnimplementedPolicy, WithTitleDlls};
 
-    if execute {
-        check_cpu_features()?;
-    }
     // A title that relaunched itself: the old process must be gone first.
     victory_hle::modules::lifecycle::wait_for_previous();
     let cfg = victory_core::Config::load()?;
-    let started = diagnostics::operation_started();
-    let original = std::fs::read(exe)
-        .inspect_err(|error| IoOperation::ReadImage.failed(error, started))
-        .with_context(|| format!("reading {}", exe.display()))?;
+    let original = std::fs::read(exe).with_context(|| format!("reading {}", exe.display()))?;
     let prepared = victory_loader::prepare(&original)?;
     let hash = prepared.original_hash.to_hex();
-    let title_dir = exe.parent().unwrap_or(Path::new("."));
     match victory_game::identify(&hash) {
-        Some(build) => {
-            println!("build          {} ({hash})", build.label);
-            if execute {
-                check_startup_archive(&title_dir.join(build.startup_archive))?;
-            }
-        }
+        Some(build) => println!("build          {} ({hash})", build.label),
         None => println!("build          unknown ({hash})"),
     }
 
     let images = cfg.cache_subdir("images")?;
     victory_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
     let image = victory_loader::load(&prepared, &images)?;
+    // The program is mapped from the copy `load` wrote: the file's bytes
+    // and their patched copy are not read again, and were held for the
+    // whole run (two blocks of 114.7 MB each for the title, in
+    // physical memory: run 65's memory map).
+    drop(prepared);
+    drop(original);
     victory_hle::runtime::set_main_image(image.base());
     victory_hle::runtime::set_image_path(image.base(), exe);
     println!(
@@ -87,6 +49,7 @@ pub fn run(
         HostPolicy::default()
     });
     let wanted = |dll: &str| title_dll(&resolver.host, dll);
+    let title_dir = exe.parent().unwrap_or(Path::new("."));
     // A missing manifest leaves id 0 and no storage quota.
     let manifest =
         std::fs::read_to_string(title_dir.join("MicrosoftGame.config")).unwrap_or_default();
@@ -168,27 +131,6 @@ pub fn run(
     Ok(())
 }
 
-#[cfg(windows)]
-fn check_startup_archive(path: &Path) -> Result<()> {
-    use std::io::Read;
-
-    let mut magic = [0; 4];
-    std::fs::File::open(path)
-        .and_then(|mut file| file.read_exact(&mut magic))
-        .with_context(|| {
-            format!(
-                "Cannot read startup archive {}. Check that the file from your package is present and readable.",
-                path.display()
-            )
-        })?;
-    anyhow::ensure!(
-        magic == *b"9FPR",
-        "Invalid RPF9 header in {}. Restore the startup archive from your package.",
-        path.display()
-    );
-    Ok(())
-}
-
 /// The debugging aids (README): scheduled stack dumps, watched values and
 /// memory saved on a crash.
 #[cfg(all(windows, feature = "diagnostics"))]
@@ -250,7 +192,7 @@ fn title_dll(host: &victory_hle::HostPolicy, dll: &str) -> bool {
 }
 
 /// Title DLLs the title loads itself (`LoadLibrary`) that nothing imports,
-/// e.g. Grand Theft Auto VI's upscaler behind its FidelityFX loader.
+/// e.g. The title's upscaler behind its FidelityFX loader.
 #[cfg(windows)]
 struct LateDlls {
     host: victory_hle::HostPolicy,
@@ -393,45 +335,6 @@ mod tests {
         });
         other.join().unwrap();
         assert_eq!(*order.lock().unwrap(), [1, 2]);
-    }
-
-    #[test]
-    fn cpu_feature_check_matches_host() {
-        let skip = std::env::var(super::SKIP_CPU_CHECK_ENV).ok();
-        #[cfg(target_arch = "x86_64")]
-        let expected_ok =
-            std::arch::is_x86_feature_detected!("avx2") || skip.as_deref() == Some("1");
-        #[cfg(not(target_arch = "x86_64"))]
-        let expected_ok = true;
-        assert_eq!(super::check_cpu_features().is_ok(), expected_ok);
-    }
-}
-
-#[cfg(test)]
-mod cpu_check_tests {
-    use super::{SKIP_CPU_CHECK_ENV, check_cpu_features_with};
-
-    #[test]
-    fn avx2_present_passes() {
-        assert!(check_cpu_features_with(true, None).is_ok());
-        assert!(check_cpu_features_with(true, Some("0")).is_ok());
-        assert!(check_cpu_features_with(true, Some("1")).is_ok());
-    }
-
-    #[test]
-    fn avx2_missing_fails_with_clear_error() {
-        for skip in [None, Some(""), Some("0"), Some("true")] {
-            let err = check_cpu_features_with(false, skip).unwrap_err();
-            let msg = err.to_string();
-            assert!(msg.contains("AVX2"), "unexpected error: {msg}");
-            assert!(msg.contains("Xbox Series"), "unexpected error: {msg}");
-            assert!(msg.contains(SKIP_CPU_CHECK_ENV), "unexpected error: {msg}");
-        }
-    }
-
-    #[test]
-    fn skip_env_var_bypasses_missing_avx2() {
-        assert!(check_cpu_features_with(false, Some("1")).is_ok());
     }
 }
 
