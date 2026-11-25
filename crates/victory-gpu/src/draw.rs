@@ -95,13 +95,6 @@ fn early_budgets() -> (u64, u64) {
     })
 }
 
-/// The pixel shaders of the title's decoration bake (the title:
-/// `PS_BakeDecorations_*`), by the first 16 hex digits of their hash as the
-/// frame listings print it. They draw into a 256x256 corner of 2048x2048
-/// targets and name no texture in a table.
-const BAKE_PIXEL_SHADERS: [&str; 4] =
-    ["c0a7fe77b1862e10", "0d1575a396dfe513", "b7cfd8dda91ebb6b", "280967ad158cee0b"];
-
 /// Since the start: early runs of the texture pass, and those of them
 /// made for a bake draw.
 pub(crate) static EARLY_TEXTURE_PASSES: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
@@ -1767,7 +1760,7 @@ impl State {
             return;
         }
         let bake = bake_ms > 0
-            && p.stages.iter().any(|s| BAKE_PIXEL_SHADERS.contains(&s.shader.hash.as_str()));
+            && p.stages.iter().any(|s| s.shader.bakes);
         static FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
         // The milliseconds this frame's bake draws have taken so far: a
         // frame has several, and together they get `bake_ms`.
@@ -1865,7 +1858,7 @@ impl State {
         /// The most bytes of one of the table's buffers looked at: 53 layers.
         const MOST: u64 = 16 << 10;
         let mut bytes = Vec::new();
-        for stage in p.stages.iter().filter(|s| BAKE_PIXEL_SHADERS.contains(&s.shader.hash.as_str())) {
+        for stage in p.stages.iter().filter(|s| s.shader.bakes) {
             let tabled = |u: &&UsedResource| u.root == RootType::Table && u.kind != ResourceType::Sampler;
             for u in stage.translated().used.iter().filter(tabled) {
                 let Some(Root::Table(table)) = self.roots_ref(false).get(usize::from(u.slot)) else {
