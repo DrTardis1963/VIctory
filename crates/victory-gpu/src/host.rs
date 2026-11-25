@@ -2386,6 +2386,147 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
     None
 }
 
+/// Whether a title buffer copy that would settle the flights runs on the
+/// card instead, in queue order (`VICTORY_QUEUE_COPIES=1`; off by default).
+///
+/// The title's buffer copies are done on the CPU when their list is
+/// submitted, so one whose source or destination lies in what flights'
+/// shaders may write waits until they have landed ("title memory read (by
+/// a buffer copy)": about twice a frame in the world, 110-130 ms a frame
+/// of the submitting thread waiting, the card idle behind it afterwards).
+/// On the console such a copy runs on the card after the work before it.
+/// With the switch it does here too: from its source's host copy to its
+/// destination's, in a list of its own just ahead of the submission's
+/// lists. The source's copy is brought up to date first, as for a shader
+/// that reads it, and the destination is declared written by the
+/// submission, as for a shader that writes it, so it reaches title memory
+/// when the submission is copied back and later CPU reads of it wait for
+/// that. Nothing else in the submission must look at the destination on
+/// the CPU (another copy, a fill, a texture), and each side must be the
+/// only copy of its bytes (no other title buffer or window over them);
+/// otherwise the flights are settled as before.
+fn queue_copies() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_QUEUE_COPIES").is_some_and(|v| v == "1"))
+}
+
+/// Since the last frame-rate line: title buffer copies run on the card
+/// ([`queue_copies`]), and the submissions that were not settled for it.
+static QUEUED_COPIES: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// A submission's title buffer copies moved to the card ([`queue_copies`]).
+struct QueuedCopies {
+    /// Per list of the submission that had copies moved (its place in the
+    /// runs): where each copy's two steps are now, and the copy
+    /// (destination, source, bytes), to put back once the submission is
+    /// prepared (a list may be submitted again).
+    moved: Vec<(usize, Vec<(usize, usize, usize, usize)>)>,
+    /// Destination copy, source copy, destination, source, bytes; in order.
+    copies: Vec<(std::sync::Arc<crate::shadow::Shadow>, std::sync::Arc<crate::shadow::Shadow>, usize, usize, usize)>,
+}
+
+/// [`queue_copies`]: rewrites the title buffer copies of `runs` that touch
+/// `written` (what flights' shaders may write) into a refresh of the
+/// source and a declared write of the destination, if that leaves nothing
+/// to settle for; `None` (and `runs` as they were) if not.
+fn queue_title_copies(runs: &[&HostList], written: &[(usize, usize)]) -> Option<QueuedCopies> {
+    if runs.iter().enumerate().any(|(i, a)| runs[..i].iter().any(|b| std::ptr::eq(*a, *b))) {
+        return None;
+    }
+    // (list, step, destination, source, bytes) of the copies to move, and
+    // what the CPU steps that stay touch.
+    let mut picked = Vec::new();
+    let mut staying = Vec::new();
+    for (l, list) in runs.iter().enumerate() {
+        for (i, step) in list.deferred().copies.iter().enumerate() {
+            match *step {
+                Step::Copy(dst, src, len) if touches(written, src, src + len) || touches(written, dst, dst + len) => {
+                    picked.push((l, i, dst, src, len));
+                }
+                Step::Copy(dst, src, len) => staying.extend([(dst, dst + len), (src, src + len)]),
+                Step::Fill(_, src, len) => staying.push((src, src + len)),
+                Step::Texture(ref staging, _) => {
+                    let (at, len) = staging.memory();
+                    staying.push((at, at + len));
+                }
+                _ => {}
+            }
+        }
+    }
+    if picked.is_empty() {
+        return None;
+    }
+    join_ranges(&mut staying, []);
+    let mut copies = Vec::with_capacity(picked.len());
+    for &(_, _, dst, src, len) in &picked {
+        if touches(&staying, dst, dst + len) {
+            return None;
+        }
+        let to = crate::shadow::sole(dst as u64, len as u64)?;
+        let from = crate::shadow::sole(src as u64, len as u64)?;
+        // One resource cannot be the copy's source and destination at once.
+        if std::sync::Arc::ptr_eq(&to, &from) {
+            return None;
+        }
+        copies.push((to, from, dst, src, len));
+    }
+    let mut moved: Vec<(usize, Vec<(usize, usize, usize, usize)>)> = Vec::new();
+    let mut next = copies.iter();
+    for (l, list) in runs.iter().enumerate() {
+        if !picked.iter().any(|p| p.0 == l) {
+            continue;
+        }
+        let mut deferred = list.deferred();
+        let steps = std::mem::take(&mut deferred.copies);
+        let mut rewritten = Vec::with_capacity(steps.len() + picked.len());
+        let mut places = Vec::new();
+        for (i, step) in steps.into_iter().enumerate() {
+            match step {
+                Step::Copy(dst, src, len) if picked.iter().any(|p| p.0 == l && p.1 == i) => {
+                    let Some((to, from, ..)) = next.next() else {
+                        unreachable!("a copy picked above")
+                    };
+                    places.push((rewritten.len(), dst, src, len));
+                    rewritten.push(Step::Refresh(from.clone(), src, len));
+                    rewritten.push(Step::GpuWrite(to.clone(), dst, len));
+                }
+                other => rewritten.push(other),
+            }
+        }
+        deferred.copies = rewritten;
+        moved.push((l, places));
+    }
+    let queued = QueuedCopies { moved, copies };
+    if blocked_by(written, runs, false).is_some() {
+        put_back(runs, &queued);
+        return None;
+    }
+    QUEUED_COPIES[0].fetch_add(queued.copies.len() as u64, Ordering::Relaxed);
+    QUEUED_COPIES[1].fetch_add(1, Ordering::Relaxed);
+    Some(queued)
+}
+
+/// Undoes [`queue_title_copies`]' rewriting: the lists' copies as recorded.
+fn put_back(runs: &[&HostList], queued: &QueuedCopies) {
+    for (l, places) in &queued.moved {
+        let mut deferred = runs[*l].deferred();
+        let steps = std::mem::take(&mut deferred.copies);
+        let mut restored = Vec::with_capacity(steps.len());
+        let mut steps = steps.into_iter().enumerate();
+        while let Some((i, step)) = steps.next() {
+            match places.iter().find(|p| p.0 == i) {
+                Some(&(_, dst, src, len)) => {
+                    // The declared write that followed the refresh.
+                    steps.next();
+                    restored.push(Step::Copy(dst, src, len));
+                }
+                None => restored.push(step),
+            }
+        }
+        deferred.copies = restored;
+    }
+}
+
 /// Whether any texture staging buffer refreshed by `runs` is still being
 /// read on the GPU by an unfinished flight (`in_flight > finished`):
 /// refreshing it now would overwrite its mapped upload buffer mid-copy.
@@ -2852,6 +2993,12 @@ fn late_line(frames: f64) {
             w[WHY_FENCE],
         );
     }
+    if queue_copies() {
+        let [copies, spared] = QUEUED_COPIES.each_ref().map(|n| n.swap(0, Ordering::Relaxed) as f64 / frames);
+        tracing::info!(
+            "title buffer copies run on the card in queue order per frame (VICTORY_QUEUE_COPIES=1): {copies:.1}, sparing {spared:.1} settles"
+        );
+    }
     #[cfg(feature = "diagnostics")]
     {
         let copies = SETTLING_COPIES.lock().unwrap_or_else(|e| e.into_inner()).take();
@@ -2898,6 +3045,55 @@ fn late_line(frames: f64) {
 #[cfg(test)]
 mod late_tests {
     use super::{continues, join_ranges, touches};
+
+    /// `VICTORY_QUEUE_COPIES`: a title copy that touches what flights write
+    /// becomes a refresh of its source and a declared write of its
+    /// destination, and goes back as recorded; one whose destination
+    /// another CPU step reads stays.
+    #[test]
+    fn queued_title_copies_rewrite_and_put_back() {
+        use super::{Step, put_back, queue_title_copies};
+        let Some(host) = super::host() else {
+            return;
+        };
+        let Ok(list) = host.new_list() else {
+            return;
+        };
+        let (src, dst, other) = (vec![1u8; 4096], vec![2u8; 4096], vec![3u8; 4096]);
+        let at = |v: &Vec<u8>| v.as_ptr() as usize;
+        struct Unregister(Vec<usize>);
+        impl Drop for Unregister {
+            fn drop(&mut self) {
+                for &start in &self.0 {
+                    crate::shadow::unregister(start, start as u64);
+                }
+            }
+        }
+        let _guard = Unregister(vec![at(&src), at(&dst)]);
+        for v in [&src, &dst] {
+            crate::shadow::register(at(v), at(v) as u64, 4096);
+            crate::shadow::find(at(v) as u64, 4096);
+        }
+        // Another test's window over the same memory: nothing to look at.
+        if crate::shadow::sole(at(&src) as u64, 256).is_none() || crate::shadow::sole(at(&dst) as u64, 256).is_none() {
+            return;
+        }
+        list.defer_copy((at(&dst) + 16) as *mut u8, at(&src) as *const u8, 256);
+        let written = [(at(&src), at(&src) + 64)];
+        let queued = queue_title_copies(&[&list], &written).expect("moved to the card");
+        assert_eq!(queued.copies.len(), 1);
+        assert!(matches!(
+            list.deferred().copies[..],
+            [Step::Refresh(_, s, 256), Step::GpuWrite(_, d, 256)] if s == at(&src) && d == at(&dst) + 16
+        ));
+        put_back(&[&list], &queued);
+        assert!(matches!(list.deferred().copies[..], [Step::Copy(d, s, 256)] if s == at(&src) && d == at(&dst) + 16));
+        // A later fill reads the destination on the CPU: the copy stays.
+        list.defer_fill(at(&other) as *mut u8, (at(&dst) + 32) as *const u8, 16);
+        assert!(queue_title_copies(&[&list], &written).is_none());
+        assert!(matches!(list.deferred().copies[..], [Step::Copy(..), Step::Fill(..)]));
+        list.close();
+    }
 
     /// Copies join only when both ends continue and the whole does not
     /// overlap itself.
@@ -4517,6 +4713,40 @@ impl Host {
         working(was_working);
     }
 
+    /// [`queue_copies`]: the title buffer copies of a submission sent ahead,
+    /// host copy to host copy, in a list of their own on the queue just
+    /// ahead of its lists. The list lives as long as `keeper`'s commands.
+    fn run_queued_copies(
+        &self,
+        keeper: &HostList,
+        copies: &[(std::sync::Arc<crate::shadow::Shadow>, std::sync::Arc<crate::shadow::Shadow>, usize, usize, usize)],
+    ) {
+        let Some((allocator, list)) = self.make_prelude() else {
+            fail(format_args!("no host list for title buffer copies on the card (VICTORY_QUEUE_COPIES=1)"));
+        };
+        // SAFETY: a list of our own nothing runs yet; live buffers (the
+        // submission's lists hold the copies), the ranges inside them.
+        // Both start in the common state (buffers decay to it between
+        // submissions) and are promoted by the copy.
+        let ran = unsafe {
+            (|| -> windows::core::Result<()> {
+                allocator.Reset()?;
+                list.Reset(&allocator, None)?;
+                for (to, from, dst, src, len) in copies {
+                    list.CopyBufferRegion(&to.buffer, to.offset(*dst as u64), &from.buffer, from.offset(*src as u64), *len as u64);
+                }
+                list.Close()?;
+                self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
+                Ok(())
+            })()
+        };
+        if let Err(e) = ran {
+            fail(format_args!("title buffer copies could not be run on the card ({e}, VICTORY_QUEUE_COPIES=1)"));
+        }
+        keeper.keep(&allocator);
+        keeper.keep(&list);
+    }
+
     /// [`Host::execute`], or with `late` the first half of
     /// [`Host::execute_late`]: the lists are prepared and sent, and what is
     /// to be done once they have run comes back with the submission lock
@@ -4535,10 +4765,17 @@ impl Host {
         // settles them first, one sent ahead only if preparing it reads
         // what they write or would overwrite an in-flight texture staging
         // buffer.
+        let mut queued = None;
         if !late {
             self.settle(&mut submitted, WHY_SYNC);
         } else if let Some(why) = late_blocked(runs) {
-            if relay_exact() && why == WHY_READ {
+            if why == WHY_READ && queue_copies() {
+                let written = line().written.clone();
+                queued = queue_title_copies(runs, &written);
+            }
+            if queued.is_some() {
+                // Run on the card in queue order: nothing to wait for.
+            } else if relay_exact() && why == WHY_READ {
                 // Only until the flights that may write what is read have
                 // landed: their copy-back's end, not the card's other work.
                 relay_wait(why, |line| blocked_by(&line.written, runs, false).is_none());
@@ -4655,6 +4892,10 @@ impl Host {
         if let Some(check) = card.as_ref().and_then(|c| c.check.clone()) {
             lists.push(Some(check));
         }
+        // After the card copies were brought up to date, ahead of the lists.
+        if let Some(queued) = &queued {
+            self.run_queued_copies(runs[0], &queued.copies);
+        }
         let prepared = std::time::Instant::now();
         if late {
             mark_staging_read(runs, this_submission);
@@ -4669,6 +4910,9 @@ impl Host {
                 fail(format_args!("a submission sent ahead could not be followed by a signal ({e})"));
             }
             let back = declared_writes(runs);
+            if let Some(queued) = &queued {
+                put_back(runs, queued);
+            }
             let writes = runs.iter().flat_map(|l| l.deferred().writes.clone()).collect();
             SUBMISSION_US[0].fetch_add((prepared - started).saturating_sub(settled).as_micros() as u64, Ordering::Relaxed);
             submitting(0, 0);
