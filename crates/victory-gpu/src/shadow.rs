@@ -1963,6 +1963,12 @@ impl Shadow {
         self.gpu + (address - self.start)
     }
 
+    /// Whether the copy is of a window of memory outside title buffers,
+    /// not of a title buffer.
+    pub(crate) fn is_window(&self) -> bool {
+        self.window
+    }
+
     /// The title memory the copy is of: its start and length.
     pub(crate) fn span(&self) -> (u64, u64) {
         (self.start, self.len)
@@ -3020,6 +3026,31 @@ static BUFFERS: Mutex<BTreeMap<(u64, usize), Entry>> = Mutex::new(BTreeMap::new(
 
 fn buffers() -> std::sync::MutexGuard<'static, BTreeMap<(u64, usize), Entry>> {
     BUFFERS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Of title memory `[from, to)`: the parts that title buffer objects hold,
+/// joined where they touch, in order (`crate::pipeline::bvh_bound`).
+/// Buffers that begin more than 1 GiB before `from` are not looked for:
+/// memory inside such a buffer has the buffer's copy, not a window's.
+pub(crate) fn buffer_parts(from: u64, to: u64) -> Vec<(u64, u64)> {
+    const LOOKBACK: u64 = 1 << 30;
+    if from >= to {
+        return Vec::new();
+    }
+    let mut parts: Vec<(u64, u64)> = buffers()
+        .range((from.saturating_sub(LOOKBACK), 0)..(to, 0))
+        .filter(|&(&(start, _), e)| e.end > from && start < to)
+        .map(|(&(start, _), e)| (start.max(from), e.end.min(to)))
+        .collect();
+    parts.sort_unstable();
+    let mut out: Vec<(u64, u64)> = Vec::with_capacity(parts.len());
+    for (a, b) in parts {
+        match out.last_mut() {
+            Some(last) if a <= last.1 => last.1 = last.1.max(b),
+            _ => out.push((a, b)),
+        }
+    }
+    out
 }
 
 /// A title buffer exists at `start` (`len` bytes).

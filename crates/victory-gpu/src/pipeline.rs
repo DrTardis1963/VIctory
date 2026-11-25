@@ -285,6 +285,77 @@ pub(crate) fn builder_quarantined(this: This) -> bool {
     is_builder(this) && *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_QUARANTINE").is_some_and(|v| v == "1"))
 }
 
+/// Whether what the structure builder's stages store into title memory
+/// outside title buffer objects stays in the host's copies
+/// (`VICTORY_BVH_BOUND`, on unless `0`).
+///
+/// The builder reaches memory by raw address, and each such dispatch
+/// declared every copy it had numbered written: mostly 4 MiB windows of
+/// memory outside buffers, in which the title's own objects lie beside
+/// whatever the builder meant to write. Whatever the builder stored there
+/// went back into title memory, byte for byte. In the run with the builder
+/// on (2026-11-24, `bvh-builder`) windows had 1.5 MB a frame written back,
+/// and four seconds after the builder started the title read a pointer of
+/// 0xff800000ff800000 (two floats of minus infinity, the empty bounding
+/// box a builder stage starts with) and died.
+///
+/// Direct3D puts a ray-tracing structure, its scratch memory and its
+/// post-build results in buffer objects, so with the switch a builder
+/// dispatch declares written only the parts of a window that title buffers
+/// hold (`crate::shadow::buffer_parts`); its root UAVs likewise. A title
+/// buffer's own copy is declared whole, as before. What the builder stores
+/// elsewhere stays in the host copy, where the programs that walk the
+/// structures read it, until the title writes that page and a refresh
+/// puts the title's bytes back (as with `VICTORY_BVH_QUARANTINE`, for
+/// that memory only). The memory line counts the bytes left out.
+#[cfg(windows)]
+pub(crate) fn bvh_bound() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_BOUND").is_none_or(|v| v != "0"))
+}
+
+/// Bytes of windows a builder dispatch did not declare written
+/// ([`bvh_bound`]), and of them declared because title buffers hold them,
+/// since the last frame-rate line.
+#[cfg(windows)]
+pub(crate) static BVH_BOUND_BYTES: [std::sync::atomic::AtomicU64; 2] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// Declares `[address, address + len)` of `shadow` written by `list`'s
+/// shaders, as [`crate::shadow::Shadow::gpu_writes`] does; for a stage of
+/// the structure builder with [`bvh_bound`], only what title buffers hold
+/// of a window.
+#[cfg(windows)]
+pub(crate) fn builder_writes(
+    list: &crate::host::HostList,
+    shadow: &Arc<crate::shadow::Shadow>,
+    address: u64,
+    len: u64,
+    builder: bool,
+) {
+    use std::sync::atomic::Ordering::Relaxed;
+    if !(builder && bvh_bound() && shadow.is_window()) {
+        shadow.gpu_writes(list, address, len);
+        return;
+    }
+    let parts = crate::shadow::buffer_parts(address, address.saturating_add(len));
+    let held: u64 = parts.iter().map(|&(a, b)| b - a).sum();
+    BVH_BOUND_BYTES[0].fetch_add(len.saturating_sub(held), Relaxed);
+    BVH_BOUND_BYTES[1].fetch_add(held, Relaxed);
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        tracing::info!(
+            window = format_args!("{address:#x}+{len:#x}"),
+            buffers = parts.len(),
+            held,
+            "the structure builder's stores outside title buffers stay in the host's copies (VICTORY_BVH_BOUND=0 copies them back)"
+        );
+    });
+    for (a, b) in parts {
+        shadow.gpu_writes(list, a, b - a);
+    }
+}
+
 /// Whether the title's pipeline `this` is one of the structure builder's.
 #[cfg(windows)]
 pub(crate) fn is_builder(this: This) -> bool {

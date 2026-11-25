@@ -304,6 +304,7 @@ pub(crate) fn ready(
     write_addresses: &[u64],
     constants: &[u32],
     writes: bool,
+    builder: bool,
 ) -> Option<Ready> {
     let mut guard = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
     if guard.is_none() {
@@ -376,10 +377,14 @@ pub(crate) fn ready(
     }
     if writes {
         WRITERS.store(true, std::sync::atomic::Ordering::Relaxed);
+        // Bounded for the structure builder (`crate::pipeline::bvh_bound`).
+        // shortcut: a list's copies are declared once, by whichever program
+        // that can store comes first; a list mixing the builder with another
+        // such program follows the first.
         for &n in &named {
             if list.first_use(WRITE_COPY - n) {
                 let (start, len) = m.copies[n].span();
-                m.copies[n].gpu_writes(list, start, len);
+                crate::pipeline::builder_writes(list, &m.copies[n], start, len, builder);
             }
         }
         // The written pages once per list, and again when more have joined
@@ -393,7 +398,7 @@ pub(crate) fn ready(
                 .map(|(&page, &(n, _))| (page, n))
                 .collect();
             for (n, start, len) in coalesce_dirty_runs(dirty, &spans) {
-                m.copies[n].gpu_writes(list, start, len);
+                crate::pipeline::builder_writes(list, &m.copies[n], start, len, builder);
             }
         }
     }
@@ -500,7 +505,7 @@ mod tests {
         let host_heap = heap(h).host().expect("host view heap");
         let key = std::ptr::from_ref(host_heap) as usize;
 
-        assert!(ready(&list, host_heap, &[], &[], &[], false).is_some());
+        assert!(ready(&list, host_heap, &[], &[], &[], false, false).is_some());
         {
             let guard = MEMORY.lock().unwrap();
             assert!(guard.as_ref().unwrap().heaps.contains_key(&key));

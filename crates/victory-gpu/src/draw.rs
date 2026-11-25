@@ -909,7 +909,8 @@ impl State {
                 _ => {}
             }
         }
-        crate::memory::ready(list, heap, &read, &written, &constants, writes)
+        let builder = crate::pipeline::is_builder(self.pipeline as This);
+        crate::memory::ready(list, heap, &read, &written, &constants, writes, builder)
     }
 
     /// The bound heap holding `handle`.
@@ -1296,11 +1297,12 @@ impl State {
             }
             Some(s)
         };
+        let builder = crate::pipeline::is_builder(self.pipeline as This);
         let ready = |a: u64, s: &std::sync::Arc<crate::shadow::Shadow>| {
             let len = s.left(a).min(limit);
             s.refresh(list, a, len);
             if writes {
-                s.gpu_writes(list, a, len);
+                crate::pipeline::builder_writes(list, s, a, len, builder);
             }
         };
         if !crate::pipeline::host::bounded_root_srvs() {
