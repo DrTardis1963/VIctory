@@ -910,6 +910,9 @@ pub(crate) struct HostList {
     /// Device-local scratch buffer for clamped indirect arguments (`indirect`),
     /// grown to the largest indirect execution recorded on the list.
     indirect_args: Mutex<Option<(ID3D12Resource, u64)>>,
+    /// That scratch buffer was left in `INDIRECT_ARGUMENT` for the draws of
+    /// a window that read it next (`crate::indirect::hold`).
+    indirect_held: std::sync::atomic::AtomicBool,
     /// Counts the list in [`ALIVE`] while it lives.
     _alive: Counted,
     /// The texts of the markers `note_op` set, in order (for device-removed
@@ -3367,6 +3370,7 @@ impl Host {
                 pipelines: Mutex::default(),
                 budget: OnceLock::new(),
                 indirect_args: Mutex::default(),
+                indirect_held: std::sync::atomic::AtomicBool::new(false),
                 _alive: Counted::new(),
                 #[cfg(feature = "diagnostics")]
                 notes: Mutex::default(),
@@ -5073,6 +5077,8 @@ impl HostList {
         let started = std::time::Instant::now();
         self._alive.used();
         *self.deferred() = Deferred::default();
+        // Buffers decay to the common state once their lists have run.
+        self.indirect_held.store(false, Ordering::Relaxed);
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -5706,11 +5712,19 @@ impl HostList {
         let buffer = host()?.uav_buffer(alloc)?;
         name(&buffer, || format!("indirect arguments {alloc:#x}"));
         let old = slot.replace((buffer.clone(), alloc));
+        // The new buffer starts in the common state; the old one decays.
+        self.indirect_held.store(false, Ordering::Relaxed);
         drop(slot);
         if let Some((old_buf, _)) = old {
             self.keep(&old_buf);
         }
         Some(buffer)
+    }
+
+    /// Sets whether the indirect scratch buffer is held in
+    /// `INDIRECT_ARGUMENT`; whether it was.
+    pub(crate) fn indirect_held(&self, held: bool) -> bool {
+        self.indirect_held.swap(held, Ordering::Relaxed)
     }
 
     /// Keeps `object` alive until the list is reset.

@@ -2701,8 +2701,13 @@ impl State {
             DISPATCH => self.bind(list, p, true),
             _ => false,
         };
+        // A window's scratch stays as the draws read it (`indirect::hold`).
+        let finish = |list: &HostList| match self.window {
+            Some(_) => crate::indirect::hold(list),
+            None => crate::indirect::done(list, &bounded),
+        };
         if !ran {
-            crate::indirect::done(list, &bounded);
+            finish(list);
             why("prepare failed");
             return false;
         }
@@ -2728,7 +2733,7 @@ impl State {
         if kind == MESH {
             self.mesh_scissor(list, false);
         }
-        crate::indirect::done(list, &bounded);
+        finish(list);
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
         } else {

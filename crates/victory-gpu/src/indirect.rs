@@ -251,7 +251,7 @@ pub(crate) fn bound(
     spec: (u32, u32, u32),
 ) -> Option<ID3D12Resource> {
     let bytes = validate_layout(spec, src.1, count.map(|(_, off)| off))?;
-    let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
+    let (c, budget, dst) = (clamp()?, list.budget()?, scratch(list, bytes)?);
     record_clamp(c, &list.list, &dst, budget, src, count, spec).then_some(dst)
 }
 
@@ -271,7 +271,7 @@ pub(crate) fn bound_ahead(
     spec: (u32, u32, u32),
 ) -> Option<ID3D12Resource> {
     let bytes = validate_layout(spec, src.1, None)?;
-    let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
+    let (c, budget, dst) = (clamp()?, list.budget()?, scratch(list, bytes)?);
     record_clamp_as(c, &list.list, &dst, budget, src, None, spec, true).then_some(dst)
 }
 
@@ -394,7 +394,24 @@ fn record_clamp_as(
 /// After indirect execution (or if preparation failed after [`bound`]):
 /// returns the scratch buffer to the common state for the next call.
 pub(crate) fn done(list: &HostList, scratch: &ID3D12Resource) {
+    list.indirect_held(false);
     done_on(&list.list, scratch);
+}
+
+/// After an indirect execution that read a window ([`bound_ahead`]): the
+/// scratch buffer stays in `INDIRECT_ARGUMENT` for the window's next draws,
+/// one barrier less per draw; the next clamp returns it first ([`scratch`]).
+pub(crate) fn hold(list: &HostList) {
+    list.indirect_held(true);
+}
+
+/// The list's scratch buffer, in the common state the clamp expects.
+fn scratch(list: &HostList, bytes: u64) -> Option<ID3D12Resource> {
+    let dst = list.indirect_scratch(bytes)?;
+    if list.indirect_held(false) {
+        done_on(&list.list, &dst);
+    }
+    Some(dst)
 }
 
 fn done_on(list: &ID3D12GraphicsCommandList, scratch: &ID3D12Resource) {
@@ -1244,5 +1261,30 @@ void main() {
         list.close();
         host.execute(&[&list]);
         list.reset();
+    }
+
+    /// A window's scratch held in `INDIRECT_ARGUMENT` goes back to the
+    /// common state before the next clamp writes it.
+    #[test]
+    fn held_scratch_is_returned_before_the_next_clamp() {
+        let Some(host) = super::host() else {
+            return;
+        };
+        let Ok(list) = host.new_list() else {
+            return;
+        };
+        let Some((src_buf, _)) = host.shared_buffer(64 << 10) else {
+            return;
+        };
+        bound_ahead(&list, (&src_buf, 0), (10, 12, 16)).unwrap();
+        hold(&list);
+        assert!(list.indirect_held(true), "held after a window's draw");
+        let b = bound(&list, (&src_buf, 0), None, (2, 12, 1)).unwrap();
+        assert!(!list.indirect_held(false), "the clamp takes the scratch back first");
+        done(&list, &b);
+        list.close();
+        host.execute(&[&list]);
+        list.reset();
+        assert!(!list.indirect_held(false), "a reset list starts in the common state");
     }
 }
