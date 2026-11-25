@@ -10696,7 +10696,18 @@ impl<'a> Lower<'a> {
                     let f = half(self, h)?.ok_or("a packed input half no element holds")?;
                     self.as_int(f)
                 } else if f16 {
-                    let mut f = half(self, h)?.ok_or("a packed input half no element holds")?;
+                    // A padding half no element holds reads as 0.
+                    // shortcut: the console reads whatever the export left there;
+                    // look at that export if such a read ever shows up wrong.
+                    let Some(mut f) = half(self, h)? else {
+                        let zero = self.s.m.i32(0);
+                        if matches!(inst.fields, Fields::Valu(_)) {
+                            return self.write_half(inst, zero, None);
+                        }
+                        let x = self.low_half(inst, reg, zero);
+                        self.write(inst, Reg::V(reg), x, None);
+                        return Ok(());
+                    };
                     if let Fields::Valu(v) = &inst.fields {
                         // omod, then clamp, before the one rounding to 16 bits; op_sel[3]
                         // picks the destination half (VIctory e29391f: the low half was
