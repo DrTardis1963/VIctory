@@ -3033,6 +3033,25 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
     lookup(address, len, false)
 }
 
+/// The host copy, made already, of the one title buffer that holds
+/// `[address, address + len)` when no other title buffer and no window
+/// outside buffers lies over any of it: what is put into that copy is then
+/// all any shader sees of those bytes. Makes nothing.
+pub(crate) fn sole(address: u64, len: u64) -> Option<Arc<Shadow>> {
+    let end = address.checked_add(len)?;
+    let over = |from: u64, to: u64| from < end && to > address;
+    if LOOSE.lock().unwrap_or_else(|e| e.into_inner()).keys().any(|&(at, n)| over(at, at + n)) {
+        return None;
+    }
+    let map = buffers();
+    let mut holders = map.range(..(end, 0)).filter(|(key, e)| over(key.0, e.end));
+    let (key, entry) = holders.next()?;
+    if holders.next().is_some() || key.0 > address || entry.end < end {
+        return None;
+    }
+    entry.shadow.clone().filter(|shadow| !shadow.window)
+}
+
 /// As [`find`], for an ask that is done with the copy when its list has
 /// run (a draw's vertex and index buffers, indirect arguments): outside
 /// buffer objects it takes a window that is there already and holds the
