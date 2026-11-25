@@ -6718,27 +6718,8 @@ impl<'a> Lower<'a> {
                 Ok(h)
             }
             Source::Constant(words) if sampler => {
-                let words: [u32; 4] = words
-                    .get(..4)
-                    .and_then(|w| w.try_into().ok())
-                    .ok_or("a sampler constant")?;
-                let comparison = props.0 & 0x8000 != 0;
-                let slot = self.samplers.iter().enumerate().position(|(n, w)| {
-                    *w == words && (self.s.cmp_samplers >> n & 1 != 0) == comparison
-                });
-                let n = match slot {
-                    Some(n) => n,
-                    None => {
-                        let n = self.samplers.len();
-                        if n >= u64::BITS as usize {
-                            return Err("more than 64 immediate sampler slots");
-                        }
-                        self.samplers.push(words);
-                        self.s.cmp_samplers |= u64::from(comparison) << n;
-                        n
-                    }
-                };
-                Ok(self.s.sampler_handle(self.cur, n as u32))
+                let n = self.sampler_slot(words, props.0 & 0x8000 != 0)?;
+                Ok(self.s.sampler_handle(self.cur, n))
             }
             Source::Constant(_) => Err("a constant resource descriptor"),
             Source::Built { address, .. } => {
@@ -6806,6 +6787,86 @@ impl<'a> Lower<'a> {
                 Ok(self.s.heap_handle(self.cur, index, sampler, true, props))
             }
         }
+    }
+
+    /// The immediate sampler slot of the sampler `words`, a comparison one
+    /// or not (slots are shared by equal samplers, taken on first use).
+    fn sampler_slot(&mut self, words: &[u32], comparison: bool) -> Result<u32, Why> {
+        let words: [u32; 4] = words
+            .get(..4)
+            .and_then(|w| w.try_into().ok())
+            .ok_or("a sampler constant")?;
+        let slot = self.samplers.iter().enumerate().position(|(n, w)| {
+            *w == words && (self.s.cmp_samplers >> n & 1 != 0) == comparison
+        });
+        let n = match slot {
+            Some(n) => n,
+            None => {
+                let n = self.samplers.len();
+                if n >= u64::BITS as usize {
+                    return Err("more than 64 immediate sampler slots");
+                }
+                self.samplers.push(words);
+                self.s.cmp_samplers |= u64::from(comparison) << n;
+                n
+            }
+        };
+        Ok(n as u32)
+    }
+
+    /// Whether `src` is a sampler that control flow picks among constants
+    /// (the words built with `s_mov`s on each side of a branch), at most
+    /// `depth` joins deep.
+    fn constant_choice(src: &Source, depth: u32) -> bool {
+        match src {
+            Source::Phi { args, .. } => args.iter().all(|a| match a {
+                Source::Constant(_) => true,
+                Source::Phi { .. } => depth > 0 && Self::constant_choice(a, depth - 1),
+                _ => false,
+            }),
+            _ => false,
+        }
+    }
+
+    /// The immediate sampler slot a [`Self::constant_choice`] phi picks:
+    /// each predecessor gives the slot of its constant, the join picks one
+    /// with a phi. `slots` collects every slot it can pick.
+    fn sampler_phi(
+        &mut self,
+        block: usize,
+        args: &[Source],
+        comparison: bool,
+        depth: u32,
+        slots: &mut Vec<u32>,
+    ) -> Result<V, Why> {
+        const WHY: Why = "a sampler chosen by control flow";
+        let p = self.x.p;
+        let mut incoming = Vec::new();
+        for (&q, arg) in p.blocks[block].preds.iter().zip(args) {
+            if self.block[q].is_none() {
+                continue;
+            }
+            let tail = self.tail[q].ok_or(WHY)?;
+            let at = self.edges.get(&(q, block)).copied().unwrap_or(tail);
+            let slot = match arg {
+                Source::Constant(words) => {
+                    let n = self.sampler_slot(words, comparison)?;
+                    if !slots.contains(&n) {
+                        slots.push(n);
+                    }
+                    self.s.m.i32(n)
+                }
+                Source::Phi { block: inner, args: inner_args } if depth > 0 => {
+                    self.sampler_phi(*inner, inner_args, comparison, depth - 1, slots)?
+                }
+                _ => return Err(WHY),
+            };
+            incoming.push((slot, at));
+        }
+        let join = self.block[block].ok_or(WHY)?;
+        let phi = self.s.m.phi(join, self.s.t.i32);
+        self.s.m.set_phi(phi, incoming);
+        Ok(phi)
     }
 
     /// The heap index a descriptor phi picks. Each predecessor computes its
@@ -10165,6 +10226,8 @@ impl<'a> Lower<'a> {
         let iu = self.s.m.undef(self.s.t.i32);
         // A gather at a named level, done as four texel reads (below).
         let mut gathered: Option<[V; 4]> = None;
+        // Samples with the other samplers a phi picks: (that one picked, result).
+        let mut picked: Vec<(V, V)> = Vec::new();
         let r = if sample {
             let ss = self
                 .descriptors
@@ -10177,7 +10240,35 @@ impl<'a> Lower<'a> {
             if cmp && (*a16 || dmask.count_ones() != 1) {
                 return Err("a comparison sample of 16-bit coordinates or several channels");
             }
-            let sh = self.handle(site, ss, true, (14 | if cmp { 0x8000 } else { 0 }, 0))?;
+            // A sampler control flow picks among immediate ones: a handle is
+            // neither phi'd nor selected in DXIL, so each one samples and the
+            // slot the phi picks chooses the result (`picked`, below).
+            let mut others: Vec<(V, V)> = Vec::new();
+            let sh = match ss {
+                Source::Phi { block, args } if Self::constant_choice(ss, 8) => {
+                    let mut slots = Vec::new();
+                    let slot = self.sampler_phi(*block, args, cmp, 8, &mut slots)?;
+                    let first = *slots.first().ok_or("a sampler chosen by control flow")?;
+                    for &n in &slots[1..] {
+                        let k = self.s.m.i32(n);
+                        let is = self.s.m.cmp(c, pred::EQ, slot, k);
+                        others.push((is, self.s.sampler_handle(c, n)));
+                    }
+                    self.s.sampler_handle(c, first)
+                }
+                _ => self.handle(site, ss, true, (14 | if cmp { 0x8000 } else { 0 }, 0))?,
+            };
+            // The sample with `sh`; with each of `others` too, into `picked`.
+            let mut sample_op = |l: &mut Self, name: &str, opcode: u32, args: &[V]| {
+                let r = l.s.op(c, name, Attr::ReadOnly, l.s.t.res_ret, opcode, args);
+                for &(is, h) in &others {
+                    let mut with = args.to_vec();
+                    with[1] = h;
+                    let r2 = l.s.op(c, name, Attr::ReadOnly, l.s.t.res_ret, opcode, &with);
+                    picked.push((is, r2));
+                }
+                r
+            };
             // Texel offsets (`_o`) come first: x in bits 0-5, y in 8-13,
             // signed (programmable offsets: gathers only).
             let offset_word = name.ends_with("_o");
@@ -10235,6 +10326,9 @@ impl<'a> Lower<'a> {
                 }
             }
             if op == 81 {
+                if !others.is_empty() {
+                    return Err("a level query with a sampler chosen by control flow");
+                }
                 // The clamped then the unclamped level of detail.
                 let Operand::Vector { reg, .. } = *data else {
                     return Err("an image result");
@@ -10296,14 +10390,7 @@ impl<'a> Lower<'a> {
                 60 if !self.s.pixel => {
                     args.extend(&os);
                     args.push(self.s.m.f32(0));
-                    self.s.op(
-                        c,
-                        "sampleLevel.f32",
-                        Attr::ReadOnly,
-                        self.s.t.res_ret,
-                        62,
-                        &args,
-                    )
+                    sample_op(self, "sampleLevel.f32", 62, &args)
                 }
                 60 => {
                     if offset_word {
@@ -10329,8 +10416,7 @@ impl<'a> Lower<'a> {
                     }
                     args.extend(&os);
                     args.push(clamp);
-                    self.s
-                        .op(c, "sample.f32", Attr::ReadOnly, self.s.t.res_ret, 60, &args)
+                    sample_op(self, "sample.f32", 60, &args)
                 }
                 61 => {
                     // With a16 the bias is an f16 in the low half of its
@@ -10346,25 +10432,11 @@ impl<'a> Lower<'a> {
                     args.extend(&os);
                     if self.s.pixel {
                         args.extend([bias, clamp]);
-                        self.s.op(
-                            c,
-                            "sampleBias.f32",
-                            Attr::ReadOnly,
-                            self.s.t.res_ret,
-                            61,
-                            &args,
-                        )
+                        sample_op(self, "sampleBias.f32", 61, &args)
                     } else {
                         // As above: the bias is the level.
                         args.push(bias);
-                        self.s.op(
-                            c,
-                            "sampleLevel.f32",
-                            Attr::ReadOnly,
-                            self.s.t.res_ret,
-                            62,
-                            &args,
-                        )
+                        sample_op(self, "sampleLevel.f32", 62, &args)
                     }
                 }
                 63 if kind == 5 => {
@@ -10403,14 +10475,7 @@ impl<'a> Lower<'a> {
                     let lod = self.s.m.bin(c, Bin::Mul, ln, per_ln2);
                     args.extend(&os);
                     args.push(lod);
-                    self.s.op(
-                        c,
-                        "sampleLevel.f32",
-                        Attr::ReadOnly,
-                        self.s.t.res_ret,
-                        62,
-                        &args,
-                    )
+                    sample_op(self, "sampleLevel.f32", 62, &args)
                 }
                 63 => {
                     let mut g = vec![fu; 6];
@@ -10423,14 +10488,7 @@ impl<'a> Lower<'a> {
                     args.extend(&os);
                     args.extend(g);
                     args.push(clamp);
-                    self.s.op(
-                        c,
-                        "sampleGrad.f32",
-                        Attr::ReadOnly,
-                        self.s.t.res_ret,
-                        63,
-                        &args,
-                    )
+                    sample_op(self, "sampleGrad.f32", 63, &args)
                 }
                 64 | 65 => {
                     let reference = addr_u32(self, first - 1)?;
@@ -10443,8 +10501,7 @@ impl<'a> Lower<'a> {
                     } else {
                         "sampleCmpLevelZero.f32"
                     };
-                    self.s
-                        .op(c, name, Attr::ReadOnly, self.s.t.res_ret, op, &args)
+                    sample_op(self, name, op, &args)
                 }
                 62 => {
                     let lod = if name == "image_sample_l" {
@@ -10455,14 +10512,7 @@ impl<'a> Lower<'a> {
                     };
                     args.extend(&os);
                     args.push(lod);
-                    self.s.op(
-                        c,
-                        "sampleLevel.f32",
-                        Attr::ReadOnly,
-                        self.s.t.res_ret,
-                        62,
-                        &args,
-                    )
+                    sample_op(self, "sampleLevel.f32", 62, &args)
                 }
                 _ => {
                     if name == "image_gather4" {
@@ -10544,14 +10594,7 @@ impl<'a> Lower<'a> {
                     } else {
                         args.extend(&os[..2]);
                         args.push(self.s.m.i32(dmask.trailing_zeros()));
-                        self.s.op(
-                            c,
-                            "textureGather.f32",
-                            Attr::ReadOnly,
-                            self.s.t.res_ret,
-                            73,
-                            &args,
-                        )
+                        sample_op(self, "textureGather.f32", 73, &args)
                     }
                 }
             }
@@ -10593,7 +10636,14 @@ impl<'a> Lower<'a> {
         for ch in channels {
             let x = match gathered {
                 Some(g) => g[ch as usize],
-                None => self.s.m.extract(c, r, ch),
+                None => {
+                    let mut x = self.s.m.extract(c, r, ch);
+                    for &(is, other) in &picked {
+                        let y = self.s.m.extract(c, other, ch);
+                        x = self.s.m.select(c, is, y, x);
+                    }
+                    x
+                }
             };
             xs.push(if *d16 {
                 // shortcut: d16 results are taken as floats (rounded to
