@@ -159,6 +159,12 @@ pub(crate) fn now(p: &Arc<Pending>) -> bool {
     p.made.get().is_some_and(|made| made.is_some())
 }
 
+/// Makes the host pipeline of a compute program for the driver's library
+/// (`victory warm`); whether it has one.
+pub(crate) fn warm(shaders: Vec<Arc<Shader>>) -> bool {
+    HostPipeline::new(&shaders, None).is_some()
+}
+
 /// At the title's creation of a pipeline: starts it at once if an earlier
 /// run drew with it (during loading, so the world's first frames find it),
 /// and every compute pipeline: what a dropped dispatch writes is missing
