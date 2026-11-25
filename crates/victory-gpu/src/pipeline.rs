@@ -67,6 +67,9 @@ pub(crate) struct Shader {
     /// ([`Shader::walks`]).
     #[cfg(windows)]
     walks: OnceLock<bool>,
+    /// Its result gets the least indirect light ([`crate::ambient`]).
+    #[cfg(windows)]
+    pub(crate) resolves_light: bool,
 }
 
 impl std::fmt::Debug for Shader {
@@ -101,6 +104,13 @@ pub(crate) fn kept() -> [u64; 7] {
     ]
 }
 
+/// Whether a container is the program whose result gets the least
+/// indirect light ([`crate::ambient::PROGRAM`], by its name inside).
+#[cfg(windows)]
+fn resolves_light(bytes: &[u8]) -> bool {
+    bytes.windows(crate::ambient::PROGRAM.len()).any(|w| w == crate::ambient::PROGRAM)
+}
+
 /// The shared container for `bytes`.
 fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
     let full = blake3::hash(bytes);
@@ -119,6 +129,8 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                 translated: OnceLock::new(),
                 #[cfg(windows)]
                 walks: OnceLock::new(),
+                #[cfg(windows)]
+                resolves_light: resolves_light(bytes),
             })
         })
         .clone()
@@ -138,6 +150,7 @@ pub fn warm(stage: &'static str, container: &[u8], compute: bool) -> (bool, Opti
         container: container.to_vec(),
         translated: OnceLock::new(),
         walks: OnceLock::new(),
+        resolves_light: resolves_light(container),
     });
     let translated = shader.translated().is_some();
     let made = (translated && compute).then(|| make::warm(vec![shader]));
