@@ -14,6 +14,11 @@ This file guides Claude Code and other AI coding agents working in this reposito
   - External config: `$env:VICTORY_CONFIG = "F:\VIctory_Testing\victory.toml"`
   - Agility SDK DLLs live at `F:\VIctory_Testing\D3D12\` (copy to gitignored `target/.../D3D12/` only).
   - Never touch `F:\Quarantine\...`.
+- **Use the Clean-Room Diagnostic Harness** (`cargo xtask harness --help`):
+  - `cargo xtask harness analyze <log> --out <external-dir>` — parses frame waterfall, GPU/CPU/settle waits, 8 GB VRAM/PCIe spill, and dropped shaders.
+  - `cargo xtask harness compare <a/report.json> <b/report.json>` — side-by-side A/B delta table.
+  - `cargo xtask harness prepare --profile tuned-8gb ...` — generates isolated launcher + `run_meta.json` outside the repo.
+  - `cargo xtask harness shader <hash> --config <toml>` — diagnoses a single refused/dropped shader container.
 - **Always run before committing**:
   ```powershell
   $env:PATH = "$env:USERPROFILE\.cargo\bin;$env:PATH"

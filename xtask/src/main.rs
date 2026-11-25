@@ -1,5 +1,6 @@
 //! Repository maintenance. Run with `cargo xtask <command>`.
 
+mod harness;
 mod policy;
 mod progress;
 
@@ -29,6 +30,11 @@ enum Cmd {
     InstallHooks,
     /// Write the README's progress tracker from docs/progress/progress.json.
     Progress,
+    /// Deep clean-room log analyzer, A/B comparator, profile launcher, and shader inspector.
+    Harness {
+        #[command(subcommand)]
+        cmd: harness::HarnessCmd,
+    },
 }
 
 fn main() -> Result<()> {
@@ -36,6 +42,7 @@ fn main() -> Result<()> {
     match Cli::parse().command {
         Cmd::Policy { staged } => policy::run(&root, staged),
         Cmd::Progress => progress::run(&root),
+        Cmd::Harness { cmd } => harness::run(&root, cmd),
         Cmd::InstallHooks => {
             let status = Command::new("git")
                 .args(["config", "core.hooksPath", ".githooks"])
