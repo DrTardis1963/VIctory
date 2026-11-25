@@ -458,6 +458,18 @@ pub fn emit(
     io: &io::Io,
     res: &resource::Resources,
 ) -> Result<HostShader, ShaderError> {
+    emit_sized(c, native, p, st, io, res).map(|(shader, _)| shader)
+}
+
+/// [`emit`], with the wave size the translation requires of the host.
+fn emit_sized(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    st: &structure::Structured,
+    io: &io::Io,
+    res: &resource::Resources,
+) -> Result<(HostShader, Option<u32>), ShaderError> {
     // (what an earlier program's lowering on this thread left behind)
     lower::take_needs();
     let original = emit_program(c, native, p, st, io, res);
@@ -522,7 +534,7 @@ pub fn emit(
                 let again = emit_program(c, native, p, st, io, res);
                 report(name, &again);
                 if done(&again) {
-                    return again.map(|(shader, _)| shader);
+                    return again;
                 }
             }
         }
@@ -553,7 +565,7 @@ pub fn emit(
                     let again = emit_program(c, native, p, st, io, res);
                     report("without skips, scalars followed", &again);
                     if done(&again) {
-                        return again.map(|(shader, _)| shader);
+                        return again;
                     }
                 }
                 // Still stopped where not every lane runs: the per-lane branches around
@@ -562,7 +574,7 @@ pub fn emit(
                 if wide_on {
                     let again = wide_form(deep.as_ref().map(|f| &f.0));
                     if done(&again) {
-                        return again.map(|(shader, _)| shader);
+                        return again;
                     }
                 }
                 if strict {
@@ -579,7 +591,7 @@ pub fn emit(
                     let local = lower::with_local_waves(|| emit_program(c, native, p, st, io, res));
                     report(&format!("local waves ({}), {name}", if exact { "idiom" } else { "APPROXIMATE" }), &local);
                     if done(&local) {
-                        return local.map(|(shader, _)| shader);
+                        return local;
                     }
                 }
             }
@@ -587,7 +599,7 @@ pub fn emit(
                 let local = lower::with_local_waves(|| emit_program(c, native, p, st, io, res));
                 report(if exact { "local waves (idiom)" } else { "local waves (APPROXIMATE)" }, &local);
                 if done(&local) {
-                    return local.map(|(shader, _)| shader);
+                    return local;
                 }
             }
         }
@@ -599,14 +611,14 @@ pub fn emit(
                         let local = lower::with_local_waves_any(|| emit_program(c, native, p, st, io, res));
                         report(&format!("local waves (APPROXIMATE, any mask), {name}"), &local);
                         if done(&local) {
-                            return local.map(|(shader, _)| shader);
+                            return local;
                         }
                     }
                 }
                 let local = lower::with_local_waves_any(|| emit_program(c, native, p, st, io, res));
                 report("local waves (APPROXIMATE, any mask)", &local);
                 if done(&local) {
-                    return local.map(|(shader, _)| shader);
+                    return local;
                 }
             }
         }
@@ -625,7 +637,7 @@ pub fn emit(
         if wide_last && !several && matches!(&original, Ok((_, Some(64)))) {
             let again = wide_last_form();
             if done(&again) {
-                return again.map(|(shader, _)| shader);
+                return again;
             }
         }
         // A thread group of several console waves: every form once more with the group's LDS
@@ -633,19 +645,26 @@ pub fn emit(
         // `VICTORY_WAVE_GROUP_BARRIERS=0` turns it off), and then the wave-wide form, whose
         // halves meet alone there.
         let group_on = std::env::var_os("VICTORY_WAVE_GROUP_BARRIERS").is_none_or(|v| v != "0");
+        let mut grouped = None;
         if several && group_on && matches!(&original, Ok((_, Some(64)))) {
             if why {
                 eprintln!("WAVE64-RETRY the group's LDS left to the title's barriers:");
             }
-            if let Some(Ok(shader)) = lower::with_group_barriers(|| emit(c, native, p, st, io, res)) {
-                return Ok(shader);
+            if let Some(again @ Ok(_)) = lower::with_group_barriers(|| emit_sized(c, native, p, st, io, res)) {
+                if done(&again) {
+                    return again;
+                }
+                grouped = Some(again);
             }
         }
         if wide_last && several && matches!(&original, Ok((_, Some(64)))) {
             let again = wide_last_form();
             if done(&again) {
-                return again.map(|(shader, _)| shader);
+                return again;
             }
+        }
+        if let Some(again) = grouped {
+            return again;
         }
     }
     // Cross-lane code that needs every lane of the console wave where it
@@ -665,7 +684,6 @@ pub fn emit(
         }
         other => other,
     };
-    let original = original.map(|(shader, _)| shader);
     // Retry unsupported programs only. Threading can separate an unknown
     // register value from its apparent use on a mutually exclusive path.
     if !matches!(original, Err(ShaderError::Unsupported { .. })) {
@@ -679,7 +697,7 @@ pub fn emit(
     let st = structure::structure(&p)?;
     let io = io::raise(&p, native)?;
     let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
-    emit_program(c, native, &p, &st, &io, &res).map(|(shader, _)| shader)
+    emit_program(c, native, &p, &st, &io, &res)
 }
 
 /// Whether a refusal is of cross-lane code that the wave-wide retry can fix:
