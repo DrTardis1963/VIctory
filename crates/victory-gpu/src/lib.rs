@@ -59,6 +59,7 @@ mod watch;
 
 #[cfg(windows)]
 pub use host::on_failure;
+pub use host::set_title_dir;
 #[cfg(all(windows, target_arch = "x86_64"))]
 pub use host::write_title_memory;
 #[cfg(windows)]
