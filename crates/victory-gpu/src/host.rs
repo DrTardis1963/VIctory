@@ -2148,6 +2148,11 @@ struct Deferred {
     /// indirect arguments; 0 if none. It stays readable until the next
     /// clamp into it ([`HostList::indirect_state`]).
     indirect_readable: usize,
+    /// Bytes used so far in the indirect scratch buffer during this recording.
+    indirect_used: u64,
+    /// Generation counter incremented whenever `indirect_alloc` resets to
+    /// offset 0 mid-recording (on buffer growth or wrap).
+    indirect_epoch: u64,
 }
 
 impl Deferred {
@@ -4996,6 +5001,7 @@ impl Host {
                         list.SetComputeRootUnorderedAccessView(3, inflight.table.0.GetGPUVirtualAddress());
                         list.SetComputeRootUnorderedAccessView(4, inflight.fetched.0.GetGPUVirtualAddress());
                         let mut every = true;
+                        let mut last_fetch_shadow = 0usize;
                         for r in plan.ranges.iter().filter(|r| r.compared) {
                             let Some((_, Some(_), size)) = r.shadow.card_sides() else {
                                 every = false;
@@ -5005,7 +5011,11 @@ impl Host {
                             let constants =
                                 [r.span.first, r.span.skew, size as u32, r.span.pieces, r.at * 4, inflight.landed, inflight.fetched.2, groups];
                             list.SetComputeRoot32BitConstants(0, 8, constants.as_ptr().cast(), 0);
-                            list.SetComputeRootShaderResourceView(1, r.shadow.buffer.GetGPUVirtualAddress());
+                            let key = Arc::as_ptr(&r.shadow) as usize;
+                            if key != last_fetch_shadow {
+                                list.SetComputeRootShaderResourceView(1, r.shadow.buffer.GetGPUVirtualAddress());
+                                last_fetch_shadow = key;
+                            }
                             list.Dispatch(groups, 1, 1);
                         }
                         plan.inflight = every;
@@ -7395,15 +7405,20 @@ impl HostList {
 
     /// A device-local unordered-access buffer of at least `size` bytes for
     /// clamped indirect arguments, reused across executions and resets of the
-    /// list. Smaller buffers replaced mid-list stay alive until
+    /// list at offset 0. Smaller buffers replaced mid-list stay alive until
     /// [`HostList::reset`].
     pub(crate) fn indirect_scratch(&self, size: u64) -> Option<ID3D12Resource> {
         let needed = size.max(64 << 10);
+        let aligned = needed.next_multiple_of(16);
         let mut slot = self.indirect_args.lock().unwrap_or_else(|e| e.into_inner());
         if let Some((buffer, cap)) = &*slot
             && *cap >= needed
         {
-            return Some(buffer.clone());
+            let buffer = buffer.clone();
+            drop(slot);
+            let mut d = self.deferred();
+            d.indirect_used = d.indirect_used.max(aligned);
+            return Some(buffer);
         }
         let prev = slot.as_ref().map_or(0, |(_, cap)| *cap);
         let alloc = prev
@@ -7420,7 +7435,65 @@ impl HostList {
             self.indirect_common(&old_buf);
             self.keep(&old_buf);
         }
+        {
+            let mut d = self.deferred();
+            d.indirect_used = aligned;
+            d.indirect_epoch += 1;
+        }
         Some(buffer)
+    }
+
+    /// Epoch incremented whenever [`HostList::indirect_alloc`] wraps or replaces
+    /// the scratch buffer, letting callers detect invalidated prior slices.
+    pub(crate) fn indirect_epoch(&self) -> u64 {
+        self.deferred().indirect_epoch
+    }
+
+    /// Bump-allocates a 16-byte-aligned non-overlapping `(buffer, dst_offset)`
+    /// slice of at least `size` bytes inside the list's scratch buffer so
+    /// multiple clamped indirect windows stay intact without barriers between.
+    pub(crate) fn indirect_alloc(&self, size: u64) -> Option<(ID3D12Resource, u64)> {
+        const INITIAL_CAP: u64 = 256 << 10;
+        const MAX_BUMP_CAP: u64 = 16 << 20;
+        let aligned = size.max(4).next_multiple_of(16);
+        let at = self.deferred().indirect_used;
+        let mut slot = self.indirect_args.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((buffer, cap)) = &*slot {
+            if at.saturating_add(aligned) <= *cap {
+                let buffer = buffer.clone();
+                drop(slot);
+                self.deferred().indirect_used = at + aligned;
+                return Some((buffer, at));
+            }
+            if *cap >= MAX_BUMP_CAP && aligned <= *cap {
+                let buffer = buffer.clone();
+                drop(slot);
+                let mut d = self.deferred();
+                d.indirect_used = aligned;
+                d.indirect_epoch += 1;
+                return Some((buffer, 0));
+            }
+        }
+        let prev = slot.as_ref().map_or(0, |(_, cap)| *cap);
+        let alloc = prev
+            .saturating_mul(2)
+            .max(aligned)
+            .max(INITIAL_CAP)
+            .next_multiple_of(64 << 10);
+        let buffer = host()?.uav_buffer(alloc)?;
+        name(&buffer, || format!("indirect arguments {alloc:#x}"));
+        let old = slot.replace((buffer.clone(), alloc));
+        drop(slot);
+        if let Some((old_buf, _)) = old {
+            self.indirect_common(&old_buf);
+            self.keep(&old_buf);
+        }
+        {
+            let mut d = self.deferred();
+            d.indirect_used = aligned;
+            d.indirect_epoch += 1;
+        }
+        Some((buffer, 0))
     }
 
     /// Moves `scratch` back to the common state if a clamp left it readable
