@@ -1323,6 +1323,11 @@ impl State {
         // Depth textures it writes through unordered access: their colour
         // twins hold what they lack from here on.
         list.twins_written();
+        // It may write the arguments active windows hold clamped; draws
+        // that store to no buffer keep them.
+        if p.stages.iter().any(|s| s.translated().stores) {
+            self.windows.clear();
+        }
         true
     }
 
@@ -2582,7 +2587,6 @@ impl State {
     /// Runs a mesh dispatch of `x` groups on the host (the title's mesh
     /// programs are one-dimensional).
     pub(crate) fn dispatch_mesh(&mut self, list: &HostList, x: u32) {
-        self.windows.clear();
         #[cfg(feature = "diagnostics")]
         self.trace("mesh", x, 0);
         let ran = mesh_test() != 1
@@ -3021,7 +3025,6 @@ impl State {
         first: u32,
         first_instance: u32,
     ) {
-        self.windows.clear();
         #[cfg(feature = "diagnostics")]
         self.trace("draw", vertices, first);
         let ready = self.prepare(list, false);
@@ -3126,7 +3129,6 @@ impl State {
         base: i32,
         first_instance: u32,
     ) {
-        self.windows.clear();
         #[cfg(feature = "diagnostics")]
         self.trace("indexed", indices, first);
         // Indexed rectangles are drawn by the rectangle geometry stage
