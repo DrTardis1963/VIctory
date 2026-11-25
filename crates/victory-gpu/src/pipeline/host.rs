@@ -1207,15 +1207,7 @@ mod tests {
         }
         // The software adapter (CI runners) reports depth bounds but draws
         // through them; only a card's result is checked.
-        use windows::Win32::Graphics::Dxgi::*;
-        // SAFETY: plain DXGI queries of the device's own adapter.
-        let software = unsafe {
-            CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
-                .and_then(|f| f.EnumAdapterByLuid::<IDXGIAdapter1>(host.device.GetAdapterLuid()))
-                .and_then(|a| a.GetDesc1())
-        }
-        .is_ok_and(|d| d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0);
-        if software {
+        if host.software() {
             eprintln!("software adapter; skipped");
             return;
         }

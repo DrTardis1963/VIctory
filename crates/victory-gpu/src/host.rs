@@ -7000,6 +7000,20 @@ pub(crate) fn legal_for(flags: u32, state: u32) -> u32 {
 }
 
 impl Host {
+    /// Whether the device is on Microsoft's software rasteriser: WARP, or
+    /// the Basic Render Driver a machine without a card (a CI runner) falls
+    /// back to, which DXGI does not always flag as software, so Microsoft's
+    /// vendor id counts too.
+    #[cfg(test)]
+    pub(crate) fn software(&self) -> bool {
+        const MICROSOFT: u32 = 0x1414;
+        // SAFETY: a plain query of the device's own adapter.
+        self.adapter
+            .as_ref()
+            .and_then(|a| unsafe { a.GetDesc1() }.ok())
+            .is_some_and(|d| d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0 || d.VendorId == MICROSOFT)
+    }
+
     /// The card's memory as the system accounts it to this process, in
     /// bytes: the budget and the use of the card's own memory, then of the
     /// PC's memory shared with the card (where the system moves what does
