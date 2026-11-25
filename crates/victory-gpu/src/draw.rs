@@ -69,7 +69,7 @@ thread_local! {
     /// While `State::early_textures` runs the texture pass: the
     /// milliseconds and the bytes that run may take, in place of the
     /// pass's own per frame.
-    static PASS_BUDGET: std::cell::Cell<Option<(u64, u64)>> = const { std::cell::Cell::new(None) };
+    static PASS_BUDGET: std::cell::Cell<Option<(u64, u64, bool)>> = const { std::cell::Cell::new(None) };
 }
 
 /// The milliseconds of every frame the pass that uploads textures picked
@@ -1790,10 +1790,11 @@ impl State {
         }
         let left = bake_ms.saturating_sub(BAKED_MS.load(Ordering::Relaxed));
         let budget = if bake && left > 0 {
-            // What a bake may read must be there now: up to 2 GiB.
-            Some((left, 2 << 30))
+            // What a bake may read must be there now: up to 2 GiB, with the
+            // card filled up to 97 % of its budget (`resource::bake_room`).
+            Some((left, 2 << 30, true))
         } else if first && early_ms > 0 {
-            Some((early_ms, 64 << 20))
+            Some((early_ms, 64 << 20, false))
         } else if bake {
             // The frame's bakes have had their time: its own sources only.
             None
@@ -2047,7 +2048,11 @@ impl State {
             let due = now.saturating_sub(MARKED_AT.load(Ordering::Relaxed)) >= MARK_EVERY_MS;
             MARKING.store(due, Ordering::Relaxed);
         }
-        let mut room = crate::resource::room();
+        // A decoration bake may fill the card further (after fxceless/victory-fork
+        // #1097): a skin source refused there is baked black for the whole run.
+        let is_bake = PASS_BUDGET.get().is_some_and(|(_, _, b)| b);
+        let check_room = || if is_bake { crate::resource::bake_room() } else { crate::resource::room() };
+        let mut room = check_room();
         // Bytes uploaded by this pass since the card was last asked
         // whether it has room: asked again every 32 MiB (a pass may upload
         // 192 MB and more, and one asking a pass let the queue run some
@@ -2135,7 +2140,7 @@ impl State {
         // own: its bytes on top of what the frame has spent so far.
         // (Not `most`: that is the longest wait between looks, used below.)
         let (span, bytes_at_most) = match PASS_BUDGET.get() {
-            Some((ms, bytes)) => {
+            Some((ms, bytes, _)) => {
                 (std::time::Duration::from_millis(ms), SPENT.load(Ordering::Relaxed).saturating_add(bytes))
             }
             None => (span, per_frame),
@@ -2352,7 +2357,7 @@ impl State {
             since_asked += bytes;
             if room && since_asked >= 32 << 20 {
                 since_asked = 0;
-                room = crate::resource::room();
+                room = check_room();
             }
             HEAP_TEXTURE_BYTES.fetch_add(bytes, Ordering::Relaxed);
             HEAP_TEXTURES.fetch_add(1, Ordering::Relaxed);
