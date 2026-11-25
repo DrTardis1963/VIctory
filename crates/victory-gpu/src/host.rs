@@ -6748,9 +6748,11 @@ fn title_logo(dir: &std::path::Path, attribute: &str) -> Option<std::path::PathB
 /// Gives the window the title's own logo as its icon (title bar and taskbar),
 /// read from the user's files: nothing of the title's is in this tree.
 fn set_title_icon(hwnd: HWND) {
-    let Some(dir) = TITLE_DIR.get() else { return };
+    // VICTORY_ICON names a PNG shown instead of the title's own logos.
+    let own = std::env::var_os("VICTORY_ICON").and_then(|p| std::fs::read(p).ok());
     for (attribute, which) in [("Square150x150Logo", ICON_BIG), ("Square44x44Logo", ICON_SMALL)] {
-        let Some(png) = title_logo(dir, attribute).and_then(|p| std::fs::read(p).ok()) else {
+        let logo = || title_logo(TITLE_DIR.get()?, attribute).and_then(|p| std::fs::read(p).ok());
+        let Some(png) = own.clone().or_else(logo) else {
             continue;
         };
         // SAFETY: PNG bytes of that length; a PNG is a valid icon image since Vista.
