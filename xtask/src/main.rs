@@ -1,6 +1,7 @@
 //! Repository maintenance. Run with `cargo xtask <command>`.
 
 mod policy;
+mod todo;
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -26,12 +27,24 @@ enum Cmd {
     },
     /// Point git at .githooks/ so every commit runs the policy check.
     InstallHooks,
+    /// Rank the unimplemented imports titles called, most hit first: the
+    /// HLE to-do list. Reads stub ledgers kept by `victory run --report
+    /// <dir>` (a report folder or its `stub-hits.tsv`; several are merged).
+    Todo {
+        /// Report folders or ledger files.
+        #[arg(required = true)]
+        reports: Vec<PathBuf>,
+        /// Show only the top N.
+        #[arg(long, short = 'n')]
+        limit: Option<usize>,
+    },
 }
 
 fn main() -> Result<()> {
     let root = workspace_root();
     match Cli::parse().command {
         Cmd::Policy { staged } => policy::run(&root, staged),
+        Cmd::Todo { reports, limit } => todo::run(&reports, limit),
         Cmd::InstallHooks => {
             let status = Command::new("git")
                 .args(["config", "core.hooksPath", ".githooks"])

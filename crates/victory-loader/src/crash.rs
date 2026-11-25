@@ -553,6 +553,7 @@ unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
 pub unsafe fn report_unhandled(info: *const EXCEPTION_POINTERS) {
     // SAFETY: forwarded from the caller.
     unsafe { report("unhandled exception", info, true) };
+    crate::flush_stub_ledger();
 }
 
 /// The bytes at `at` as hex, as many as the longest x86 instruction (15),

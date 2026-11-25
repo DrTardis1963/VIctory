@@ -5,7 +5,6 @@ use std::ffi::{CString, c_void};
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
 
 use anyhow::{Context, Result, bail};
 use victory_pe::{ImageInfo, ImportSymbol};
@@ -254,12 +253,7 @@ impl LoadedImage {
         if !unresolved.is_empty() {
             let mut block = ThunkBlock::new(unresolved.len())?;
             for (slot, dll, symbol) in unresolved {
-                let site: &'static ImportSite = Box::leak(Box::new(ImportSite {
-                    dll: dll.to_owned(),
-                    symbol: symbol.to_string(),
-                    policy,
-                    calls: AtomicU64::new(0),
-                }));
+                let site = ImportSite::leak(dll, &symbol.to_string(), policy);
                 slots.push((slot, block.emit(site)?));
                 report.missing.push(MissingImport {
                     dll: site.dll.clone(),

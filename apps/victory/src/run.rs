@@ -42,6 +42,7 @@ pub fn run(
     strict: bool,
     execute: bool,
     console: Console,
+    report: Option<&Path>,
 ) -> Result<u32> {
     use std::sync::Arc;
     use victory_hle::{HleResolver, HostPolicy};
@@ -49,6 +50,15 @@ pub fn run(
 
     if execute {
         check_cpu_features()?;
+    }
+    // Before anything is bound, so a bad folder fails before the title runs.
+    if let Some(dir) = report {
+        victory_core::ensure_outside_repo(dir)?;
+        std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+        let ledger = dir.join("stub-hits.tsv");
+        victory_loader::record_stub_hits_to(ledger.clone())
+            .with_context(|| format!("writing {}", ledger.display()))?;
+        println!("stub ledger    {}", ledger.display());
     }
     // A title that relaunched itself: the old process must be gone first.
     victory_hle::modules::lifecycle::wait_for_previous();
@@ -188,7 +198,9 @@ pub fn run(
     let main = unsafe { Arc::new(image).spawn_main(dlls)? };
     let code = main
         .join()
-        .map_err(|_| anyhow::anyhow!("title main thread panicked"))??;
+        .map_err(|_| anyhow::anyhow!("title main thread panicked"));
+    victory_loader::flush_stub_ledger();
+    let code = code??;
     println!("title exited with {code}");
     Ok(code)
 }
@@ -545,6 +557,13 @@ mod cpu_check_tests {
 }
 
 #[cfg(not(windows))]
-pub fn run(_: &Path, _: Unimplemented, _: bool, _: bool, _: Console) -> Result<u32> {
+pub fn run(
+    _: &Path,
+    _: Unimplemented,
+    _: bool,
+    _: bool,
+    _: Console,
+    _: Option<&Path>,
+) -> Result<u32> {
     anyhow::bail!("running titles requires Windows")
 }

@@ -50,7 +50,10 @@ pub use stacks::{dump_stacks, dump_stacks_on_schedule};
 #[cfg(windows)]
 pub use threads::disable_thread_calls;
 #[cfg(windows)]
-pub use thunks::{UnimplementedPolicy, unimplemented_call_count};
+pub use thunks::{
+    StubHit, UnimplementedPolicy, flush_stub_ledger, record_stub_hits_to, stub_hits,
+    unimplemented_call_count, write_stub_ledger,
+};
 #[cfg(windows)]
 pub use windows::{
     BindReport, LoadedImage, MissingImport, WithTitleDlls, load, load_title_dll, load_title_dlls,

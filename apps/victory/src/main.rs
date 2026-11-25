@@ -115,6 +115,11 @@ enum Command {
         /// The console model the title sees (device type, memory).
         #[arg(long, value_enum, default_value_t = Console::SeriesX)]
         console: Console,
+        /// Keep the stub ledger in this folder (outside the repository):
+        /// `stub-hits.tsv`, every unimplemented import called, its hit
+        /// count and first caller. `cargo xtask todo <dir>` ranks it.
+        #[arg(long, value_name = "DIR")]
+        report: Option<PathBuf>,
         /// Arguments for the title, after `--` (it reads the whole command
         /// line; a title that relaunches itself passes some).
         #[arg(last = true)]
@@ -183,9 +188,17 @@ fn main() -> Result<()> {
             strict,
             execute,
             console,
+            report,
             title_args: _,
         } => {
-            let code = run::run(&exe, unimplemented, strict, execute, console)?;
+            let code = run::run(
+                &exe,
+                unimplemented,
+                strict,
+                execute,
+                console,
+                report.as_deref(),
+            )?;
             if code != 0 {
                 // Preserve all 32 bits of the Windows process status.
                 std::process::exit(code as i32);

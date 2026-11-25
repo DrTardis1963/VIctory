@@ -130,9 +130,15 @@ victory shader-info [paths...] [--verbose] [--disasm] [--effects]
 victory translate [paths...] [--validate] [--pipelines] [--list] [--jobs N]
 victory translate [paths...] --cache [--pipelines] [--jobs N]
 victory run <exe> [--execute] [--unimplemented trap|zero] [--strict]
-            [--console series-x|series-s] [-- <title arguments>]
+            [--console series-x|series-s] [--report <dir>] [-- <title arguments>]
 victory config
 ```
+
+The HLE to-do list: `victory run <exe> --execute --unimplemented zero
+--report <dir>` keeps `<dir>/stub-hits.tsv` (outside the repository), every
+unimplemented import the title called with its hit count and first caller
+(`module+rva`). `cargo xtask todo <dir>...` merges such reports and ranks
+the imports, most hit first.
 
 Logging: `VICTORY_LOG=victory_loader=trace,info` (a release build logs
 info and above).
