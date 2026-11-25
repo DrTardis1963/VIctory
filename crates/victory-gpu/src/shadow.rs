@@ -2516,12 +2516,17 @@ impl Shadow {
         if !busy.is_empty() {
             // Around ranges shaders are writing: the gaps, each as below
             // (in the world most submissions have such ranges; copying the
-            // gaps whole cost ~1 s per frame).
+            // gaps whole cost ~1 s per frame). Under them, what the title
+            // wrote since it was taken (`update_busy`).
             busy.sort_unstable();
             let (mut at, mut bytes) = (from, 0);
             for (a, e) in busy {
+                let (a, e) = (a.max(from), e.min(to));
                 if a > at {
                     bytes += self.update_free(at, a);
+                }
+                if e > a.max(at) {
+                    bytes += self.update_busy(a.max(at), e);
                 }
                 at = at.max(e);
             }
@@ -2531,6 +2536,67 @@ impl Shadow {
             return bytes;
         }
         self.update_free(from, to)
+    }
+
+    /// [`Shadow::update`] of `[from, to)` where a list submitted earlier
+    /// declared that shaders write. A submission waits for the one before it,
+    /// so none of this submission's shaders has run yet: the pages the title
+    /// wrote since they were taken are copied as anywhere else. Skipped, the
+    /// title's constants there stayed stale for the whole submission (a
+    /// dispatch read its sizes as zeros and looped until the device was
+    /// removed). The same bytes go into the snapshot `writing` took, so
+    /// copy-back neither takes them for the GPU's nor puts them back over a
+    /// later title write.
+    fn update_busy(&self, from: usize, to: usize) -> usize {
+        // shortcut: write-watched copies with a snapshot in PC memory only;
+        // a copy on the card or memory not watched keeps the old behaviour.
+        if self.card.is_some() || self.watched.load(Ordering::Relaxed) == NOT_WATCHED {
+            return 0;
+        }
+        let Some((now, written)) = crate::watch::writes(from, to, true) else {
+            return 0;
+        };
+        // Only pages the title wrote after their last copy: a page never
+        // written stays as taken (a flight in the air may be writing it;
+        // `stale_under_flights` settles flights under title writes first).
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let base = start / PAGE;
+        let mut runs: Vec<(usize, usize)> = Vec::new();
+        {
+            let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+            for &(page, write) in &written {
+                let Some(at) = copied.get_mut(page.wrapping_sub(base)) else {
+                    continue;
+                };
+                if write == 0 || write <= *at {
+                    continue;
+                }
+                let (a, b) = ((page * PAGE).max(from), ((page + 1) * PAGE).min(to));
+                if a >= b {
+                    continue;
+                }
+                if (page * PAGE).max(start) >= from && ((page + 1) * PAGE).min(end) <= to {
+                    *at = now;
+                }
+                match runs.last_mut() {
+                    Some(last) if last.1 == a => last.1 = b,
+                    _ => runs.push((a, b)),
+                }
+            }
+        }
+        let mut bytes = 0;
+        for (a, b) in runs {
+            bytes += self.copy(a, b);
+            let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(snapshot) = before.as_mut() {
+                let (s, e) = (a - start, b - start);
+                debug_assert!(e <= snapshot.capacity());
+                // SAFETY: the copy's mapping and the snapshot's allocation
+                // (`pooled`) both hold the copy's bytes, and `e` is inside it.
+                unsafe { std::ptr::copy_nonoverlapping(self.data.add(s), snapshot.as_mut_ptr().add(s), e - s) };
+            }
+        }
+        bytes
     }
 
     /// [`Shadow::update`] of `[from, to)` (inside the buffer) where no
@@ -3333,4 +3399,58 @@ pub(crate) fn near(va: u64) -> String {
         ));
     }
     text
+}
+
+#[cfg(test)]
+mod busy_tests {
+    use super::{PAGE, find, register, unregister};
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+    };
+    const MEM_WRITE_WATCH: u32 = 0x20_0000;
+
+    /// The title writes a constant under a range an earlier list of the
+    /// submission declared as written by shaders: the refresh before the
+    /// submission runs still brings it to the copy, a shader's write still
+    /// goes back, and a title write made after the refresh is not undone.
+    #[test]
+    fn title_writes_under_a_busy_range_are_copied() {
+        let len = 2 * PAGE;
+        // SAFETY: a fresh write-watched allocation, freed at the end.
+        let p = unsafe {
+            VirtualAlloc(std::ptr::null(), len, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE)
+        } as usize;
+        assert_ne!(p, 0);
+        let done = || {
+            unregister(p, p as u64);
+            // SAFETY: our allocation.
+            unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+        };
+        register(p, p as u64, len as u64);
+        let Some(copy) = find(p as u64, len as u64) else {
+            return done(); // no host GPU here
+        };
+        if copy.place.is_some() || copy.card.is_some() {
+            return done(); // in place or on the card: no PC-side snapshot to check
+        }
+        let title = |at: usize| (p + at) as *mut u8;
+        // SAFETY: (all reads and writes below) bytes of our pool and of the copy's mapping.
+        let host = |at: usize| unsafe { copy.data.add(at).read_volatile() };
+        copy.update(p, len);
+        // An earlier list declares all of it as written by shaders.
+        copy.writing(p, len);
+        unsafe { title(PAGE + 20).write_volatile(0x55) };
+        assert!(copy.update(p + PAGE + 16, 16) > 0, "the title's write is copied");
+        assert_eq!(host(PAGE + 20), 0x55, "the title's constant reaches the copy");
+        // The shaders run: one byte written. The title writes meanwhile.
+        unsafe { copy.data.add(10).write_volatile(0xaa) };
+        unsafe { title(PAGE + 20).write_volatile(0x66) };
+        copy.copy_back(p, len);
+        unsafe {
+            assert_eq!(title(10).read_volatile(), 0xaa, "the shader's write goes back");
+            assert_eq!(title(PAGE + 20).read_volatile(), 0x66, "the title's later write stays");
+        }
+        drop(copy);
+        done();
+    }
 }
