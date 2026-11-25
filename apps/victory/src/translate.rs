@@ -455,7 +455,7 @@ pub fn warm(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool) -> Result
                             let compute = pipelines && stage == "compute";
                             let (translated, pipeline) = victory_hle::modules::d3d12x::warm(stage, bytes, compute);
                             let count = if translated { &done } else { &refused };
-                            let n = count.fetch_add(1, Ordering::Relaxed) + 1;
+                            count.fetch_add(1, Ordering::Relaxed);
                             match pipeline {
                                 Some(true) => made.fetch_add(1, Ordering::Relaxed),
                                 Some(false) => unmade.fetch_add(1, Ordering::Relaxed),
