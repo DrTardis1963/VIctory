@@ -1447,7 +1447,8 @@ pub(crate) fn host_made<'a>(
 /// by this process is under nine tenths of the budget the system gives it
 /// ([`room_percent`] says another share; `VICTORY_TEXTURE_BUDGET_MB` sets a
 /// limit on those copies' bytes instead). Past the budget the system moves
-/// the card's memory into the PC's, which ended runs 20 and 24.
+/// the card's memory into the PC's, which ended runs 20 and 24; so past it
+/// only up to half the shared budget (`VICTORY_TEXTURE_SPILL`).
 #[cfg(windows)]
 pub(crate) fn room() -> bool {
     use std::sync::atomic::Ordering::Relaxed;
@@ -1465,8 +1466,20 @@ pub(crate) fn room() -> bool {
     if filled < FLOOR {
         return true;
     }
+    // Past the card's own memory, into the PC's memory the system shares
+    // with it (`VICTORY_TEXTURE_SPILL=0`: the card's alone, as before): up
+    // to half the shared budget, the rest left to the title. On an 8 GB card
+    // the card's share was reached just before the opening cutscene, and
+    // the 19,000 textures still waiting (skin, clothes) were sampled empty:
+    // black faces. A texture there is read over the bus: slower, not missing.
+    static SPILL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let spill = *SPILL.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_SPILL").is_none_or(|v| v != "0"));
     match crate::host::host().and_then(|h| h.video_memory()) {
-        Some([budget, used, ..]) => used < budget / 100 * room_percent(),
+        Some([budget, used, ..]) if !spill => used < budget / 100 * room_percent(),
+        Some([budget, used, shared_budget, shared_used]) => {
+            let own = budget / 100 * room_percent();
+            used < own || used + shared_used < own + shared_budget / 2
+        }
         None => filled < WITHOUT_BUDGET,
     }
 }
