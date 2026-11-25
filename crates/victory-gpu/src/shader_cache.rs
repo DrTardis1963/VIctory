@@ -183,6 +183,8 @@ fn settings() -> Vec<u8> {
         "VICTORY_HEAP_USAGE",
         // Whether the ray-tracing node test always misses.
         "VICTORY_RT_MISS",
+        // Whether the structure builder's atomics stand between fences.
+        "VICTORY_BVH_FENCES",
     ] {
         bytes.extend_from_slice(name.as_bytes());
         bytes.push(b'=');
