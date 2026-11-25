@@ -18,7 +18,27 @@ ter a sua própria cópia. Nada aqui tem ligação com o desenvolvedor ou a
 editora do jogo, nem é aprovado por eles.
 
 Origem: [VIctory](https://github.com/Marvisak/VIctory) → [fxceless/victory-fork](https://github.com/fxceless/victory-fork) → este fork.
-A branch de trabalho é `base/fxceless`; a `main` acompanha ela.
+A branch de trabalho é a `main`.
+
+## O que só este fork faz
+
+Resultados que não existem nas árvores de origem, cada um com o commit que dá para conferir:
+
+- **Texturas em resolução cheia numa placa de 8 GB, sem rosto preto** (`44823d61`, `da32cb58`,
+  `719e3b15`). Os shaders de pixel e de compute marcam quais texturas do heap de views leem de
+  verdade; a placa guarda essas e tira primeiro as menos usadas. Antes, as ~116 mil texturas do
+  heap iam para a placa por ordem de escrita, ela enchia e ~17 mil eram descartadas e lidas como
+  zero: pele, cabelo e roupa saíam pretos. A ideia de marcar os slots vem do PR #1962 do VIctory,
+  reescrita para esta árvore.
+- **Seções ordenadas de pixel do console (POPS) como ROV** (`913b2f36`, `8107d596`): os 10 shaders
+  de recorte de cabelo e roupa dos personagens, recusados pelas outras árvores, traduzem e criam
+  pipeline em placas com Rasterizer Ordered Views.
+- **Samplers escolhidos por desvio e raios de sombra com endereço lido do heap** (`05e719b3`,
+  `4699d89a`): 44 shaders a mais traduzidos. Com os itens acima, **25.750 de 25.758** shaders
+  traduzem numa placa de 32 lanes (contagem do `victory translate`).
+- **Modo de tela do monitor** (`VICTORY_DISPLAY_MODE=1920x1080`): os render targets caem de
+  3,4 GB para 2,5 GB numa tela 1080p.
+
 
 ## Estado (25/11/2026)
 
