@@ -2274,7 +2274,25 @@ impl State {
             // submission that samples it.
             let tabled = crate::texture::is_staged(resource);
             if let Some(view) = &view {
-                readable(list, sampled.kind, view);
+                // Levels on demand: the room this pass found for the
+                // texture is its levels' too. Their tiles are given when
+                // the list is submitted, and the card was asked again
+                // there: by then the pass had filled it to its line, or
+                // was past it, spilling. The texture was made and read
+                // zeros, black, for as long as the card stayed full (the
+                // prison scene on an 8 GB card: 678 such uploads in half a
+                // minute, 13 MB of tiles on 697 textures; a head and a
+                // shirt black for the whole shot). An upload let through
+                // on a full card as taking no memory still asks there.
+                // shortcut: the tiles a pass promises count only once its
+                // lists are submitted, so one pass can go its byte budget
+                // past the line; count them in `resource::room` if the
+                // card then runs over.
+                if room {
+                    crate::texture::whatever_the_room(|| readable(list, sampled.kind, view));
+                } else {
+                    readable(list, sampled.kind, view);
+                }
             }
             // A texture view the host refuses removes the device: name it.
             static GONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);

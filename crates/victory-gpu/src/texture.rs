@@ -861,7 +861,8 @@ thread_local! {
 /// level by level the card's memory for every level the title holds,
 /// whatever room the card has. For what is read once (`draw.rs`
 /// `bake_sources`): a level left waiting for room reads zeros, and nothing
-/// reads it a second time.
+/// reads it a second time. And for what the texture pass found room for
+/// (`draw.rs` `heap_textures`): the card is not asked a second time.
 pub(crate) fn whatever_the_room<R>(f: impl FnOnce() -> R) -> R {
     WHATEVER_THE_ROOM.set(true);
     let out = f();
