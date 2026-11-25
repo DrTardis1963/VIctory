@@ -66,6 +66,13 @@ pub(crate) struct Shader {
     /// Its result gets the least indirect light ([`crate::ambient`]).
     #[cfg(windows)]
     pub(crate) resolves_light: bool,
+    /// It draws the sky as the title reflects it ([`crate::ambient::SKY`]).
+    #[cfg(windows)]
+    pub(crate) draws_sky: bool,
+    /// It writes the title's reflections for the last time in a frame
+    /// ([`crate::ambient::REFLECTED`]).
+    #[cfg(windows)]
+    pub(crate) ends_reflections: bool,
 }
 
 impl std::fmt::Debug for Shader {
@@ -104,7 +111,13 @@ pub(crate) fn kept() -> [u64; 7] {
 /// indirect light ([`crate::ambient::PROGRAM`], by its name inside).
 #[cfg(windows)]
 fn resolves_light(bytes: &[u8]) -> bool {
-    bytes.windows(crate::ambient::PROGRAM.len()).any(|w| w == crate::ambient::PROGRAM)
+    named(bytes, crate::ambient::PROGRAM)
+}
+
+/// Whether a container holds `name` (a program's name inside it).
+#[cfg(windows)]
+fn named(bytes: &[u8], name: &[u8]) -> bool {
+    bytes.windows(name.len()).any(|w| w == name)
 }
 
 /// The shared container for `bytes`.
@@ -125,6 +138,10 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                 translated: OnceLock::new(),
                 #[cfg(windows)]
                 resolves_light: resolves_light(bytes),
+                #[cfg(windows)]
+                draws_sky: named(bytes, crate::ambient::SKY),
+                #[cfg(windows)]
+                ends_reflections: named(bytes, crate::ambient::REFLECTED),
             })
         })
         .clone()
@@ -144,6 +161,8 @@ pub fn warm(stage: &'static str, container: &[u8], compute: bool) -> (bool, Opti
         container: container.to_vec(),
         translated: OnceLock::new(),
         resolves_light: resolves_light(container),
+        draws_sky: named(container, crate::ambient::SKY),
+        ends_reflections: named(container, crate::ambient::REFLECTED),
     });
     let translated = shader.translated().is_some();
     let made = (translated && compute).then(|| make::warm(vec![shader]));

@@ -490,6 +490,8 @@ mod tests {
             container: Vec::new(),
             translated: OnceLock::new(),
             resolves_light: false,
+            draws_sky: false,
+            ends_reflections: false,
         });
         let early_one = Arc::new(Pending::new(vec![cs.clone()], None));
         early(&early_one);
