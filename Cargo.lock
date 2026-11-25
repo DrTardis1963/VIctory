@@ -727,6 +727,7 @@ dependencies = [
  "blake3",
  "tempfile",
  "thiserror",
+ "toml",
  "tracing",
  "victory-core",
  "victory-pe",
@@ -912,5 +913,8 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "serde",
+ "toml",
+ "victory-core",
  "walkdir",
 ]

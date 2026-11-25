@@ -79,6 +79,7 @@ pub fn log_crash(text: &str) {
 
 fn append_to_log(text: &str) {
     use std::io::Write;
+    crate::thunks::save_ledger();
     let Some(file) = LOG.get() else { return };
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -121,10 +122,11 @@ fn title_output() -> String {
 /// Set along with the crash log, so a crash queries nothing.
 static HOST: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
-/// What ends a crash report: the host, then the title's last debug output.
+/// What ends a crash report: the host, the unimplemented imports called so
+/// far, then the title's last debug output.
 fn report_end() -> String {
     let host = HOST.get().map_or("", String::as_str);
-    format!("{host}{}", title_output())
+    format!("{host}{}{}", crate::thunks::report_lines(), title_output())
 }
 
 /// The line [`HOST`] holds.

@@ -170,6 +170,10 @@ pub fn run(
     }
     victory_loader::report_crashes();
     victory_loader::log_crashes_to(temp.with_file_name("crashes.log"));
+    // What `cargo xtask todo` ranks: the unimplemented imports called.
+    let ledger = temp.with_file_name("unimplemented.toml");
+    println!("ledger         {}", ledger.display());
+    victory_loader::save_unimplemented_to(ledger.clone());
     victory_hle::runtime::use_console_timers();
     #[cfg(feature = "diagnostics")]
     diagnostics(&image, &cfg);
@@ -189,6 +193,7 @@ pub fn run(
     let code = main
         .join()
         .map_err(|_| anyhow::anyhow!("title main thread panicked"))??;
+    victory_loader::save_unimplemented_to(ledger);
     println!("title exited with {code}");
     Ok(code)
 }

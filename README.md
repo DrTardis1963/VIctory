@@ -70,6 +70,12 @@ cargo test --workspace                   # needs no game data
 cargo run -p victory -- config           # check your paths
 ```
 
+Before a commit, `cargo xtask gate` runs the whole check (asset policy,
+clippy, clippy with every feature, tests) and prints only what failed; the
+full logs go to `target\xtask-gate\`. `--changed` checks only the packages
+changed since `origin/main` and those depending on them, `--keep-going`
+runs every step after a failure, and `--json` prints the summary as JSON.
+
 Run the title:
 
 ```powershell
@@ -193,7 +199,16 @@ The on/off switches below (`...=1`) are off when unset or set to `0`.
 | `VICTORY_XMA_DUMP=<dir>` | saves the first 32 XMA voices' context and input |
 
 Every build appends unhandled exceptions, panics, and host GPU failures to
-`crashes.log` in the title's data folder.
+`crashes.log` in the title's data folder. Each report lists the
+unimplemented imports called so far, with where each was first called from.
+
+Beside it, `unimplemented.toml` lists every unimplemented import the title
+called, with call counts and first caller. It is updated when an import is
+first called, on a crash, and at exit. `cargo xtask todo` ranks the imports
+from every title's list (or from the files you name) and shows which HLE
+module serves each DLL, which is where the implementation goes. Run with
+`--unimplemented zero` to collect them all in one run instead of stopping at
+the first.
 
 For a startup breakpoint (`0x80000003`), run the diagnostics build with
 `VICTORY_CRASH_BREAKPOINTS=1`. Keep the console output along with the new
