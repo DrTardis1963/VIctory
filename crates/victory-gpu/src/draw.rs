@@ -377,6 +377,17 @@ pub(crate) static HEAP_TEXTURES_WAITING: AtomicU64 = AtomicU64::new(0);
 pub(crate) static HEAP_TEXTURES_FULL: AtomicU64 = AtomicU64::new(0);
 /// Slots given up for lack of room, since the start.
 pub(crate) static HEAP_TEXTURES_EVICTED: AtomicU64 = AtomicU64::new(0);
+/// Uploads of textures already on the card made while it had no room for
+/// new ones, since the start.
+pub(crate) static HEAP_TEXTURES_REUPLOADED_FULL: AtomicU64 = AtomicU64::new(0);
+
+/// Whether a texture that has its host copy is still brought up to date
+/// while the card has no room for new ones (`VICTORY_REUPLOAD_WHEN_FULL=0`:
+/// no).
+fn reupload_when_full() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_REUPLOAD_WHEN_FULL").is_none_or(|v| v != "0"))
+}
 /// Heap slots shaders marked as taken (`SLOT_HEAP_USED`), since the start.
 pub(crate) static HEAP_SLOTS_USED: AtomicU64 = AtomicU64::new(0);
 
@@ -1888,17 +1899,29 @@ impl State {
                 continue;
             }
             // From here on a host texture is made: not without room. The
-            // slot stays due.
+            // slot stays due, unless it already holds its host texture and
+            // bringing it up to date takes no new card memory.
             if !room {
-                // Slots keep the copies of what they showed, so the card
-                // stayed full for the rest of the run (uploads stopped at
-                // 14 GB with 4,500 slots due): the least recently used gave
-                // theirs up above, but not the last seconds'.
-                refused += 1;
-                if refused > 256 {
-                    break;
+                let has_its_texture = reupload_when_full()
+                    && heap.handle(index).is_some_and(|handle| host.texture_slot_made_from(index, handle));
+                if !has_its_texture {
+                    // Slots keep the copies of what they showed, so the card
+                    // stayed full for the rest of the run: the least recently used
+                    // gave theirs up above, but not the last seconds'.
+                    refused += 1;
+                    if refused > 256 {
+                        break;
+                    }
+                    continue;
                 }
-                continue;
+                let n = HEAP_TEXTURES_REUPLOADED_FULL.fetch_add(1, Ordering::Relaxed) + 1;
+                if n == 1 || n.is_multiple_of(500) {
+                    tracing::info!(
+                        so_far = n,
+                        slot = index,
+                        "a texture already on the card is brought up to date although the card has no room for new ones"
+                    );
+                }
             }
             // Under a budget (early or bake pass): recheck time before the
             // heavy work of making and staging a texture, and cap each
