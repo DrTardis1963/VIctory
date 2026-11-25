@@ -1802,6 +1802,51 @@ mod piece_tests {
     }
 }
 
+/// The pages of `[a, e)` (title addresses, `a < e`) that a copy whose
+/// first page is `base` must take from title memory before it holds the
+/// title's bytes: those it never took (`copied` 0), whether or not the
+/// title wrote them since tracking began, and those `written` (as
+/// `crate::watch::writes` gives it, by page in order) shows written after
+/// the copy took them. As [`Shadow::copy_stale`] decides it.
+///
+/// [`Shadow::stale_under_writes`] and [`Shadow::merge_under_writes`] looked
+/// at `written` alone, so a page of a range shaders may be writing that the
+/// copy never took, and the title had not written lately, was neither
+/// merged nor a reason to settle; the refresh leaves such ranges alone, and
+/// shaders read zeros there (fxceless/victory-fork#206: missing geometry
+/// with `VICTORY_LATE_WAIT`/`VICTORY_RELAY`).
+fn stale_pages_in(base: usize, copied: &[u64], a: usize, e: usize, written: &[(usize, u64)]) -> Vec<usize> {
+    (a / PAGE..e.div_ceil(PAGE))
+        .filter(|&page| page >= base)
+        .filter(|&page| match copied.get(page - base) {
+            None => false,
+            Some(0) => true,
+            Some(&at) => written
+                .binary_search_by_key(&page, |&(p, _)| p)
+                .is_ok_and(|i| written[i].1 > at),
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod stale_tests {
+    use super::*;
+
+    #[test]
+    fn pages_never_taken_are_stale_written_or_not() {
+        let base = 0x100;
+        let copied = [5, 0, 5, 5];
+        let at = |page: usize| page * PAGE;
+        // Page 0x101 was never taken; page 0x102 was written after it was
+        // taken, page 0x103 before.
+        let written = [(0x102, 6), (0x103, 4)];
+        assert_eq!(stale_pages_in(base, &copied, at(0x100), at(0x104), &written), [0x101, 0x102]);
+        // Part of a page counts as the page; pages outside the copy do not.
+        assert_eq!(stale_pages_in(base, &copied, at(0x101) + 8, at(0x101) + 16, &[]), [0x101]);
+        assert!(stale_pages_in(base, &copied, at(0x104), at(0x106), &[(0x104, 9)]).is_empty());
+    }
+}
+
 /// Copies of windows outside buffers let go since the start, and their
 /// bytes.
 static LET_GO: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
@@ -2517,9 +2562,7 @@ impl Shadow {
         let base = start / PAGE;
         let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
         busy.into_iter().any(|(a, e)| match crate::watch::asked(a, e) {
-            Some((_, written)) => written.into_iter().any(|(page, write)| {
-                page >= base && copied.get(page - base).is_none_or(|&at| at == 0 || write > at)
-            }),
+            Some((_, written)) => !stale_pages_in(base, &copied, a, e, &written).is_empty(),
             None => true,
         })
     }
@@ -2574,11 +2617,7 @@ impl Shadow {
             };
             let stale: Vec<usize> = {
                 let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-                written
-                    .into_iter()
-                    .filter(|&(page, write)| page >= base && copied.get(page - base).is_none_or(|&at| at == 0 || write > at))
-                    .map(|(page, _)| page)
-                    .collect()
+                stale_pages_in(base, &copied, a, e, &written)
             };
             for page in stale {
                 let (lo, hi) = ((page * PAGE).max(a), ((page + 1) * PAGE).min(e));
