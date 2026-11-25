@@ -112,6 +112,12 @@ pub fn run(
     victory_loader::report_crashes();
     victory_loader::log_crashes_to(temp.with_file_name("crashes.log"));
     victory_hle::runtime::use_console_timers();
+    // The title patches (upscaler picker, render scale) in every build: a
+    // release build left them out with the other aids, and Series S then
+    // took FidelityFX, whose passes do not run here, and lost the card.
+    // First, before any thread started below can read or write the image.
+    #[cfg(windows)]
+    crate::title_patch::apply(&image)?;
     #[cfg(feature = "diagnostics")]
     diagnostics(&image, &cfg)?;
     let late = LateDlls {
@@ -138,8 +144,6 @@ pub fn run(
 /// memory saved on a crash.
 #[cfg(all(windows, feature = "diagnostics"))]
 fn diagnostics(image: &victory_loader::LoadedImage, cfg: &victory_core::Config) -> Result<()> {
-    // First, before any thread started below can read or write the image.
-    crate::title_patch::apply(image)?;
     victory_loader::dump_stacks_on_schedule();
     victory_hle::modules::audio::capture::start();
     watch(image.base(), image.info().size_of_image as usize);

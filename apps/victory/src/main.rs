@@ -7,7 +7,7 @@ mod census;
 mod inspect;
 mod run;
 mod shader;
-#[cfg(all(windows, feature = "diagnostics"))]
+#[cfg(windows)]
 mod title_patch;
 mod translate;
 
