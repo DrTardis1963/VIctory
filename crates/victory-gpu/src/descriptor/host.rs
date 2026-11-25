@@ -1330,9 +1330,8 @@ impl HostHeap {
     /// left to their draws. Returns how many slots it made due.
     /// shortcut: the ranges are kept in one place for all heaps; the heap
     /// whose pass runs first takes them (a title has one view heap).
-    /// `bake`: a decoration bake draws next ([`HostHeap::texture_slots_page_written`]).
-    pub(crate) fn texture_slots_remapped(&self, frame: u64, bake: bool) -> usize {
-        self.texture_slots_page_written(frame, bake);
+    pub(crate) fn texture_slots_remapped(&self, frame: u64) -> usize {
+        self.texture_slots_page_written(frame);
         self.slots_remapped_under(&take_texture_changes(&REMAPPED), frame)
     }
 
@@ -1518,23 +1517,18 @@ impl HostHeap {
     /// upload takes the bytes that are there by then. Slots tables read
     /// are left to their draws. Counted either way; returns how many slots
     /// it made due.
-    /// Before a decoration bake (`bake`) such slots are due at once, whatever
-    /// `VICTORY_PAGE_WRITES` says (after fxceless/victory-fork #1097): the
-    /// bytes have landed, and a skin texture uploaded before them is read
-    /// by the bake once, for the run (black faces).
-    fn texture_slots_page_written(&self, frame: u64, bake: bool) -> usize {
+    fn texture_slots_page_written(&self, frame: u64) -> usize {
         let ranges = take_texture_changes(&PAGE_WRITTEN);
         if ranges.is_empty() {
             return 0;
         }
-        let due = bake || crate::watch::page_writes() & 2 != 0;
-        self.slots_written_under(&ranges, frame, due, if bake { 0 } else { PAGE_WRITE_AFTER })[2]
+        self.slots_written_under(&ranges, frame, crate::watch::page_writes() & 2 != 0)[2]
     }
 
     /// [`HostHeap::texture_slots_page_written`] for `ranges` (start, end):
     /// the slots that held bytes of them, those of them uploaded before,
     /// and those made due (the latter, if `due`).
-    fn slots_written_under(&self, ranges: &[(u64, u64)], frame: u64, due: bool, after: u64) -> [usize; 3] {
+    fn slots_written_under(&self, ranges: &[(u64, u64)], frame: u64, due: bool) -> [usize; 3] {
         use std::sync::atomic::Ordering::Relaxed;
         let mut slots: Vec<u32> = {
             let placed = self.placed.lock().unwrap_or_else(|e| e.into_inner());
@@ -1545,15 +1539,6 @@ impl HostHeap {
         slots.retain(|&slot| !self.tabled_lately(slot, frame));
         let held = slots.len();
         let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
-        if after == 0 {
-            // Before a bake: one still waiting for its memory (looked at
-            // later and later) has it now, with the bytes that landed.
-            for slot in &slots {
-                if let Some(w) = textures.slots.get_mut(slot) {
-                    w.due = w.due.min(frame);
-                }
-            }
-        }
         // Uploaded before: out of the queue, or in it after an upload (in
         // part, or whole and being looked at again).
         slots.retain(|slot| textures.slots.get(slot).is_none_or(|w| w.mapped > 0 || w.checked.2 != 0));
@@ -1563,7 +1548,7 @@ impl HostHeap {
             return [held, slots.len(), 0];
         }
         for &slot in &slots {
-            textures.changed(slot, frame, frame + after);
+            textures.changed(slot, frame, frame + PAGE_WRITE_AFTER);
         }
         [held, slots.len(), slots.len()]
     }
@@ -3942,25 +3927,20 @@ mod tests {
         assert!(heap.note_buffer(1, Some(&view), false).is_empty());
         let written = [(at, at + 0x1000)];
         // Waiting for its first upload: held, not uploaded, nothing done.
-        assert_eq!(heap.slots_written_under(&written, 50, true, PAGE_WRITE_AFTER), [1, 0, 0]);
+        assert_eq!(heap.slots_written_under(&written, 50, true), [1, 0, 0]);
         let (queued, write) = heap.texture_slots_due(u64::MAX, 8).0[0];
         assert_eq!(queued, 1);
         heap.texture_slot_done(1, write, None);
         assert_eq!(slots(u64::MAX), []);
         // Uploaded and out of the queue. Memory elsewhere: nothing.
-        assert_eq!(heap.slots_written_under(&[(at + 0x10_0000, at + 0x10_1000)], 60, true, PAGE_WRITE_AFTER), [0, 0, 0]);
+        assert_eq!(heap.slots_written_under(&[(at + 0x10_0000, at + 0x10_1000)], 60, true), [0, 0, 0]);
         // Under it, counted only: it stays out of the queue.
-        assert_eq!(heap.slots_written_under(&written, 60, false, PAGE_WRITE_AFTER), [1, 1, 0]);
+        assert_eq!(heap.slots_written_under(&written, 60, false), [1, 1, 0]);
         assert_eq!(slots(u64::MAX), []);
         // Under it, asked for: due two frames on, not before.
-        assert_eq!(heap.slots_written_under(&written, 60, true, PAGE_WRITE_AFTER), [1, 1, 1]);
+        assert_eq!(heap.slots_written_under(&written, 60, true), [1, 1, 1]);
         assert_eq!(slots(61), []);
         assert_eq!(slots(62), [1]);
-        // Before a bake: due in the same frame, not two frames on.
-        let (_, write) = heap.texture_slots_due(62, 8).0[0];
-        heap.texture_slot_done(1, write, None);
-        assert_eq!(heap.slots_written_under(&written, 70, true, 0), [1, 1, 1]);
-        assert_eq!(slots(70), [1]);
     }
 
     /// Repeated changes at one address can run the pending queue out of
@@ -4003,7 +3983,7 @@ mod tests {
         let (slot, write) = heap.texture_slots_due(51, 8).0[0];
         assert_eq!(slot, 1);
         heap.texture_slot_done(slot, write, None);
-        assert_eq!(heap.slots_written_under(&ranges, 60, true, PAGE_WRITE_AFTER), [1, 1, 1]);
+        assert_eq!(heap.slots_written_under(&ranges, 60, true), [1, 1, 1]);
         assert_eq!(heap.texture_slots_due(62, 8).0[0].0, 1);
     }
 
@@ -4227,7 +4207,7 @@ mod tests {
         // Memory elsewhere: nothing. Under the texture: due from the next frame.
         remapped((at + 2 * len) as usize, 0x1000);
         remapped(at as usize, 0x1000);
-        assert_eq!(heap.texture_slots_remapped(50, false), 1);
+        assert_eq!(heap.texture_slots_remapped(50), 1);
         assert_eq!(slots(50), []);
         assert_eq!(slots(51), [1]);
         // A wider texture written at the same address: slot 1 is stale.
