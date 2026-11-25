@@ -9537,8 +9537,13 @@ impl<'a> Lower<'a> {
                     let f = half(self, h)?.ok_or("a packed input half no element holds")?;
                     self.as_int(f)
                 } else if f16 {
-                    let f = half(self, h)?.ok_or("a packed input half no element holds")?;
-                    let lo = to_f16(self, f);
+                    // A padding half no element holds reads as 0.
+                    // shortcut: the console reads whatever the export left there;
+                    // look at that export if such a read ever shows up wrong.
+                    let lo = match half(self, h)? {
+                        Some(f) => to_f16(self, f),
+                        None => self.s.m.i32(0),
+                    };
                     // omod and clamp are part of the f16 instruction; op_sel[3]
                     // picks the destination half.
                     let lo = self.half_modifiers(inst, lo);
@@ -10631,13 +10636,26 @@ impl<'a> Lower<'a> {
         // bytes too. The host makes its buffer views raw (a raw read
         // through a structured view gives zeros on NVIDIA), and one kind
         // of view can then serve every shader that reads the buffer.
+        // A 2-byte stride, too, the way stride 1 reads its index as the byte.
         if let (Some(element), Some(u)) = (index, used)
             && !typed
             && u.kind != ResourceType::Cbv
-            && u.stride >= 4
-            && u.stride.is_multiple_of(4)
+            && ((u.stride >= 4 && u.stride.is_multiple_of(4)) || u.stride == 2)
         {
             let k = self.s.m.i32(u.stride);
+            let at = self.s.m.bin(c, Bin::Mul, element, k);
+            off = self.s.m.bin(c, Bin::Add, at, off);
+            index = None;
+        }
+        // A descriptor the program builds around an address has no entry:
+        // its stride is the one it ORs into dword 1 (bits 16..29), unless
+        // swizzled or adding the thread id (other addressing).
+        if let Some(element) = index
+            && !typed
+            && used.is_none()
+            && let Some(stride) = built_stride(src)
+        {
+            let k = self.s.m.i32(stride);
             let at = self.s.m.bin(c, Bin::Mul, element, k);
             off = self.s.m.bin(c, Bin::Add, at, off);
             index = None;
@@ -11666,6 +11684,26 @@ impl<'a> Lower<'a> {
     }
 }
 
+/// The stride a descriptor built around an address ORs into dword 1
+/// (bits 16..29), the same on every path to it; none when it swizzles
+/// (dword 1 bit 31) or adds the thread id (dword 3 bit 23).
+fn built_stride(src: &Source) -> Option<u32> {
+    let same = |args: Vec<&Source>| {
+        let first = built_stride(args.first()?)?;
+        args.iter().all(|a| built_stride(a) == Some(first)).then_some(first)
+    };
+    match src {
+        Source::Built { bits, words, .. } => {
+            (bits >> 31 == 0 && words[1] >> 23 & 1 == 0).then_some(bits >> 16 & 0x3FFF)
+        }
+        Source::Phi { args, .. } | Source::Select { args, .. } | Source::Lanes { args, .. } => {
+            same(args.iter().collect())
+        }
+        Source::LanePhi { args, .. } => same(args.iter().flatten().collect()),
+        _ => None,
+    }
+}
+
 /// The DXIL interpolation mode of a kind of barycentrics (none for the
 /// pull model).
 fn interp_mode(kind: Barycentric) -> Option<u8> {
@@ -11689,6 +11727,42 @@ mod tests {
     use crate::{io, ir, resource, structure};
 
     const S_ENDPGM: u32 = 0xBF81_0000;
+
+    #[test]
+    fn built_descriptors_give_their_stride() {
+        use super::built_stride;
+        use crate::resource::{Address, Source};
+        let built = |bits: u32, word3: u32| Source::Built {
+            address: Address {
+                param: 0,
+                offset: 0,
+                dynamic: None,
+            },
+            bits,
+            words: [u32::MAX, word3],
+        };
+        assert_eq!(built_stride(&built(24 << 16, 0)), Some(24));
+        assert_eq!(built_stride(&built(0, 0)), Some(0));
+        // Swizzled, or adding the thread id: other addressing.
+        assert_eq!(built_stride(&built(1 << 31 | 16 << 16, 0)), None);
+        assert_eq!(built_stride(&built(16 << 16, 1 << 23)), None);
+        let phi = |args| Source::Phi { block: 1, args };
+        assert_eq!(
+            built_stride(&phi(vec![built(8 << 16, 0), built(8 << 16, 0)])),
+            Some(8)
+        );
+        assert_eq!(
+            built_stride(&phi(vec![built(8 << 16, 0), built(12 << 16, 0)])),
+            None
+        );
+        assert_eq!(
+            built_stride(&Source::LanePhi {
+                block: 1,
+                args: vec![None, Some(built(4 << 16, 0))],
+            }),
+            Some(4)
+        );
+    }
 
     #[test]
     fn packed_pixel_inputs_find_their_second_row() {
