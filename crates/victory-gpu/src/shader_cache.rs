@@ -181,6 +181,8 @@ fn settings() -> Vec<u8> {
         "VICTORY_F16_NEAREST",
         // Whether shaders mark the heap slots they take.
         "VICTORY_HEAP_USAGE",
+        // Whether the ray-tracing node test always misses.
+        "VICTORY_RT_MISS",
     ] {
         bytes.extend_from_slice(name.as_bytes());
         bytes.push(b'=');
