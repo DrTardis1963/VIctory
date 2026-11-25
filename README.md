@@ -60,12 +60,12 @@ Tradução dos shaders do console para este host e etapas do jogo
 |---|---|---|
 | Carrega e inicia | ✅ | uns 10 s até o primeiro quadro |
 | Vídeo de abertura e menus | ✅ | 30 fps |
-| Cutscene de abertura | ⚠️ | vai até o fim; pele e roupa ainda saem pretas |
+| Cutscene de abertura | ⚠️ | vai até o fim; rostos, cabelo e roupa com textura, mas a cena fica escura sem a luz por ray tracing; 1-5 fps |
 | Entrada no mundo | ✅ | alcançada, pipelines vindas da biblioteca salva |
 | Jogável | ⚠️ | controle, HUD e pausa funcionam, mas a 4-7 fps em 1080p |
 | Luz por ray tracing | ❌ | ainda não roda; tudo na sombra fica preto |
 
-*Medido em 2026-11-25 em NVIDIA GeForce RTX 4060 Ti 8 GB, Intel Core i7-13700K, Windows 11 (`8107d596`). As contagens de shaders são os shaders de console do dump do Xbox Series 1.0.2.1 que são traduzidos para este host (`victory translate`); as etapas do jogo são o que uma execução alcançou. Regenere com `cargo xtask progress` depois de editar `docs/progress/progress.json`.*
+*Medido em 2026-11-25 em NVIDIA GeForce RTX 4060 Ti 8 GB, Intel Core i7-13700K, Windows 11 (`719e3b15`). As contagens de shaders são os shaders de console do dump do Xbox Series 1.0.2.1 que são traduzidos para este host (`victory translate`); as etapas do jogo são o que uma execução alcançou. Regenere com `cargo xtask progress` depois de editar `docs/progress/progress.json`.*
 <!-- progress:end -->
 
 ## O que este fork acrescenta
