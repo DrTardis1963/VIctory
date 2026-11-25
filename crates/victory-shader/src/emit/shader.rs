@@ -95,6 +95,12 @@ pub const USER_VIEW_ADDRESS: u32 = 0x101;
 /// view. Asked for every root UAV, and for the root SRVs of programs with
 /// a spilled user-data table.
 pub const USER_VIEW_BIAS: u32 = 0x103;
+/// `RootType::Other` code of a user-data dword the host computes: the
+/// threads along x of a dispatch by thread count (`DispatchX` with the
+/// console's thread-dimensions flag), `u32::MAX` for a dispatch by group
+/// count. A program [`crate::spill::limit_threads`] changed runs only the
+/// lanes below it.
+pub const USER_THREAD_LIMIT: u32 = 0x104;
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
