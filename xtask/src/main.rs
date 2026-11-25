@@ -1,8 +1,11 @@
 //! Repository maintenance. Run with `cargo xtask <command>`.
 
+mod gate;
 mod harness;
+mod json;
 mod policy;
 mod progress;
+mod todo;
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -35,6 +38,36 @@ enum Cmd {
         #[command(subcommand)]
         cmd: harness::HarnessCmd,
     },
+    /// The verification gate in one command: policy, clippy, clippy with
+    /// every feature, tests. Prints only what failed; full logs go to
+    /// target/xtask-gate/.
+    Gate {
+        /// Check only packages changed since the merge base with `--base`
+        /// (and those depending on them).
+        #[arg(long)]
+        changed: bool,
+        /// The branch `--changed` compares with.
+        #[arg(long, default_value = "origin/main")]
+        base: String,
+        /// Run every step even after one fails.
+        #[arg(long)]
+        keep_going: bool,
+        /// Print the summary as one JSON object on stdout.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Rank the unimplemented imports titles called (the ledgers
+    /// `victory run --execute` writes) and name the HLE module for each.
+    Todo {
+        /// Ledger files; default: every title's under the data directory.
+        files: Vec<PathBuf>,
+        /// Show at most this many.
+        #[arg(long, default_value_t = 40)]
+        limit: usize,
+        /// Print as one JSON object.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 fn main() -> Result<()> {
@@ -56,6 +89,21 @@ fn main() -> Result<()> {
             println!("hooks installed: commits now run `cargo xtask policy --staged`");
             Ok(())
         }
+        Cmd::Gate {
+            changed,
+            base,
+            keep_going,
+            json,
+        } => gate::run(
+            &root,
+            &gate::Options {
+                changed,
+                keep_going,
+                json,
+                base,
+            },
+        ),
+        Cmd::Todo { files, limit, json } => todo::run(&root, files, limit, json),
     }
 }
 
