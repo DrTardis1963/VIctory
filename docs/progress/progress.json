@@ -1,7 +1,7 @@
 {
   "measured": "2026-11-25",
   "gpu": "NVIDIA GeForce RTX 4060 Ti 8 GB, Intel Core i7-13700K, Windows 11",
-  "commit": "4699d89a",
+  "commit": "8107d596",
   "shaders": [
     {
       "stage": "Mesh",
@@ -10,7 +10,7 @@
     },
     {
       "stage": "Vertex/pixel",
-      "translated": 14248,
+      "translated": 14258,
       "total": 14259
     },
     {
