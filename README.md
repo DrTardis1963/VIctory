@@ -1,95 +1,115 @@
-# VIctory fork (work in progress)
+# VIctory-fork: the 8 GB card build
 
-A work-in-progress fork of [VIctory](https://github.com/Marvisak/VIctory), a
-compatibility layer that runs an Xbox Series title natively on Windows from
-files the user supplies. This fork follows upstream
-`main` and adds fixes aimed at one goal: getting the game's world to render
-correctly and playably on one particular PC.
+A fork of [VIctory](https://github.com/Marvisak/VIctory) (by way of
+[fxceless/victory-fork](https://github.com/fxceless/victory-fork)), the
+compatibility layer that runs an Xbox Series X|S title natively on Windows
+from files the user supplies. This fork aims at one kind of machine: a
+mid-range NVIDIA card with **8 GB** of memory and 32-lane waves (tested on an
+RTX 4060 Ti) driving a **1080p** monitor, where the upstream trees run out of
+card memory, stall on texture checks and wait minutes for shaders.
 
 **This repository contains no game files, code or assets.** You need your own
 copy of the game. It is not affiliated with or endorsed by the game's
 developer or publisher.
+
+> **Resumo (pt-BR):** fork do VIctory focado em placas NVIDIA de 8 GB
+> (RTX 4060 Ti) em monitor 1080p. Chega ao mundo e passa a cutscene de
+> abertura; ainda não é jogável (cerca de 3 fps). A branch de trabalho é
+> `base/fxceless`.
+
+The working branch is **`base/fxceless`**: fxceless' tree, every upstream
+fix that applied, and this fork's own changes below.
+
+## Progress (2026-11-25)
+
+Windows 11, Intel i7-13700K, RTX 4060 Ti 8 GB, Series X profile. The
+percentages are our own estimate of each stage, not a benchmark.
+
+| Stage | Progress | Notes |
+|-------|---------:|-------|
+| Loads and boots | 100 % | about 10 s to the first frame |
+| Intro video and menus | 100 % | steady 30 fps (the title's own limit) |
+| Opening cutscene | 70 % | plays to the end; skin and clothes come out black and video frames flash green when the card is full (see below); colour banding in the grading is being tracked down |
+| Reaching the world | 100 % | pipelines come from the saved library; no black stall |
+| Playable (input, HUD, menus) | 50 % | pad input, HUD and pause menu work, but at about 3 fps |
+| Picture quality | 50 % | no ray-traced light yet (shadows black), one mip dropped on 8 GB cards |
+| Frame rate in the world | 10 % | about 3 of the 30 fps target: GPU ~120-200 ms, preparing ~100-250 ms, copying back ~50-250 ms per frame |
+| Stability | 90 % | hour-long runs with no hang or device loss |
+| **Overall** | **74 %** | the average of the rows above |
+
+## What this fork adds
+
+Memory, for 8 GB cards:
+- The display mode the title is told about can match the monitor
+  (`VICTORY_DISPLAY_MODE=1920x1080`): at the default 4K mode its render
+  targets alone took 3.4 GB of a 6.6 GB budget, and textures were given up.
+- One mip is dropped from large textures on cards of 8 GB or less (floor 2048).
+- Render targets whose title memory is unmapped and idle are let go; targets
+  at the same address with the same description share one host copy.
+- Textures picked by index are given up oldest first when the card is full,
+  and come back when the title names them again.
+- A line in the log tells the card's memory by kind.
+
+Speed:
+- The shader translator runs about 2.7x faster cold, with the same output.
+- Texture checks hold only the ranges they read while the runtime remaps
+  title memory, and wait for nothing (`VICTORY_TEXTURE_NO_WAIT`); a per-frame
+  budget (`VICTORY_TEXTURE_BUDGET_MS`, 10 by default) carries the rest over.
+- Console texture detiling runs in parallel bands.
+- Copy-back of card copies runs on its own copy queue; the card compares
+  pieces with wide groups.
+- Cutscene frames that waited 1.6-7.9 s for texture uploads now take 5-67 ms.
+- Spare pipeline workers during loads; the world opens with its pipelines
+  from the library instead of a black stall.
+
+Correctness:
+- Programs written for 64-lane waves run as several 32-lane waves with group
+  barriers (22 of the 24 hair programs now create).
+- Textures a list uploads in its prelude no longer flicker in the intro.
+- A crash in guarded DirectStorage reads is fixed.
+- Compute dispatches past the frame's wait budget are dropped instead of
+  stalling the frame.
+
+From upstream and other forks: fxceless' tree and fixes (skin and hair
+textures looked at again after their upload, view-heap clamp, f64
+instructions, idle eviction under memory pressure, ...), and more than forty
+VIctory pull requests (helper lanes in `v_readfirstlane`, mesh edge flags,
+d16 loads, title writes under shader-written ranges, ...).
+
+### Recommended switches for an 8 GB card
+
+```powershell
+$env:VICTORY_RELAY = '1'          # 2 shows defects on 8 GB cards
+$env:VICTORY_WIDE_BACK = '1'
+$env:VICTORY_WIDE_REFRESH = '1'
+$env:VICTORY_DISPLAY_MODE = '1920x1080'   # your monitor's size
+$env:VICTORY_NO_WATCHDOG = '1'    # the first world frames are slow
+```
+
+The first run after the shader translator changes rebuilds the pipeline
+library: the opening cutscene is mostly black for a few minutes while about
+3,000 pipelines are made. Later runs load them.
+
+### Known problems
+
+- Everything in shadow is black: the title's ray-traced light does not run yet.
+- Colour banding in the cutscene's grading.
+- Two 64-lane programs (triangle collection and meshlets) still do not fit
+  32-lane waves and are refused.
+- Around 24 GB of system memory is in use during play.
 
 ## Credits
 
 - **[VIctory](https://github.com/Marvisak/VIctory)** by Marvisak and its
   contributors is the base of everything here: the loader, the runtime
   services, the Direct3D 12 back end and the shader recompiler. Licensed
-  GPL-3.0-or-later; so is this fork. Upstream's history is kept intact below
-  the single commit that carries this fork's changes.
-- **[XCL](https://github.com/ivall/xcl)** by ivall and its contributors
-  (GPL-2.0-only) was used as a reference for how the same title behaves under
-  another layer. Fixes inspired by it were written anew in VIctory's code.
+  GPL-3.0-or-later; so is this fork.
+- **[fxceless/victory-fork](https://github.com/fxceless/victory-fork)** and the
+  forks it gathers (asdaasdsaddf, triippywhale and others) for the world
+  rendering, relay and memory work this fork starts from.
+- **[XCL](https://github.com/ivall/xcl)** (GPL-2.0-only) was used only as a
+  reference for how the title behaves under another layer; nothing was copied.
 - This fork's changes were developed with [Claude Code](https://claude.com/claude-code).
-
-## Status of this fork (2026-11-25)
-
-**Not playable yet: 2.5 to 4 frames per second, and shadowed areas are black.**
-Tested on one machine: Windows 11, Intel i7-14700KF, NVIDIA RTX 4070 12 GB,
-32 GB RAM. The Series X profile is used throughout.
-
-| Stage | State in this fork |
-|-------|--------------------|
-| Boot, menus, start screen | works, 30 fps (as upstream) |
-| Opening cutscene | plays from start to finish, in order, lit: title cards, credits cards, night and dusk shots |
-| Saves | the game autosaves a checkpoint and loads it again |
-| First gameplay scene (the prologue) | renders: characters, textures, sky, sunlit exterior; HUD, pause menu and pad input work |
-| Light in shadow | missing: the game's ray-traced bounce light and ray-traced lamp and sun shadows do not run yet, so anything the sun does not hit directly is black |
-| Frame rate in the world | 2-4 fps: 420-450 ms per frame by default, 240-350 ms with the newer switches (`VICTORY_RELAY=2`, or `VICTORY_LATE_WAIT=3 VICTORY_WIDE_BACK=1 VICTORY_CARD_BUFFERS_MIN_MB=1 VICTORY_CARD_BUFFERS_MB=1024`); it started at 3-6 seconds per frame |
-| Stability | no driver hang or device loss in normal runs (a hang introduced by the wave64 update was found and fixed: its barrier form for 64-lane programs is now off unless `VICTORY_WAVE_WIDE=1`) |
-
-### Progress on an 8 GB card (branch `base/fxceless`, 2026-11-25)
-
-Measured on a second machine: Windows 11, Intel i7-13700K, NVIDIA RTX 4060 Ti
-8 GB, Series X profile, `VICTORY_RELAY=1 VICTORY_WIDE_BACK=1 VICTORY_WIDE_REFRESH=1`.
-The percentages are our own estimates of each stage, not a benchmark.
-
-| Stage | Progress | Notes |
-|-------|---------:|-------|
-| Loads and boots | 100 % | about 10 s to the first frame |
-| Intro and menus | 100 % | steady 30 fps (the title's own limit) |
-| Opening cutscene | 70 % | plays to the end; colour banding in the grading and some characters' faces and clothes black (fix for textures filled after their upload just merged) |
-| Reaching the world | 100 % | 3,998 pipelines from the saved library; no black stall |
-| Playable (input, HUD, menus) | 50 % | pad input, HUD and pause menu work, but at 3 fps |
-| Picture quality | 50 % | no ray-traced light (shadows black), one mip dropped on 8 GB cards, banding |
-| Frame rate in the world | 10 % | about 3 of the 30 fps target: GPU ~165-210 ms, preparing ~90-160 ms, copying back ~110-250 ms per frame |
-| Stability | 90 % | an hour-long run with no hang or device loss |
-| **Overall** | **74 %** | the average of the rows above |
-
-### What this fork changed (summary)
-
-Rendering:
-- Meshlet culling read its scene buffers as the wrong kind of view, so the world drew almost nothing; fixed.
-- Per-draw descriptor tables could run out, after which draws used slots never made for them and the card hung; fixed.
-- Light packed by the game's compute shaders was read back through empty copies (sky, probes, fog); fixed for every mip level and layer.
-- The fog reconstruction, shadow-mask, hair, blend-shape skinning, fire and several material programs did not translate; fixed.
-- Gathers at a named mip level (with and without an offset) read level 0; fixed.
-- Implicit-level samples outside pixel shaders produced invalid DXIL in 730 compute programs; fixed.
-- Rectangle lists, depth and stencil twins for depth textures written by compute, texture read-backs.
-- Ray tracing, in progress and off by default: the game's own structure-builder programs translate, title memory can be read by raw address from shaders, the hardware ray/box and ray/triangle test is emulated in DXIL (checked against a reference on the GPU), and 59 of the 64 trace programs translate. Nothing is lit by it yet. See [docs/fork-ray-tracing.md](docs/fork-ray-tracing.md).
-
-Speed and memory:
-- Waits for memory values, write-watch queries and page queries no longer walk page tables per call.
-- Large title buffers get a copy in card memory, with shader writes found by hashing on the card.
-- Submissions can be sent ahead of the wait for the card (`VICTORY_LATE_WAIT`), with a relay thread that lands results as the card finishes (`VICTORY_RELAY`): in a first five-minute run the card's idle time behind the submitting thread fell from about 136 to 30 ms per frame.
-- Title memory can be opened as a graphics heap so that buffers are used in place instead of copied (`VICTORY_INPLACE`, first stage only; a probe confirmed the approach on the test GPU).
-- The bindless texture queue no longer uploads stale views; the view table no longer grows without bound; the pipeline library is mapped instead of read into memory.
-- An intermittent device loss was traced to the pipeline library file being replaced while mapped; fixed.
-
-- Translated shaders get clean-up passes over the finished module (dead code, constant folding, reuse of values, branch facts); the pack's host instruction count falls by about 43 %, worth about 20 ms of GPU time per frame on the test machine (`VICTORY_SHADER_OPT=0` turns them off).
-
-Most of the newer speed changes sit behind environment switches that are off
-by default (`VICTORY_LATE_WAIT`, `VICTORY_RELAY`, `VICTORY_WIDE_BACK`,
-`VICTORY_CARD_BUFFERS_MIN_MB`, `VICTORY_INPLACE`, `VICTORY_BVH_BUILDER`, ...).
-Each is described in a comment where it is read.
-
-### Known problems
-
-- Everything in shadow is black (see above).
-- The interior of the first gameplay room is sometimes not drawn after the cutscene hands over to gameplay.
-- Around 24 GB of memory is in use during play.
-- A few style lints are switched off for this fork in the workspace `Cargo.toml` until the newer code is tidied.
-- Many changes here are specific to this title and this GPU, and some are marked `shortcut:` in the code where they approximate what the console does.
 
 Everything below this line is upstream VIctory's own README, unchanged; its
 status section describes upstream, not this fork.
