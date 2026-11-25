@@ -219,6 +219,9 @@ pub(crate) struct State {
     /// The indirect records clamped last, if later draws may still read
     /// them ([`windows`]).
     window: Option<Window>,
+    /// The threads along x of the dispatch by thread count being bound
+    /// (`victory_shader::emit::USER_THREAD_LIMIT`).
+    thread_limit: u32,
     /// What the host list has: pipeline, root signature, heaps.
     host_pipeline: usize,
     /// Graphics, compute.
@@ -846,9 +849,12 @@ impl State {
         dword: u32,
         memory: Option<&crate::memory::Ready>,
     ) -> u32 {
-        use victory_shader::emit::{USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS};
+        use victory_shader::emit::{USER_MEMORY_BASE, USER_THREAD_LIMIT, USER_VIEW_ADDRESS, USER_VIEW_BIAS};
         if kind == USER_MEMORY_BASE {
             return memory.map_or(0, |m| m.base);
+        }
+        if kind == USER_THREAD_LIMIT {
+            return self.thread_limit;
         }
         if kind == USER_VIEW_BIAS {
             // The view begins on 16 bytes of the copy the address finds
@@ -2080,8 +2086,9 @@ impl State {
         });
     }
 
-    /// Runs a dispatch on the host.
-    pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
+    /// Runs a dispatch on the host. `threads`: `x`, `y` and `z` count
+    /// threads, not groups (the console's thread-dimensions flag).
+    pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32, threads: bool) {
         // It may write the arguments a window holds clamped.
         self.window = None;
         #[cfg(feature = "diagnostics")]
@@ -2123,6 +2130,30 @@ impl State {
             once!("a dispatch with a graphics pipeline");
             return;
         }
+        // By thread count, the console's last group is partial. The host
+        // runs whole groups; the program leaves out the threads past the
+        // count along x if it was translated for that
+        // (`victory_shader::spill::limit_threads`).
+        self.thread_limit = u32::MAX;
+        let [x, y, z] = if threads {
+            let t = p.stages[0].translated();
+            let limited = t
+                .host
+                .user_data
+                .iter()
+                .any(|u| u.root == RootType::Other(victory_shader::emit::USER_THREAD_LIMIT));
+            let [nx, ny, nz] = t.threads.map(|n| n.max(1));
+            if !(limited || x.is_multiple_of(nx)) || !y.is_multiple_of(ny) || !z.is_multiple_of(nz) {
+                once!(
+                    pipeline = format_args!("{:#x}", self.pipeline),
+                    "a dispatch by thread count ends in a partial group: the host runs all of its threads"
+                );
+            }
+            self.thread_limit = x;
+            [x.div_ceil(nx), y.div_ceil(ny), z.div_ceil(nz)]
+        } else {
+            [x, y, z]
+        };
         if !self.bind(list, p, true) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             // A stage of the structure builder that cannot be bound is a

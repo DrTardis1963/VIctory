@@ -1374,14 +1374,16 @@ extern "system" fn driver_hint(_: This, _feature: u64, _value: u64) -> u64 {
     0
 }
 
-/// `DispatchX(x, y, z, flags)`: a dispatch with console flags, which the
-/// host has no use for (the ray-tracing builder dispatches this way).
-extern "system" fn dispatch_x(this: This, x: u32, y: u32, z: u32, _flags: u32) {
+/// `DispatchX(x, y, z, flags)`: a dispatch with console flags, bits of the
+/// hardware's dispatch initiator (the ray-tracing builder dispatches this
+/// way). With bit 5, `USE_THREAD_DIMENSIONS`, `x`, `y` and `z` count
+/// threads, not groups; the host has no use for the others.
+extern "system" fn dispatch_x(this: This, x: u32, y: u32, z: u32, flags: u32) {
     #[cfg(windows)]
-    state::dispatch(this, x, y, z);
+    state::dispatch_x(this, x, y, z, flags & 0x20 != 0);
     #[cfg(not(windows))]
     {
-        let _ = (this, x, y, z);
+        let _ = (this, x, y, z, flags);
         count_dispatch();
     }
 }
@@ -1674,8 +1676,12 @@ mod state {
         });
     }
     pub(super) extern "system" fn dispatch(this: This, x: u32, y: u32, z: u32) {
+        dispatch_x(this, x, y, z, false);
+    }
+    /// A dispatch whose counts are threads (`threads`) or groups.
+    pub(super) fn dispatch_x(this: This, x: u32, y: u32, z: u32, threads: bool) {
         super::count_dispatch();
-        with_state(this, |list, s| s.dispatch(list, x, y, z));
+        with_state(this, |list, s| s.dispatch(list, x, y, z, threads));
     }
     /// `DispatchMesh(x, y, z)` (the PC method of List6); the title's mesh
     /// programs take `x` groups only.
