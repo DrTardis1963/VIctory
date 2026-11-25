@@ -2327,7 +2327,14 @@ impl State {
             }
             HEAP_TEXTURE_BYTES.fetch_add(bytes, Ordering::Relaxed);
             HEAP_TEXTURES.fetch_add(1, Ordering::Relaxed);
-            host.texture_slot_made(index, now);
+            // Not a slot to give up for room if the card itself wrote the
+            // texture (the title's baked skin): its host copy is never let
+            // go (`resource::let_go_idle`), so the slot made null frees
+            // nothing, and reads black until a pass with room makes it
+            // again.
+            if !crate::texture::host_wrote(resource as usize) {
+                host.texture_slot_made(index, now);
+            }
             match memory {
                 // Whole and uploaded: looked at again (see above).
                 Some((at, len)) => {
