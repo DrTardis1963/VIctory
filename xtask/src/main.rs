@@ -1,5 +1,6 @@
 //! Repository maintenance. Run with `cargo xtask <command>`.
 
+mod agility;
 mod gate;
 mod harness;
 mod json;
@@ -38,6 +39,18 @@ enum Cmd {
         #[command(subcommand)]
         cmd: harness::HarnessCmd,
     },
+    /// Copy the D3D12 Agility SDK runtime (shader model 6.6 on Windows 10)
+    /// into every build folder, after checking it is the version the
+    /// executables ask for.
+    Agility {
+        /// The folder holding D3D12Core.dll, outside the repository;
+        /// remembered for later runs.
+        #[arg(long)]
+        from: Option<PathBuf>,
+        /// Only report; fail if a build folder lacks a current copy.
+        #[arg(long)]
+        check: bool,
+    },
     /// The verification gate in one command: policy, clippy, clippy with
     /// every feature, tests. Prints only what failed; full logs go to
     /// target/xtask-gate/.
@@ -46,8 +59,9 @@ enum Cmd {
         /// (and those depending on them).
         #[arg(long)]
         changed: bool,
-        /// The branch `--changed` compares with.
-        #[arg(long, default_value = "origin/main")]
+        /// The branch `--changed` compares with; default: the current
+        /// branch's upstream, else origin/main.
+        #[arg(long, default_value = "")]
         base: String,
         /// Run every step even after one fails.
         #[arg(long)]
@@ -104,6 +118,7 @@ fn main() -> Result<()> {
             },
         ),
         Cmd::Todo { files, limit, json } => todo::run(&root, files, limit, json),
+        Cmd::Agility { from, check } => agility::run(&root, from, check),
     }
 }
 

@@ -1,10 +1,11 @@
 //! `cargo xtask gate`: the verification gate (AGENTS.md) as one command.
 //!
 //! Runs, in order: the asset policy, clippy, clippy with every feature, and
-//! the tests. Each cargo step's full output goes to `target/xtask-gate/`;
-//! the summary keeps only the lines that say what failed, so an agent reads
-//! a dozen lines instead of a build log. `--changed` checks only the
-//! packages changed since `origin/main` and the packages that depend on
+//! the tests (the GPU-backed crates' apart, as CLAUDE.md runs them). Each
+//! cargo step's full output goes to `target/xtask-gate/`; the summary keeps
+//! only the lines that say what failed, so an agent reads a dozen lines
+//! instead of a build log. `--changed` checks only the packages changed
+//! since the upstream branch (or `--base`) and the packages that depend on
 //! them; `--json` prints the summary as one JSON object on stdout.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -86,35 +87,25 @@ pub fn run(root: &Path, options: &Options) -> Result<()> {
     });
     say(&line(steps.last().unwrap()));
 
-    let packages: Vec<String> = match &scope {
-        Scope::Workspace => vec!["--workspace".into()],
-        Scope::Packages(p) => p.iter().flat_map(|p| ["-p".into(), p.clone()]).collect(),
-    };
-    let nothing_to_build = matches!(&scope, Scope::Packages(p) if p.is_empty());
-    let cargo_steps: [(&'static str, Vec<&str>); 3] = [
-        (
-            "clippy",
-            vec![
-                "clippy",
-                "--all-targets",
-                "--locked",
-                "--message-format=short",
-            ],
-        ),
-        (
-            "clippy-all-features",
-            vec![
-                "clippy",
-                "--all-targets",
-                "--all-features",
-                "--locked",
-                "--message-format=short",
-            ],
-        ),
-        ("test", vec!["test", "--locked"]),
-    ];
+    let cargo_steps = cargo_steps(&scope);
+    // The GPU-backed tests need shader model 6.6, which Windows 10 has only
+    // through the Agility SDK runtime beside the test executables.
+    if cargo_steps
+        .iter()
+        .any(|(name, args)| name.starts_with("test-") && !args.is_empty())
+    {
+        match crate::agility::install(root, None, false) {
+            Ok(r) => say(&format!(
+                "gate: agility              SDK {} in place ({} folders updated)",
+                r.version,
+                r.updated.len()
+            )),
+            Err(e) => say(&format!("gate: agility              not installed: {e:#}")),
+        }
+    }
+
     for (name, args) in cargo_steps {
-        if nothing_to_build || (failed && !options.keep_going) {
+        if args.is_empty() || (failed && !options.keep_going) {
             steps.push(Step {
                 name,
                 status: Status::Skipped,
@@ -126,10 +117,7 @@ pub fn run(root: &Path, options: &Options) -> Result<()> {
             continue;
         }
         let mut command = Command::new(cargo());
-        command.args(&args).args(&packages).current_dir(root);
-        if name.starts_with("clippy") {
-            command.args(["--", "-D", "warnings"]);
-        }
+        command.args(&args).current_dir(root);
         let log = logs.join(format!("{name}.log"));
         let step = run_cargo(name, command, &log)?;
         failed |= step.status == Status::Failed;
@@ -150,6 +138,70 @@ pub fn run(root: &Path, options: &Options) -> Result<()> {
     }
     say("gate: ok");
     Ok(())
+}
+
+/// The crates whose tests run apart, as CLAUDE.md runs them: their unit
+/// tests only, victory-gpu's one at a time (they share one device).
+const GPU_CRATES: [&str; 2] = ["victory-shader", "victory-gpu"];
+
+/// Each cargo step's name and full arguments; no arguments means the step
+/// has nothing in scope and is skipped.
+fn cargo_steps(scope: &Scope) -> Vec<(&'static str, Vec<String>)> {
+    let strings = |s: &[&str]| s.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    let in_scope = |p: &str| match scope {
+        Scope::Workspace => true,
+        Scope::Packages(set) => set.contains(p),
+    };
+    let (all, rest): (Vec<String>, Vec<String>) = match scope {
+        Scope::Workspace => {
+            let mut rest = strings(&["--workspace"]);
+            for p in GPU_CRATES {
+                rest.extend(strings(&["--exclude", p]));
+            }
+            (strings(&["--workspace"]), rest)
+        }
+        Scope::Packages(set) => {
+            let flags = |keep: &dyn Fn(&str) -> bool| {
+                set.iter()
+                    .filter(|p| keep(p))
+                    .flat_map(|p| ["-p".to_string(), p.clone()])
+                    .collect::<Vec<_>>()
+            };
+            (flags(&|_| true), flags(&|p| !GPU_CRATES.contains(&p)))
+        }
+    };
+    let with = |head: &[&str], packages: &[String], tail: &[&str]| {
+        if packages.is_empty() {
+            return Vec::new();
+        }
+        let mut args = strings(head);
+        args.extend_from_slice(packages);
+        args.extend(strings(tail));
+        args
+    };
+    let clippy = [
+        "clippy",
+        "--all-targets",
+        "--locked",
+        "--message-format=short",
+    ];
+    let deny = ["--", "-D", "warnings"];
+    let mut clippy_all = clippy.to_vec();
+    clippy_all.insert(2, "--all-features");
+    let gpu = |p: &str, tail: &[&str]| {
+        if in_scope(p) {
+            with(&["test", "--lib", "--locked"], &strings(&["-p", p]), tail)
+        } else {
+            Vec::new()
+        }
+    };
+    vec![
+        ("clippy", with(&clippy, &all, &deny)),
+        ("clippy-all-features", with(&clippy_all, &all, &deny)),
+        ("test", with(&["test", "--locked"], &rest, &[])),
+        ("test-shader", gpu("victory-shader", &[])),
+        ("test-gpu", gpu("victory-gpu", &["--", "--test-threads=1"])),
+    ]
 }
 
 fn cargo() -> String {
@@ -286,7 +338,12 @@ fn summary_json(scope: &Scope, steps: &[Step], ok: bool) -> String {
 /// A change outside any package that cargo reads (the workspace manifest,
 /// lock file, toolchain, test fixtures) means the whole workspace.
 fn changed_scope(root: &Path, base: &str) -> Result<Scope> {
-    let merge_base = git(root, &["merge-base", "HEAD", base])?;
+    let merge_base = if base.is_empty() {
+        git(root, &["merge-base", "HEAD", "@{upstream}"])
+            .or_else(|_| git(root, &["merge-base", "HEAD", "origin/main"]))?
+    } else {
+        git(root, &["merge-base", "HEAD", base])?
+    };
     let mut files = git(root, &["diff", "--name-only", merge_base.trim()])?;
     files += &git(root, &["ls-files", "--others", "--exclude-standard"])?;
     let members = members(root)?;
@@ -480,6 +537,45 @@ mod tests {
         assert_eq!(got, want);
         let got = with_dependents(BTreeSet::from(["xtask".into()]), &m);
         assert_eq!(got, BTreeSet::from(["xtask".into()]));
+    }
+
+    #[test]
+    fn gpu_crates_are_tested_apart_and_only_when_in_scope() {
+        let joined = |scope: &Scope| -> Vec<(&str, String)> {
+            cargo_steps(scope)
+                .into_iter()
+                .map(|(name, args)| (name, args.join(" ")))
+                .collect()
+        };
+        let all = joined(&Scope::Workspace);
+        assert_eq!(
+            all[2].1,
+            "test --locked --workspace --exclude victory-shader --exclude victory-gpu"
+        );
+        assert_eq!(all[3].1, "test --lib --locked -p victory-shader");
+        assert_eq!(
+            all[4].1,
+            "test --lib --locked -p victory-gpu -- --test-threads=1"
+        );
+        assert!(all[1].1.starts_with("clippy --all-targets --all-features"));
+        assert!(all[0].1.ends_with("--workspace -- -D warnings"));
+
+        let some = joined(&Scope::Packages(BTreeSet::from([
+            "victory-gpu".into(),
+            "xtask".into(),
+        ])));
+        assert_eq!(
+            some[0].1,
+            "clippy --all-targets --locked --message-format=short -p victory-gpu -p xtask -- -D warnings"
+        );
+        assert_eq!(some[2].1, "test --locked -p xtask");
+        assert_eq!(some[3].1, "", "victory-shader is not in scope");
+        assert!(some[4].1.contains("-p victory-gpu"));
+        assert!(
+            joined(&Scope::Packages(BTreeSet::new()))
+                .iter()
+                .all(|(_, a)| a.is_empty())
+        );
     }
 
     #[test]
