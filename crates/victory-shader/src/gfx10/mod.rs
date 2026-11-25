@@ -386,6 +386,19 @@ mod tests {
     }
 
     #[test]
+    fn flat_offsets_ignore_bit_eleven() {
+        let offset = |word0: u32| {
+            let code = bytes(&[word0, 0x0000_0001, S_ENDPGM]);
+            match decode(&code).unwrap()[0].fields(false) {
+                Fields::Flat { offset, .. } => offset,
+                fields => panic!("{fields:?}"),
+            }
+        };
+        assert_eq!(offset(0xDC30_0800), 0);
+        assert_eq!(offset(0xDC30_0FFF), 0x7FF);
+    }
+
+    #[test]
     fn vop3_names_match_aliased_encodings() {
         for (encoding, start, count) in [
             (Encoding::Vopc, 0x000, 0x100),
