@@ -246,6 +246,8 @@ impl Memory {
                 tracing::warn!(
                     pages = pages.len(),
                     first = format_args!("{:#x}", u64::from(pages[0]) * PAGE),
+                    copies = self.copies.len(),
+                    written_pages = self.dirty_pages.len(),
                     "title memory by address: shaders touched pages that had no copy (those accesses read 0 or were dropped); the copies are made now"
                 );
             }
