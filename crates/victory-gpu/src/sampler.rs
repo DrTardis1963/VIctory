@@ -53,12 +53,25 @@ impl Fields {
         } else {
             linear(self.min) << 4 | linear(self.mag) << 2 | u32::from(self.mip == 2)
         };
+        let (min_lod, max_lod) = if self.mip == 0 {
+            // Without a mip filter the console samples mip 0 only.
+            (0.0, 0.0)
+        } else {
+            let min_lod = finite_lod(self.min_lod, 0.0);
+            let max_lod = finite_lod(self.max_lod, min_lod).max(min_lod);
+            (min_lod, max_lod)
+        };
         D3D12_SAMPLER_DESC {
             Filter: D3D12_FILTER((reduction << 7 | filter) as i32),
             AddressU: address(0),
             AddressV: address(1),
             AddressW: address(2),
-            MipLODBias: self.bias,
+            MipLODBias: if self.bias.is_nan() {
+                0.0
+            } else {
+                self.bias
+                    .clamp(D3D12_MIP_LOD_BIAS_MIN, D3D12_MIP_LOD_BIAS_MAX)
+            },
             MaxAnisotropy: if aniso {
                 self.anisotropy.clamp(1, 16)
             } else {
@@ -66,14 +79,18 @@ impl Fields {
             },
             ComparisonFunc: D3D12_COMPARISON_FUNC(compare as i32),
             BorderColor: self.border,
-            MinLOD: self.min_lod,
-            // Without a mip filter the console samples mip 0 only.
-            MaxLOD: if self.mip == 0 {
-                self.min_lod
-            } else {
-                self.max_lod
-            },
+            MinLOD: min_lod,
+            MaxLOD: max_lod,
         }
+    }
+}
+
+/// Sanitizes an LOD bound for D3D12, substituting `fallback` for `NaN` and clamping infinities.
+fn finite_lod(value: f32, fallback: f32) -> f32 {
+    if value.is_nan() {
+        fallback
+    } else {
+        value.clamp(-D3D12_FLOAT32_MAX, D3D12_FLOAT32_MAX)
     }
 }
 
@@ -237,7 +254,52 @@ mod tests {
         // Without a mip filter one level is sampled, whatever the bounds.
         w[3] = 0;
         let d = console(&w);
-        assert_eq!((d.MinLOD, d.MaxLOD), (1.0, 1.0));
+        assert_eq!((d.MinLOD, d.MaxLOD), (0.0, 0.0));
+    }
+
+    #[test]
+    fn mip_none_forces_base_level_and_inverted_lod_range_clamps() {
+        let mut w = description();
+        w[3] = 0; // mip none
+        w[9] = 3.0f32.to_bits();
+        w[10] = 8.0f32.to_bits();
+        let d = console(&w);
+        assert_eq!((d.MinLOD, d.MaxLOD), (0.0, 0.0));
+
+        w[3] = 2; // linear mips
+        w[9] = 4.0f32.to_bits();
+        w[10] = 1.0f32.to_bits();
+        let d = console(&w);
+        assert_eq!((d.MinLOD, d.MaxLOD), (4.0, 4.0));
+
+        w[9] = f32::NAN.to_bits();
+        w[10] = f32::INFINITY.to_bits();
+        let d = console(&w);
+        assert_eq!((d.MinLOD, d.MaxLOD), (0.0, D3D12_FLOAT32_MAX));
+
+        w[9] = 2.5f32.to_bits();
+        w[10] = f32::NAN.to_bits();
+        let d = console(&w);
+        assert_eq!((d.MinLOD, d.MaxLOD), (2.5, 2.5));
+
+        w[9] = f32::NEG_INFINITY.to_bits();
+        w[10] = f32::NEG_INFINITY.to_bits();
+        let d = console(&w);
+        assert_eq!(
+            (d.MinLOD, d.MaxLOD),
+            (-D3D12_FLOAT32_MAX, -D3D12_FLOAT32_MAX)
+        );
+    }
+
+    #[test]
+    fn bias_clamps_and_nan_zeros() {
+        let mut w = description();
+        w[11] = 24.0f32.to_bits();
+        assert_eq!(console(&w).MipLODBias, D3D12_MIP_LOD_BIAS_MAX);
+        w[11] = (-24.0f32).to_bits();
+        assert_eq!(console(&w).MipLODBias, D3D12_MIP_LOD_BIAS_MIN);
+        w[11] = f32::NAN.to_bits();
+        assert_eq!(console(&w).MipLODBias, 0.0);
     }
 
     #[test]

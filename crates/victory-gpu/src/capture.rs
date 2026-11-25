@@ -356,7 +356,8 @@ pub(crate) fn finish_frame(frame: u64, buffer: ID3D12Resource, footprint: D3D12_
     save_read_back(frame, &buffer, &footprint);
 }
 
-/// Saves a frame read back by [`read_back`] (8-bit color only).
+/// Saves a frame read back by [`read_back`]: 8-bit color as is, other
+/// formats (a 10-bit swap chain) converted as dumped targets are.
 fn save_read_back(
     frame: u64,
     buffer: &ID3D12Resource,
@@ -364,12 +365,9 @@ fn save_read_back(
 ) {
     let f = footprint.Footprint;
     let bgra = match f.Format {
-        DXGI_FORMAT_R8G8B8A8_UNORM | DXGI_FORMAT_R8G8B8A8_UNORM_SRGB => false,
-        DXGI_FORMAT_B8G8R8A8_UNORM | DXGI_FORMAT_B8G8R8A8_UNORM_SRGB => true,
-        other => {
-            tracing::warn!(format = other.0, "frame not saved: not 8-bit color");
-            return;
-        }
+        DXGI_FORMAT_R8G8B8A8_UNORM | DXGI_FORMAT_R8G8B8A8_UNORM_SRGB => Some(false),
+        DXGI_FORMAT_B8G8R8A8_UNORM | DXGI_FORMAT_B8G8R8A8_UNORM_SRGB => Some(true),
+        _ => None,
     };
     let mut data = std::ptr::null_mut();
     // SAFETY: the copy finished (every submission is waited for); the
@@ -380,7 +378,14 @@ fn save_read_back(
         }
         let len = f.RowPitch as usize * f.Height as usize;
         let rows = std::slice::from_raw_parts(data.cast::<u8>(), len);
-        save(frame, f.Width, f.Height, f.RowPitch as usize, bgra, rows);
+        let (w, h, pitch) = (f.Width as usize, f.Height as usize, f.RowPitch as usize);
+        match bgra {
+            Some(bgra) => save(frame, f.Width, f.Height, pitch, bgra, rows),
+            None => match to_rgba(f.Format.0 as u32, w, h, pitch, rows) {
+                Some(rgba) => save(frame, f.Width, f.Height, 4 * w, false, &rgba),
+                None => tracing::warn!(format = f.Format.0, "frame not saved: format not handled"),
+            },
+        }
         buffer.Unmap(0, None);
     }
 }

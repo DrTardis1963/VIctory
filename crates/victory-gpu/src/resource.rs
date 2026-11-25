@@ -221,7 +221,7 @@ fn footprint(desc: &ResourceDesc) -> Option<AllocationInfo> {
         return None;
     }
     Some(AllocationInfo {
-        size: bytes.checked_next_multiple_of(KIB_64)?,
+        size: bytes.checked_next_multiple_of(alignment)?,
         alignment,
     })
 }
@@ -244,22 +244,24 @@ pub(crate) fn pc_format(format: u32) -> u32 {
 /// (NVIDIA) refused the whole texture, so every pass that wrote it drew
 /// nothing. There 8-bit RGBA stands in: the same channels in the same
 /// order, every 4-bit level exact and every 5-bit level within 1/510.
+/// The title also renders to R9G9B9E5 (67), which no PC GPU does: 16-bit
+/// float RGBA stands in, with at least R9G9B9E5's precision and range.
 /// The title's pipelines and views of such targets name the stand-in too
 /// ([`view_format`], the host view checks).
 /// shortcut: copies between such a target and a texture the title fills
 /// itself in the 16-bit format are skipped ([`stands_in`]); convert them
 /// if a pass turns out to need one.
 pub(crate) fn target_format(format: u32) -> u32 {
-    const STAND_INS: [(u32, u32); 2] = [(86, 28), (115, 28)];
+    const STAND_INS: [(u32, u32); 3] = [(86, 28), (115, 28), (67, 10)];
     let Some(i) = STAND_INS.iter().position(|&(f, _)| f == format) else {
         return format;
     };
     #[cfg(windows)]
     {
         use windows::Win32::Graphics::Direct3D12::*;
-        static REFUSED: std::sync::OnceLock<[bool; 2]> = std::sync::OnceLock::new();
+        static REFUSED: std::sync::OnceLock<[bool; 3]> = std::sync::OnceLock::new();
         let refused = REFUSED.get_or_init(|| {
-            STAND_INS.map(|(f, _)| {
+            STAND_INS.map(|(f, to)| {
                 let Some(host) = crate::host::host() else {
                     return false;
                 };
@@ -279,7 +281,7 @@ pub(crate) fn target_format(format: u32) -> u32 {
                     | D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0;
                 let refused = asked.is_err() || support.Support1.0 & both != both;
                 if refused {
-                    tracing::info!(format = f, "the host does not render to this format: 8-bit RGBA stands in");
+                    tracing::info!(format = f, stand_in = to, "the host does not render to this format: a stand-in is used");
                 }
                 refused
             })
@@ -878,7 +880,7 @@ fn place<'a>(
 ) -> AllocationInfo {
     let mut total = AllocationInfo {
         size: 0,
-        alignment: KIB_64,
+        alignment: 0,
     };
     for (i, desc) in descs.enumerate() {
         let Some(one) = footprint(desc) else {
@@ -908,6 +910,9 @@ fn place<'a>(
         );
         total.size = offset + one.size;
         total.alignment = total.alignment.max(one.alignment);
+    }
+    if total.alignment == 0 {
+        total.alignment = KIB_64;
     }
     total
 }
@@ -2436,23 +2441,27 @@ pub(crate) fn first_mip(view: &[u32]) -> u32 {
     }
 }
 
-/// The resource for a texture placed at `address` with the resource
-/// description `desc` (as words), made on first use.
+/// Normalizes a placed resource description for keying: words 1 and 13 are
+/// struct padding (after `dimension`, and at the end) where the title leaves
+/// uninitialized stack values, so two views of the same texture can differ
+/// only there. `VICTORY_PLACED_FILLER=1` keeps them unchanged.
 #[cfg(windows)]
-pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
-    // Words 1 and 13 of the description are the filler of its layout
-    // (after the dimension, and at the end): the title leaves there what
-    // its stack held, and two views of one texture that differed only in
-    // them each got a resource and a host copy of their own, on a card
-    // that fills at world entry. They are not part of what a texture is.
-    // `VICTORY_PLACED_FILLER=1`: kept in the key, as before.
+pub(crate) fn placed_desc_key(desc: &[u32; 14]) -> [u32; 14] {
     static KEPT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let raw = *desc;
     let mut key = *desc;
     if !*KEPT.get_or_init(|| std::env::var_os("VICTORY_PLACED_FILLER").is_some_and(|v| v == "1")) {
         key[1] = 0;
         key[13] = 0;
     }
+    key
+}
+
+/// The resource for a texture placed at `address` with the resource
+/// description `desc` (as words), made on first use.
+#[cfg(windows)]
+pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
+    let raw = *desc;
+    let key = placed_desc_key(desc);
     let desc = &key;
     let mut map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
     // How many resources the filler alone would have added (a count for
@@ -2988,6 +2997,66 @@ mod tests {
         );
         allocation_info(&mut info, std::ptr::null(), 0, 1, &texture(1, 1, 999, 1));
         assert_eq!(info.size, u64::MAX);
+
+        // Standalone 4 KiB console textures must preserve their 4 KiB alignment
+        // through `allocation_info` / `allocation_info2`, rather than clamping up
+        // to 64 KiB; empty queries still default to 64 KiB.
+        let bc7_desc = texture(512, 512, 98, 10);
+        allocation_info(&mut info, std::ptr::null(), 0, 1, &bc7_desc);
+        assert_eq!(
+            info,
+            AllocationInfo {
+                size: 0x56000,
+                alignment: 0x1000,
+            }
+        );
+        let mut each = std::array::from_fn::<_, 2, _>(|_| AllocationInfo1 {
+            offset: 0,
+            alignment: 0,
+            size: 0,
+        });
+        let two_bc7 = [
+            ResourceDesc1 {
+                desc: bc7_desc,
+                mip_region: [0; 3],
+            },
+            ResourceDesc1 {
+                desc: bc7_desc,
+                mip_region: [0; 3],
+            },
+        ];
+        allocation_info2(
+            &mut info,
+            std::ptr::null(),
+            0,
+            2,
+            two_bc7.as_ptr(),
+            each.as_mut_ptr(),
+        );
+        assert_eq!(
+            info,
+            AllocationInfo {
+                size: 2 * 0x56000,
+                alignment: 0x1000,
+            }
+        );
+        assert_eq!(each[0].alignment, 0x1000);
+        assert_eq!(each[1].offset, 0x56000);
+
+        // Fallback path (`footprint` without `texture_layout`) rounds `size`
+        // up to `alignment`, not unconditionally to 64 KiB.
+        let aligned_buf = ResourceDesc {
+            alignment: MIB_4,
+            ..buffer(100)
+        };
+        allocation_info(&mut info, std::ptr::null(), 0, 1, &aligned_buf);
+        assert_eq!(
+            info,
+            AllocationInfo {
+                size: MIB_4,
+                alignment: MIB_4,
+            }
+        );
     }
 
     #[test]
