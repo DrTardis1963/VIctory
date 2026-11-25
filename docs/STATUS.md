@@ -22,8 +22,8 @@
 | Phase | Milestone | Status | Notes |
 | :--- | :--- | :--- | :--- |
 | **Phase 0** | Host & Sandbox Setup | `DONE` | Testing copy (`109 files`, `208.62 GB`) + `victory.toml` + Agility SDK `1.614.1` SM 6.6 unlock verified on Win10 + RTX 3070. |
-| **Phase 1** | First Boot & Baseline Telemetry | `IN_PROGRESS` | `diag` built + `victory warm` completed (`25,750` translated, `8` refused, `2,725` compute pipelines / `428 MB` saved in `1,384 s`); external launcher ready at `F:\VIctory_Testing\launch_1080p.ps1`. First 1080p boot next. |
-| **Phase 2** | 100% Shaders & Full Visual Fidelity | `PENDING` | Close remaining shaders (`9dad973`/`5cfc8d8` queued), enable RT shadows, fix green transition & banding. |
+| **Phase 1** | First Boot & Baseline Telemetry | `DONE` | `victory warm` (`25,750` translated, `2,725` compute pipelines); 1080p boot succeeded (`30.0 fps` / `33.3 ms` intro/menus, `1,560 / 7,249 MB` VRAM, `0` dropped pipelines, `0` settles). |
+| **Phase 2** | 100% Shaders & Full Visual Fidelity | `NEXT` | Port `[T-01]`/`[T-02]` (`victory-amd` +48 shaders & `f64` wave sums), capture 3D cutscene/world telemetry, enable RT shadows, fix green transition & banding. |
 | **Phase 3** | 30 FPS Stable @ 1080p | `PENDING` | Eliminate queue flushes (`VICTORY_QUEUE_COPIES`), shadow copy-backs, tune 8 GB VRAM residency (`VICTORY_LEVELS_ON_DEMAND`). |
 | **Phase 4** | 60 FPS Stable @ 1080p/1440p | `PENDING` | Decouple 30 Hz pacing, multi-core command translation, async compute queue, DXIL wave32 opts. |
 | **Phase 5** | 60+ FPS, 100% Completion & Polish | `PENDING` | Uncapped pacing, `<16 GB` RAM target, full playthrough verification. |
