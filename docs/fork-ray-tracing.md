@@ -35,11 +35,15 @@ shaders and emulates the one instruction.
 
 ## What this fork adds
 
-1. **The builder programs translate** (49 of 52; all that the title creates in
-   the scenes tested). They pass buffer addresses in a spilled parameter table
+1. **The builder programs translate** (52 of 52, each with a host pipeline on
+   a 32-lane GPU). They pass buffer addresses in a spilled parameter table
    rather than in descriptors. Added: the spilled user-data table, root
    unordered-access views (translator and host binding), byte and 16-bit buffer
-   accesses, and several control-flow shapes.
+   accesses, and several control-flow shapes. Some stages are dispatched by
+   thread count (`DispatchX` with the console's thread-dimensions flag): the
+   host runs whole groups, and each builder program starts with the hardware's
+   own test, so the threads past the count are in no wave's EXEC. Run as one
+   group per thread, as before, those stages stored far past their buffers.
 2. **Title memory by raw address from shaders.** A directory with one entry per
    64 KiB of title address space leads a shader to the layer's host copy of
    that memory; loads, stores, atomic add/sub and float min/max go through it.
@@ -63,10 +67,12 @@ shaders and emulates the one instruction.
 
 ## Known gaps
 
-- With `VICTORY_BVH_BUILDER=1` the builder still stays off in a real run: a few
-  of its pipelines are refused by the host (they still ask for 64-lane waves on
-  a 32-lane GPU) or do not translate.
-- Five shadow-mask trace programs do not translate yet.
+- The whole builder has not run in the game yet (`VICTORY_BVH_BUILDER=1`; a
+  first run should add `VICTORY_BVH_QUARANTINE=1`).
+- A dispatch by thread count leaves out threads along x only (the builder's
+  are x by 1 by 1).
+- One shadow-ray trace program (`TraceShadowRays`, FullAdaptive) does not
+  translate yet.
 - An access to a title page that has no host copy is lost (a read gives zero, a
   store is dropped).
 - Not publicly documented, and assumed: the instruction's rounding, the order
