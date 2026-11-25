@@ -34,8 +34,13 @@ Resultados que não existem nas árvores de origem, cada um com o commit que dá
   de recorte de cabelo e roupa dos personagens, recusados pelas outras árvores, traduzem e criam
   pipeline em placas com Rasterizer Ordered Views.
 - **Samplers escolhidos por desvio e raios de sombra com endereço lido do heap** (`05e719b3`,
-  `4699d89a`): 44 shaders a mais traduzidos. Com os itens acima, **25.750 de 25.758** shaders
-  traduzem numa placa de 32 lanes (contagem do `victory translate`).
+  `4699d89a`): 44 shaders a mais traduzidos.
+- **Todos os shaders traduzem: 25.758 de 25.758** numa placa de 32 lanes (contagem do
+  `victory translate`; `0615710b`, `f237fecc`, `dc75ed82`, `8a1b59cf`, `96981b74`, `783a54ca`):
+  leituras da primeira lane de valores iguais em todas as lanes, recusas refeitas no nível da
+  wave, as duas metades de uma wave de 64 do console que se encontram sozinhas em grupos,
+  reservas de contador na LDS e máscaras de wave64 copiadas metade por metade. 74 deles ainda
+  não passam no validador do DirectX, mas a placa os aceita e eles rodam.
 - **Modo de tela do monitor** (`VICTORY_DISPLAY_MODE=1920x1080`): os render targets caem de
   3,4 GB para 2,5 GB numa tela 1080p.
 
@@ -50,7 +55,7 @@ benchmark.
 |-------|:--------:|----------:|-------------|
 | Carrega e inicia | ✅ | 100 % | uns 10 s até o primeiro quadro |
 | Vídeo de abertura e menus | ✅ | 100 % | 30 fps estáveis (o limite do próprio título) |
-| Cutscene de abertura | 🟡 | 75 % | vai até o fim; rostos, cabelo e roupa com textura e sem flash verde, mas escura sem a luz por ray tracing |
+| Cutscene de abertura | 🟡 | 75 % | vai até o fim e chega à cena da prisão; cabelo e roupa com textura e sem flash verde; a pele de parte dos personagens ainda sai preta e falta a luz por ray tracing |
 | Entrada no mundo | ✅ | 100 % | as pipelines vêm da biblioteca salva, sem tela preta |
 | Jogável (controle, HUD, menus) | 🟡 | 50 % | controle, HUD e menu de pausa funcionam, mas devagar |
 | Qualidade da imagem | 🟡 | 55 % | texturas em resolução cheia; sem a luz por ray tracing (sombras pretas) |
