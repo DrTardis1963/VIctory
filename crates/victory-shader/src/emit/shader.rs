@@ -77,6 +77,10 @@ pub fn heap_usage_marks() -> bool {
 pub const MEMORY_PAGES: u32 = 1 << 21;
 /// Dwords of the [`SLOT_FAULTS`] buffer.
 pub const MEMORY_FAULTS: u32 = 4096;
+/// Dwords of the [`SLOT_FAULTS`] buffer after [`MEMORY_FAULTS`]: a bit per
+/// page of [`MEMORY_PAGES`], set by a shader that stores to the page by
+/// address.
+pub const MEMORY_DIRTY_DWORDS: u32 = MEMORY_PAGES / 32;
 /// `RootType::Other` code of a user-data dword the host computes: the view
 /// heap slot of the memory copies' views ([`SLOT_MEMORY`]).
 pub const USER_MEMORY_BASE: u32 = 0x100;
