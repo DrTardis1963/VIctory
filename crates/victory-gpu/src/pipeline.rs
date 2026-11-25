@@ -546,6 +546,20 @@ fn hand_out(
     object::hand_out(PIPELINE, pipeline, iid, &PIPELINE_IIDS, out)
 }
 
+/// A pipeline with no shaders, for the device's precompiled-pipeline
+/// methods (`crate::device`, `VICTORY_PRECOMPILED_STUB`): it never gets a
+/// host pipeline, so what is drawn or dispatched with it is dropped and
+/// counted.
+pub(crate) fn hand_out_empty(iid: *const Iid, out: *mut This) -> HRESULT {
+    hand_out(
+        Vec::new(),
+        #[cfg(windows)]
+        None,
+        iid,
+        out,
+    )
+}
+
 /// Device method.
 pub(crate) extern "system" fn create_graphics(
     _: This,

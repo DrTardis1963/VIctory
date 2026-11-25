@@ -352,20 +352,29 @@ fn feature_levels(data: *mut c_void) -> HRESULT {
     }
 }
 
-/// Device methods 0x1c8 and 0x218 (`SLOT`). The title calls both
-/// (title+0x2477578 and title+0x24800d5) as `(this, description, interface
-/// id, out)`, asks for `ID3D12PipelineState`, and on success keeps the
-/// object `out` names and draws with it; on failure it goes without that
-/// pipeline, silently. What the descriptions hold is not known: the calls
-/// fail as they always did, with `out` null, and the first ones log the
-/// description's words and what its first word points at, so that the two
-/// methods can be written.
-/// shortcut: not implemented. Answering `S_OK` here without making the
-/// pipeline would hand the title whatever its stack held as an object.
+/// Device methods 0x1c8 and 0x218 (`SLOT`): the console's
+/// `DeserializeGraphicsPipelineStateX` and `DeserializeComputePipelineStateX`
+/// (as ZigZagBoi1/ScarlettPort's `pipeline/precompiled.rs` identifies them).
+/// The title calls both (title+0x2477578 and title+0x24800d5) as `(this,
+/// description, interface id, out)`, asks for `ID3D12PipelineState`, and on
+/// success keeps the object `out` names and draws with it. The description
+/// is a root signature, then `(pointer, size)` pairs: two state blocks, then
+/// per stage its native GFX10 code and metadata, out of the title's loaded
+/// pipeline cache. On failure the calls answer `E_NOTIMPL` with `out` null,
+/// and the first ones log the description's words.
+///
+/// `VICTORY_PRECOMPILED_STUB` (`compute`: 0x218 only; `all`: both) hands
+/// out a pipeline with no shaders instead ([`crate::pipeline::hand_out_empty`]),
+/// so what the title draws or dispatches with it is dropped. A check, not a
+/// way to run: whether a title that waits on these pipelines (on Series S
+/// run 2026-11-26 the title sat on its loading screen) goes on with them.
+/// shortcut: off by default. On Series X the title makes the same pipelines
+/// from their containers when these calls fail; an empty one handed out
+/// would take the place of a working one.
 extern "system" fn unknown_pipeline<const SLOT: usize>(
     _: This,
     desc: *const u8,
-    _iid: *const Iid,
+    iid: *const Iid,
     out: *mut This,
 ) -> HRESULT {
     use std::sync::atomic::{AtomicU32, Ordering};
@@ -402,7 +411,35 @@ extern "system" fn unknown_pipeline<const SLOT: usize>(
             "a pipeline creation method that is not implemented: the title goes without this pipeline"
         );
     }
+    if stubbed(SLOT, stub_setting()) {
+        return crate::pipeline::hand_out_empty(iid, out);
+    }
     E_NOTIMPL
+}
+
+/// `VICTORY_PRECOMPILED_STUB`, read once ([`unknown_pipeline`]).
+fn stub_setting() -> Option<&'static str> {
+    static SETTING: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    SETTING
+        .get_or_init(|| {
+            let v = std::env::var("VICTORY_PRECOMPILED_STUB").ok()?.trim().to_ascii_lowercase();
+            tracing::warn!(
+                setting = %v,
+                "VICTORY_PRECOMPILED_STUB: precompiled pipelines are handed out empty (their draws and dispatches are dropped)"
+            );
+            Some(v)
+        })
+        .as_deref()
+}
+
+/// Whether the precompiled-pipeline method at `slot` hands out an empty
+/// pipeline for the setting `stub`.
+fn stubbed(slot: usize, stub: Option<&str>) -> bool {
+    match stub {
+        Some("all" | "1") => true,
+        Some("compute") => slot == 0x218,
+        _ => false,
+    }
 }
 
 /// IUnknown 3, object methods 4, device methods 76 (0x18-0x290), then the
@@ -470,6 +507,18 @@ static FUNCTIONS: Table<160> = {
 mod tests {
     use super::*;
     use crate::object::slot;
+
+    #[test]
+    fn precompiled_stub_is_off_unless_asked_for() {
+        for slot in [0x1c8, 0x218] {
+            assert!(!stubbed(slot, None));
+            assert!(!stubbed(slot, Some("off")));
+            assert!(stubbed(slot, Some("all")));
+            assert!(stubbed(slot, Some("1")));
+        }
+        assert!(stubbed(0x218, Some("compute")));
+        assert!(!stubbed(0x1c8, Some("compute")));
+    }
 
     fn create_as(iid: &Iid) -> (HRESULT, This) {
         let version = CHECKED_VERSION;
