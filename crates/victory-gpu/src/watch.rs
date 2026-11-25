@@ -973,15 +973,22 @@ mod tests {
         } as usize;
         assert_ne!(p, 0);
         let (start, end) = (p, p + 4 * PAGE);
-        let (_, before) = writes(start, end, false).expect("watched");
-        assert!(before.is_empty());
+        // The journal is the process's and keeps pages after they are freed:
+        // memory other tests had at these addresses may be in it, older than
+        // this asking.
+        let (then, _) = writes(start, end, false).expect("watched");
         // SAFETY: committed pages of ours.
         unsafe { ((p + PAGE + 8) as *mut u8).write(1) };
-        let (now, after) = writes(start, end, false).expect("watched");
-        assert_eq!(after, [(p / PAGE + 1, now)]);
+        let (_, after) = writes(start, end, false).expect("watched");
+        let written = |pages: &[(usize, u64)]| pages.iter().find(|&&(page, _)| page == p / PAGE + 1).map(|&(_, w)| w);
+        // Asked by this test, or by another test's submission whose asking
+        // ahead took this range in: either way after `then`.
+        let now = written(&after).expect("the written page is reported");
+        assert!(now > then);
+        assert!(after.iter().all(|&(page, w)| page == p / PAGE + 1 || w <= then), "{after:?}");
         // Another asker after the kernel's bit was cleared still sees it.
         let (later, again) = writes(p + PAGE, p + 2 * PAGE, false).expect("watched");
-        assert!(later > now);
+        assert!(later >= now);
         assert_eq!(again, [(p / PAGE + 1, now)]);
         let mut plain = vec![0u8; PAGE];
         assert!(
