@@ -67,8 +67,16 @@ shaders and emulates the one instruction.
 
 ## Known gaps
 
-- The whole builder has not run in the game yet (`VICTORY_BVH_BUILDER=1`; a
-  first run should add `VICTORY_BVH_QUARANTINE=1`).
+- The whole builder ran in the game once (`VICTORY_BVH_BUILDER=1`, RTX 4060
+  Ti: characters lit at dusk, no device loss), at 4 to 6 s a frame: every
+  numbered copy was declared written by every list. Now a store by address
+  marks its page and only marked pages and the copies written root views
+  name are looked through (port of fxceless/victory-fork #814); not run in
+  the game yet.
+- The first stores to a page no root view names stay in the host's copy and
+  reach title memory only when a later store changes them again.
+- At most 1,023 copies are numbered, and none is ever let go: the first run
+  ran out 31 s after the builder started (pages past that read zeros).
 - A dispatch by thread count leaves out threads along x only (the builder's
   are x by 1 by 1).
 - One shadow-ray trace program (`TraceShadowRays`, FullAdaptive) does not
@@ -78,7 +86,8 @@ shaders and emulates the one instruction.
 - Not publicly documented, and assumed: the instruction's rounding, the order
   of two boxes entered at the same distance, the result for a ray exactly
   through an edge, and what a child that is not there returns when the ray
-  enters its box (here: a miss).
+  enters its box (here: a miss), or a box with its minimum above its maximum
+  (here: a miss).
 - Cost on the GPU is unmeasured.
 
 ## Where to look
