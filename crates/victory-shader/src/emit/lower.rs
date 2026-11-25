@@ -3449,6 +3449,23 @@ impl<'a> Lower<'a> {
         )
     }
 
+    /// A multiply kept apart from the add that follows it, rounding like the
+    /// plain product: a driver that folds a `fmul` feeding an `fadd`/`fsub`
+    /// into an FMA (one rounding where `v_mac_f32` and `v_mad_f32` round the
+    /// product first) does not see the `fmul` behind the FMad's call. The
+    /// third operand is a zero signed by the operands' own signs, which the
+    /// addition never steps out of and keeps a -0 product -0.
+    fn mul_apart(&mut self, a: V, b: V) -> V {
+        let c = self.cur;
+        let ia = self.as_int(a);
+        let ib = self.as_int(b);
+        let sign = self.s.m.bin(c, Bin::Xor, ia, ib);
+        let mask = self.s.m.i32(0x8000_0000);
+        let zeros = self.s.m.bin(c, Bin::And, sign, mask);
+        let zero = self.as_float(zeros);
+        self.fmad(a, b, zero)
+    }
+
     /// `f` as an f16 in the low bits, rounded toward zero: the nearest-even
     /// conversion, one step back toward zero where it rounded away (which
     /// also turns an overflow to infinity into the largest finite half).
@@ -4628,16 +4645,38 @@ impl<'a> Lower<'a> {
             return Err("LDS the program does not allocate");
         }
         let a = self.vgprs(inst, addr.as_ref().ok_or("an LDS address")?, 1)?[0];
-        // shortcut: LDS addresses are taken as dword-aligned and in bounds
-        // (out-of-bounds console accesses read 0 and drop writes).
-        let dword = |l: &mut Self, bytes: u32| -> V {
+        // shortcut: LDS addresses are taken as dword-aligned.
+        // The address is `addr + offset` in 32 bits (it wraps: LLVM folds a
+        // base below 0 and an offset on GFX7 and later). Each dword comes
+        // with whether it lies inside the program's LDS:
+        // out-of-bounds console accesses read 0 and drop writes, and the
+        // host index is clamped so it never leaves the group-shared array.
+        // (the title's own allocation: dwords the lowering adds past it for
+        // its wave exchanges are not the title's to reach)
+        let title_dwords = match &self.x.native.io {
+            StageIo::Cs(cs) => cs.lds_bytes() / 4,
+            StageIo::Ms(ms) => ms.lds_bytes.div_ceil(4),
+            _ => self.s.lds_dwords,
+        };
+        let dword = |l: &mut Self, bytes: u32| -> (V, V) {
             let c = l.cur;
             let o = l.s.m.i32(bytes);
             let at = l.s.m.bin(c, Bin::Add, a, o);
             let two = l.s.m.i32(2);
             let index = l.s.m.bin(c, Bin::LShr, at, two);
+            let n = l.s.m.i32(title_dwords);
+            let inside = l.s.m.cmp(c, pred::IULT, index, n);
+            let zero = l.s.m.i32(0);
+            let index = l.s.m.select(c, inside, index, zero);
             let lds = l.s.lds();
-            l.s.m.element(c, lds, index)
+            (l.s.m.element(c, lds, index), inside)
+        };
+        // A lane accesses when its guard holds and the dword is inside.
+        let on = |l: &mut Self, inside: V| -> V {
+            match guard {
+                Some(g) => l.s.m.bin(l.cur, Bin::And, g, inside),
+                None => inside,
+            }
         };
         let width = |n: &str| match n.rsplit('_').next() {
             Some("b64") => 2,
@@ -4671,7 +4710,7 @@ impl<'a> Lower<'a> {
                 || name.ends_with("_d16_hi")
         });
         if let Some(bits) = sub {
-            let p = dword(self, offset);
+            let (p, inside) = dword(self, offset);
             let o = self.s.m.i32(offset);
             let at = self.s.m.bin(c, Bin::Add, a, o);
             let three = self.s.m.i32(3);
@@ -4681,6 +4720,8 @@ impl<'a> Lower<'a> {
             if name.starts_with("ds_read") {
                 let reg = dst_reg.ok_or("an LDS read result")?;
                 let w = self.s.m.load(c, p);
+                let zero = self.s.m.i32(0);
+                let w = self.s.m.select(c, inside, w, zero);
                 let x = self.s.m.bin(c, Bin::LShr, w, sh);
                 let x = if base.contains("_i") {
                     let k = self.s.m.i32(32 - bits);
@@ -4723,7 +4764,8 @@ impl<'a> Lower<'a> {
                 let ones = self.s.m.i32(u32::MAX);
                 let keep = self.s.m.bin(c, Bin::Xor, m, ones);
                 use super::bitcode::Rmw;
-                let at = self.begin_guarded(guard);
+                let g = on(self, inside);
+                let at = self.begin_guarded(Some(g));
                 self.s.m.atomic(self.cur, Rmw::And, p, keep);
                 self.s.m.atomic(self.cur, Rmw::Or, p, x);
                 self.end_guarded(at, &[]);
@@ -4742,8 +4784,10 @@ impl<'a> Lower<'a> {
             let mut n = 0;
             for (off, w) in elements {
                 for k in 0..w {
-                    let p = dword(self, off + 4 * k);
+                    let (p, inside) = dword(self, off + 4 * k);
                     let x = self.s.m.load(self.cur, p);
+                    let zero = self.s.m.i32(0);
+                    let x = self.s.m.select(self.cur, inside, x, zero);
                     self.write(inst, Reg::V(reg + n), x, guard);
                     n += 1;
                 }
@@ -4765,12 +4809,13 @@ impl<'a> Lower<'a> {
                     stores.push((off + 4 * k as u32, x));
                 }
             }
-            let at = self.begin_guarded(guard);
             for (off, x) in stores {
-                let p = dword(self, off);
+                let (p, inside) = dword(self, off);
+                let g = on(self, inside);
+                let at = self.begin_guarded(Some(g));
                 self.s.m.store(self.cur, p, x);
+                self.end_guarded(at, &[]);
             }
-            self.end_guarded(at, &[]);
             return Ok(());
         }
         // Atomics: the old value returns with `_rtn`.
@@ -4803,13 +4848,21 @@ impl<'a> Lower<'a> {
             Some((_, v)) => self.i32_of(v).unwrap_or(self.s.m.i32(0)),
             None => self.s.m.i32(0),
         };
-        let p = dword(self, offset);
+        let (p, inside) = dword(self, offset);
+        // Lanes the guard leaves out keep the old register; lanes outside
+        // the LDS read 0.
+        let zero = self.s.m.i32(0);
+        let outside = match guard {
+            Some(g) => self.s.m.select(self.cur, g, zero, outside),
+            None => zero,
+        };
+        let g = on(self, inside);
         if let Some(max) = match op.as_str() {
             "max_f32" => Some(true),
             "min_f32" => Some(false),
             _ => None,
         } {
-            let at = self.begin_guarded(guard);
+            let at = self.begin_guarded(Some(g));
             let r = self.lds_float_min_max(p, v0, max);
             let r = self.end_guarded(at, &[(r, outside)])[0];
             if let Some(reg) = dst_reg {
@@ -4817,7 +4870,7 @@ impl<'a> Lower<'a> {
             }
             return Ok(());
         }
-        let at = self.begin_guarded(guard);
+        let at = self.begin_guarded(Some(g));
         let r = match rmw {
             Some(op) => self.s.m.atomic(self.cur, op, p, v0),
             // Compare with data0, store data1.
@@ -6303,18 +6356,101 @@ impl<'a> Lower<'a> {
         Ok(out)
     }
 
+    /// A UNORM / SNORM channel `x` (its decoded f32 bits) of `w` bits as
+    /// f16, rounded once to nearest even as RDNA2 does (`legacyF32ToF16` of
+    /// the f32 rounds twice, the second time toward zero, leaving about half
+    /// the codes a unit low). `code / (2^w - 1)` repeats the w-bit code in
+    /// binary, so its first 32 bits, `(code << 32) / (2^w - 1)`, decide the
+    /// rounding and a tie cannot happen. SNORM is `|v| / (2^(w-1) - 1)`.
+    fn norm_f16(&mut self, x: V, w: u32, snorm: bool) -> V {
+        let c = self.cur;
+        let bits = if snorm { w - 1 } else { w };
+        let d = (1u32 << bits) - 1;
+        let (i32t, i64t) = (self.s.t.i32, self.s.m.int(64));
+        self.s.flags |= flags::INT64;
+        // the code, back from the decoded value (|value| for SNORM)
+        let mag = self.s.m.i32(0x7FFF_FFFF);
+        let ax = self.s.m.bin(c, Bin::And, x, mag);
+        let af = self.as_float(ax);
+        let df = self.s.m.f32((d as f32).to_bits());
+        let y = self.s.m.bin(c, Bin::Mul, af, df);
+        let y = self.unary(26, y); // round to nearest even
+        let y = self.s.m.cast(c, Cast::FpToUi, y, i32t);
+        // first 32 bits of y / d
+        let y64 = self.s.m.cast(c, Cast::ZExt, y, i64t);
+        let k32 = self.s.m.int_const(i64t, 32);
+        let y64 = self.s.m.bin(c, Bin::Shl, y64, k32);
+        let d64 = self.s.m.int_const(i64t, i64::from(d));
+        let p = self.s.m.bin(c, Bin::UDiv, y64, d64);
+        let p = self.s.m.cast(c, Cast::Trunc, p, i32t);
+        let lz = self.s.op(c, "unaryBits.i32", Attr::ReadNone, i32t, 33, &[p]);
+        // normal: 11 bits after the leading one and the round bit
+        let k14 = self.s.m.i32(14);
+        let e = self.s.m.bin(c, Bin::Sub, k14, lz);
+        let pn = self.s.m.bin(c, Bin::Shl, p, lz);
+        let k20 = self.s.m.i32(20);
+        let b = self.s.m.bin(c, Bin::LShr, pn, k20);
+        let one = self.s.m.i32(1);
+        let m = self.s.m.bin(c, Bin::LShr, b, one);
+        let r = self.s.m.bin(c, Bin::And, b, one);
+        let m = self.s.m.bin(c, Bin::Add, m, r);
+        let em1 = self.s.m.bin(c, Bin::Sub, e, one);
+        let k10 = self.s.m.i32(10);
+        let eh = self.s.m.bin(c, Bin::Shl, em1, k10);
+        let normal = self.s.m.bin(c, Bin::Add, eh, m);
+        // below 2^-14: a subnormal half
+        let k8 = self.s.m.i32(8);
+        let k7 = self.s.m.i32(7);
+        let s8 = self.s.m.bin(c, Bin::LShr, p, k8);
+        let r7 = self.s.m.bin(c, Bin::LShr, p, k7);
+        let r7 = self.s.m.bin(c, Bin::And, r7, one);
+        let sub = self.s.m.bin(c, Bin::Add, s8, r7);
+        let is_normal = self.s.m.cmp(c, pred::SGE, e, one);
+        let h = self.s.m.select(c, is_normal, normal, sub);
+        // 0 and 1.0 (the latter's expansion has no leading one in 32 bits' reach)
+        let zero = self.s.m.i32(0);
+        let is0 = self.s.m.cmp(c, pred::EQ, y, zero);
+        let h = self.s.m.select(c, is0, zero, h);
+        let dv = self.s.m.i32(d);
+        let full = self.s.m.cmp(c, pred::IUGE, y, dv);
+        let h1 = self.s.m.i32(0x3C00);
+        let h = self.s.m.select(c, full, h1, h);
+        if !snorm {
+            return h;
+        }
+        let k31 = self.s.m.i32(31);
+        let sign = self.s.m.bin(c, Bin::LShr, x, k31);
+        let k15 = self.s.m.i32(15);
+        let sign = self.s.m.bin(c, Bin::Shl, sign, k15);
+        self.s.m.bin(c, Bin::Or, h, sign)
+    }
+
     /// Channels of buffer format `format`, as [`Self::format_load`] gives
     /// them, as d16 data: 16 bits each, two per dword, low half first (an
-    /// odd last high half 0). Integer formats keep their low 16 bits; the
+    /// odd last high half 0). Integer formats saturate to 16 bits (UINT to
+    /// 0xFFFF, SINT to -32768..32767), as RDNA2 does for a 32-bit channel;
+    /// UNORM / SNORM ones are rounded once to f16 ([`Self::norm_f16`]); the
     /// others become f16.
     fn d16_channels(&mut self, format: u8, channels: Vec<V>) -> Result<Vec<V>, Why> {
-        let (_, numeric) = buffer_format(format).ok_or("a buffer format")?;
+        let (widths, numeric) = buffer_format(format).ok_or("a buffer format")?;
         let c = self.cur;
         let mut halves = Vec::new();
-        for x in channels {
-            halves.push(if matches!(numeric, Numeric::Uint | Numeric::Sint) {
+        for (k, x) in channels.into_iter().enumerate() {
+            let w = widths.get(k).copied().unwrap_or(0);
+            let norm = matches!(numeric, Numeric::Unorm | Numeric::Snorm);
+            halves.push(if matches!(numeric, Numeric::Uint) {
                 let m = self.s.m.i32(0xFFFF);
+                let lt = self.s.m.cmp(c, pred::IULT, x, m);
+                self.s.m.select(c, lt, x, m)
+            } else if matches!(numeric, Numeric::Sint) {
+                let (lo, hi, m) = (self.s.m.i32((-32768i32) as u32), self.s.m.i32(32767), self.s.m.i32(0xFFFF));
+                let below = self.s.m.cmp(c, pred::SLT, x, lo);
+                let x = self.s.m.select(c, below, lo, x);
+                let above = self.s.m.cmp(c, pred::SGT, x, hi);
+                let x = self.s.m.select(c, above, hi, x);
                 self.s.m.bin(c, Bin::And, x, m)
+            } else if norm && (2..=16).contains(&w) {
+                self.norm_f16(x, w, matches!(numeric, Numeric::Snorm))
             } else {
                 let (f, i32t) = (self.as_float(x), self.s.t.i32);
                 self.s
@@ -7335,7 +7471,7 @@ impl<'a> Lower<'a> {
                 let r = match name {
                     "v_fmac_f32" => self.fmad(a, bb, acc),
                     "v_mac_f32" => {
-                        let m = self.s.m.bin(c, Bin::Mul, a, bb);
+                        let m = self.mul_apart(a, bb);
                         self.s.m.bin(c, Bin::Add, m, acc)
                     }
                     _ => {
@@ -7350,7 +7486,7 @@ impl<'a> Lower<'a> {
                 let m = if name == "v_mad_legacy_f32" {
                     self.legacy_mul(a, bb)
                 } else {
-                    self.s.m.bin(c, Bin::Mul, a, bb)
+                    self.mul_apart(a, bb)
                 };
                 let r = self.s.m.bin(c, Bin::Add, m, cc);
                 float(self, r)
@@ -9403,7 +9539,10 @@ impl<'a> Lower<'a> {
                 } else if f16 {
                     let f = half(self, h)?.ok_or("a packed input half no element holds")?;
                     let lo = to_f16(self, f);
-                    self.low_half(inst, reg, lo)
+                    // omod and clamp are part of the f16 instruction; op_sel[3]
+                    // picks the destination half.
+                    let lo = self.half_modifiers(inst, lo);
+                    return self.write_half(inst, lo, None);
                 } else if matches!(eval, Eval::Mode(1)) {
                     // The whole dword of a flat input: both halves.
                     let h = 2 * attribute.channel;
@@ -9535,6 +9674,32 @@ impl<'a> Lower<'a> {
         let old = self.s.m.bin(c, Bin::And, old, high);
         let x = self.s.m.bin(c, Bin::And, x, low);
         self.s.m.bin(c, Bin::Or, old, x)
+    }
+
+    /// VOP3 f16 output modifiers: omod, then clamp, applied in f32 so the
+    /// half conversion rounds once (the order `write_f` uses).
+    fn half_modifiers(&mut self, inst: &Inst, h: V) -> V {
+        let Fields::Valu(v) = &inst.fields else {
+            return h;
+        };
+        if v.omod == 0 && !v.clamp {
+            return h;
+        }
+        let c = self.cur;
+        let f32t = self.s.t.f32;
+        let mut f = self
+            .s
+            .op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[h]);
+        if v.omod != 0 {
+            let factor = [1.0f32, 2.0, 4.0, 0.5][usize::from(v.omod)];
+            let k = self.s.m.f32(factor.to_bits());
+            f = self.s.m.bin(c, Bin::Mul, f, k);
+        }
+        if v.clamp {
+            f = self.unary(7, f);
+        }
+        self.s
+            .op(c, "legacyF32ToF16", Attr::ReadNone, self.s.t.i32, 130, &[f])
     }
 
     fn image(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
@@ -11678,6 +11843,27 @@ mod tests {
             mesh_stride: 0,
         })
         .map(|_| ())
+    }
+
+    /// LDS accesses past the program's 512 bytes (reads, writes, bytes,
+    /// read2, a returning atomic) lower with their in-bounds guard.
+    #[test]
+    fn lds_past_the_allocation_lowers_guarded() {
+        // DS `op` at v0 with `data` v1 into `vdst`, byte offset `offset`.
+        let ds = |op: u32, vdst: u32, offset: u32| [0xD800_0000 | op << 18 | offset, vdst << 24 | 1 << 8];
+        let mut words = vec![];
+        for (op, vdst, offset) in [
+            (0x0D, 0, 512),     // ds_write_b32 [v0 + 512], v1
+            (0x36, 5, 0xFFFC),  // ds_read_b32 v5, [v0 + 65532]
+            (0x39, 6, 600),     // ds_read_i8 v6, [v0 + 600]
+            (0x1E, 0, 513),     // ds_write_b8 [v0 + 513], v1
+            (0x37, 7, 200 << 8), // ds_read2_b32 v[7:8], [v0], [v0 + 800]
+            (0x20, 9, 512),     // ds_add_rtn_u32 v9, [v0 + 512], v1
+        ] {
+            words.extend(ds(op, vdst, offset));
+        }
+        words.push(S_ENDPGM);
+        lower_with(&words, vec![], vec![]).unwrap();
     }
 
     /// Lowers a compute program with the root parameters `layout` (in user
