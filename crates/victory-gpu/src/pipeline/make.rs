@@ -287,6 +287,7 @@ fn wait(p: &Pending, frame: u64) {
             }
         }
     }
+    crate::framelog::add(crate::framelog::T::PipelineWaitUs, started.elapsed().as_micros() as u64);
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(
         crate::copystat::C::PipelineWaitUs,
@@ -489,6 +490,7 @@ mod tests {
             hash: "c0c0c0c0c0c0c0c0".to_owned(),
             container: Vec::new(),
             translated: OnceLock::new(),
+            walks: OnceLock::new(),
         });
         let early_one = Arc::new(Pending::new(vec![cs.clone()], None));
         early(&early_one);
