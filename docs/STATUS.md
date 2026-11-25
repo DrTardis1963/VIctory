@@ -34,7 +34,7 @@
 - `cargo xtask policy`: **PASS** (`183 files ok`)
 - `cargo clippy --workspace --all-targets --locked -- -D warnings`: **PASS** (0 warnings)
 - `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`: **PASS** (0 warnings)
-- `cargo test --workspace --locked --exclude victory-gpu --exclude victory-shader`: **PASS** (`163 passed, 0 failed, 5 ignored` across 9 crates, including `xtask` 10/10)
+- `cargo test --workspace --locked --exclude victory-gpu --exclude victory-shader`: **PASS** (`198 passed, 0 failed, 5 ignored` across 9 crates, including `xtask` 10/10)
 - `cargo test -p victory-shader --lib --locked`: **PASS** (`265 passed, 0 failed, 2 ignored` — includes `packed_dot_products_and_clamps_execute_cleanly` & SM 6.6 suite)
 - `cargo test -p victory-gpu --lib --locked -- --test-threads=1`: **PASS** (`205 passed, 0 failed, 4 ignored` — includes `packed_neighbours_stay`, `records_copied_as_bytes_are_made_at_the_next_sync`, `a_record_that_changed_prints_otherwise`, `a_view_off_its_copys_elements_gets_its_own_bytes`)
 - Shader diagnostic note (`#f133e35efed2a48a`): `dxil.dll` validation passes (`26,703` IR instructions, `52` used resources), `CreateComputePipelineState` fails with `E_INVALIDARG`; queued for Phase 2C root-signature / compute state inspection.
