@@ -608,8 +608,10 @@ fn translate(
 }
 
 fn translate_programs(container: &Container, programs: Vec<NativeProgram>, example: &dyn Fn() -> String, t: &mut Tally, checks: &mut Checks<'_>) {
-    for p in programs {
+    for mut p in programs {
         t.programs += 1;
+        // (as `victory_shader::translate` does)
+        victory_shader::spill::limit_threads(&mut p);
         match victory_shader::spill::build(&p) {
             Ok(program) => {
                 t.translated += 1;

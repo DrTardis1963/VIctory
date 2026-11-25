@@ -2601,6 +2601,18 @@ impl<'a> Lower<'a> {
             Input::ThreadIdInGroup(c) => return self.thread_id(c),
             Input::GroupId(c) => return self.compute_id("groupId.i32", 94, c),
             Input::GroupInfo => return Val::Missing("the thread-group info SGPR"),
+            // The dispatch's threads along x less those of the groups before
+            // this one (a dispatch by group count has `u32::MAX` of them).
+            Input::ThreadLimit => {
+                let total = self.host_word(RootType::Other(super::shader::USER_THREAD_LIMIT), 0, 0);
+                let Val::I32(group) = self.compute_id("groupId.i32", 94, 0) else {
+                    unreachable!()
+                };
+                let e = self.s.entry;
+                let x = self.s.m.i32(self.s.threads.expect("compute")[0]);
+                let before = self.s.m.bin(e, Bin::Mul, group, x);
+                return Val::I32(self.s.m.bin(e, Bin::Sub, total, before));
+            }
             Input::MeshGroup => {
                 let Val::I32(g) = self.compute_id("groupId.i32", 94, 0) else {
                     unreachable!()
