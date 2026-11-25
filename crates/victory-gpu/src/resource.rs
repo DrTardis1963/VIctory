@@ -2498,14 +2498,15 @@ impl OnDemand {
     /// [`crate::tiles::Tiled::uploaded`]; `memory`: where the texture's
     /// title memory starts (its slots are made again if the first level
     /// they may show changed).
-    /// Held levels get tiles only while the card has room ([`room`]).
+    /// Held levels get tiles only while the card has room ([`room`]), or
+    /// `whatever` it has (`crate::texture::whatever_the_room`).
     /// Returns whether a level is still without its tiles: the caller
     /// records the upload again later.
-    pub(crate) fn uploaded(&self, held: u32, memory: u64) -> bool {
+    pub(crate) fn uploaded(&self, held: u32, memory: u64, whatever: bool) -> bool {
         let Some(tiled) = &self.0.tiled else {
             return false;
         };
-        let (changed, waiting) = tiled.uploaded(&self.0.texture, held, room());
+        let (changed, waiting) = tiled.uploaded(&self.0.texture, held, whatever || room());
         if changed {
             crate::descriptor::host::levels_changed(memory);
         }

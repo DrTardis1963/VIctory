@@ -852,6 +852,23 @@ pub(crate) fn title_written(texture: &ID3D12Resource) -> bool {
     unsafe { texture.GetDesc() }.Flags.0 & TARGET_DEPTH_UNORDERED == 0
 }
 
+thread_local! {
+    /// While [`whatever_the_room`] runs its uploads.
+    static WHATEVER_THE_ROOM: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `f`; the uploads it records ([`upload_from`]) give a texture made
+/// level by level the card's memory for every level the title holds,
+/// whatever room the card has. For what is read once (`draw.rs`
+/// `bake_sources`): a level left waiting for room reads zeros, and nothing
+/// reads it a second time.
+pub(crate) fn whatever_the_room<R>(f: impl FnOnce() -> R) -> R {
+    WHATEVER_THE_ROOM.set(true);
+    let out = f();
+    WHATEVER_THE_ROOM.set(false);
+    out
+}
+
 /// Records, once per list, the copy of `resource`'s staging buffer into
 /// its host copy, and the detiling that refreshes the staging buffer at
 /// submission if the memory changed. Leaves the texture in the copy
@@ -892,11 +909,13 @@ pub(crate) fn upload_from(list: &HostList, resource: This, texture: &ID3D12Resou
     // would record an upload again until the title writes the texture: the
     // level stayed empty, the texture blurred or black. Asked again about
     // once a second, and only when the card has room; the staging buffer
-    // still holds the level's bytes.
+    // still holds the level's bytes. (At once and without room for what is
+    // read once: `whatever_the_room`.)
+    let whatever = WHATEVER_THE_ROOM.get();
     if staging.on_demand {
         let since = staging.waiting.load(Relaxed);
-        if since != 0 && crate::host::long_ago(since, 1000, 2) {
-            if crate::resource::room_lately() {
+        if since != 0 && (whatever || crate::host::long_ago(since, 1000, 2)) {
+            if whatever || crate::resource::room_lately() {
                 staging.waiting.store(0, Relaxed);
                 staging.dirty.store(true, Relaxed);
                 crate::tiles::STATS[10].fetch_add(1, Relaxed);
@@ -984,7 +1003,7 @@ pub(crate) fn upload_from(list: &HostList, resource: This, texture: &ID3D12Resou
     };
     list.defer_texture(staging.clone(), true);
     list.defer_host(move || {
-        let waiting = on_demand.uploaded(staging.detiled.load(Relaxed), staging.memory as u64);
+        let waiting = on_demand.uploaded(staging.detiled.load(Relaxed), staging.memory as u64, whatever);
         staging.waiting.store(if waiting { crate::host::moment().max(1) } else { 0 }, Relaxed);
         // A texture picked by index has no staging buffer after this
         // upload: its slots are made due again by the texture pass.

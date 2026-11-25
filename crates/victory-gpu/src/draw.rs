@@ -106,6 +106,53 @@ const BAKE_PIXEL_SHADERS: [&str; 4] =
 /// made for a bake draw.
 pub(crate) static EARLY_TEXTURE_PASSES: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
 
+/// The words of `bytes` (little-endian, in their order, each once) that
+/// `names` holds for; 0 names nothing. For title data that holds heap
+/// slots as plain numbers among its other words ([`State::bake_sources`]).
+fn named_words(bytes: &[u8], names: impl Fn(u32) -> bool) -> Vec<u32> {
+    let mut found = Vec::new();
+    for word in bytes.chunks_exact(4) {
+        let word = u32::from_le_bytes([word[0], word[1], word[2], word[3]]);
+        if word != 0 && !found.contains(&word) && names(word) {
+            found.push(word);
+        }
+    }
+    found
+}
+
+#[cfg(test)]
+mod named_words_tests {
+    #[test]
+    fn words_that_name_a_slot_are_found_once_and_zero_never() {
+        let words = [0u32, 7, 0x3f80_0000, 12, 7, 9];
+        // (And two bytes that are no word.)
+        let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).chain([7, 0]).collect();
+        assert_eq!(super::named_words(&bytes, |w| matches!(w, 0 | 7 | 12)), [7, 12]);
+    }
+}
+
+/// Whether title slot `index` of `heap` holds a view of a texture the
+/// title fills whose memory is there (some of it, of one it placed): what
+/// the texture pass ([`State::heap_textures`]) would upload.
+fn title_texture_there(heap: &crate::descriptor::Heap, index: u32) -> bool {
+    // The heap's memory is the title's, and not all of it need be there.
+    let there = |handle: &u64| crate::texture::committed(*handle as *const u8, 12);
+    match heap.handle(index).filter(there).and_then(crate::descriptor::view) {
+        Some(View::Placed(false, resource, desc)) if resource[0] != 1 => {
+            let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
+            let len = crate::resource::placed_bytes_from(&resource, crate::resource::first_mip(&desc)).unwrap_or(1);
+            crate::texture::mapped_bytes(address as *const u8, len as usize) != 0
+        }
+        Some(View::Shader(object, _)) => {
+            crate::resource::buffer_bytes(object as This).is_none()
+                && crate::resource::title_fills(object as This)
+                // (What the card itself wrote is not in title memory.)
+                && !crate::texture::host_wrote(object)
+        }
+        _ => false,
+    }
+}
+
 /// Whether a buffer range a shader names through an unordered access view
 /// is given to shaders as written (snapshot before the submission, compare
 /// and write back after) only if that shader's code can store to buffers.
@@ -1711,8 +1758,9 @@ impl State {
     /// ([`early_budgets`]): once a frame for a few milliseconds, at the
     /// frame's first draw with a view heap set, and with a larger budget
     /// of its own before every draw whose pixel shader is one of the
-    /// title's bake programs. The uploads are recorded into `list` ahead
-    /// of the draw being bound, as the world's pass records them.
+    /// title's bake programs, after the textures that draw itself names
+    /// ([`State::bake_sources`]). The uploads are recorded into `list`
+    /// ahead of the draw being bound, as the world's pass records them.
     fn early_textures(&self, list: &HostList, p: &HostPipeline, compute: bool) {
         let (early_ms, bake_ms) = early_budgets();
         if compute || (early_ms == 0 && bake_ms == 0) {
@@ -1732,9 +1780,12 @@ impl State {
         let left = bake_ms.saturating_sub(BAKED_MS.load(Ordering::Relaxed));
         let budget = if bake && left > 0 {
             // What a bake may read must be there now: up to 2 GiB.
-            (left, 2 << 30)
+            Some((left, 2 << 30))
         } else if first && early_ms > 0 {
-            (early_ms, 64 << 20)
+            Some((early_ms, 64 << 20))
+        } else if bake {
+            // The frame's bakes have had their time: its own sources only.
+            None
         } else {
             return;
         };
@@ -1750,6 +1801,13 @@ impl State {
         let Some(host) = heap.host() else {
             return;
         };
+        // The textures this draw itself names, whatever the pass gets to.
+        static SOURCES: AtomicU64 = AtomicU64::new(0);
+        let sources = if bake { self.bake_sources(list, p, heap, host) } else { 0 };
+        let sources_so_far = SOURCES.fetch_add(sources, Ordering::Relaxed) + sources;
+        let Some(budget) = budget else {
+            return;
+        };
         let bake = bake && left > 0;
         let n = EARLY_TEXTURE_PASSES[usize::from(bake)].fetch_add(1, Ordering::Relaxed) + 1;
         if bake && n.is_power_of_two() {
@@ -1757,10 +1815,12 @@ impl State {
             tracing::info!(
                 frame,
                 bakes = n,
+                its_sources = sources,
+                sources_so_far,
                 queued_at_the_last_pass = slots,
                 due_at_the_last_pass = due,
                 uploaded_so_far = HEAP_TEXTURES.load(Ordering::Relaxed),
-                "a draw of the title's decoration bake: textures picked by index are uploaded first (VICTORY_BAKE_TEXTURES_MS=0: not)"
+                "a draw of the title's decoration bake: the textures it names and others picked by index are uploaded first (VICTORY_BAKE_TEXTURES_MS=0: not)"
             );
         }
         let began = std::time::Instant::now();
@@ -1770,6 +1830,74 @@ impl State {
         if bake {
             BAKED_MS.fetch_add(began.elapsed().as_millis() as u64, Ordering::Relaxed);
         }
+    }
+
+    /// Before a draw of the title's decoration bake (`p`): the textures it
+    /// will pick by index are made and uploaded now, whatever the card's
+    /// room and the texture pass's budget and order. Returns how many.
+    ///
+    /// The bake reads its sources once and what it draws stays for the run
+    /// (the title compresses the targets into the character's skin
+    /// textures). The pass before it ([`State::early_textures`]) serves the
+    /// queue of all the heap's textures, in the queue's order and within
+    /// its time, and makes no host copy while the card is full; and a
+    /// source uploaded seconds earlier has been given up again by then as
+    /// one no shader took (`HostHeap::texture_slots_evict`), since nothing
+    /// samples it before the bake does. A source not there was baked as
+    /// nothing: black skin on the characters baked after the card had
+    /// filled, textured skin on the ones baked before.
+    ///
+    /// Which they are, from the bake programs' native code
+    /// (`PS_DecorationBlend_*`, `PS_BakeDecorations_*`): heap slots held as
+    /// plain words in the constants (144 bytes) and the layer records (304
+    /// bytes a layer) of the draw's own table. Every word of those that
+    /// names a texture the title fills is taken for one.
+    /// shortcut: a word that is such a number by chance uploads a texture
+    /// the bake does not read; decode the records' fields if that ever
+    /// costs.
+    fn bake_sources(
+        &self,
+        list: &HostList,
+        p: &HostPipeline,
+        heap: &crate::descriptor::Heap,
+        host: &crate::descriptor::host::HostHeap,
+    ) -> u64 {
+        /// The most bytes of one of the table's buffers looked at: 53 layers.
+        const MOST: u64 = 16 << 10;
+        let mut bytes = Vec::new();
+        for stage in p.stages.iter().filter(|s| BAKE_PIXEL_SHADERS.contains(&s.shader.hash.as_str())) {
+            let tabled = |u: &&UsedResource| u.root == RootType::Table && u.kind != ResourceType::Sampler;
+            for u in stage.translated().used.iter().filter(tabled) {
+                let Some(Root::Table(table)) = self.roots_ref(false).get(usize::from(u.slot)) else {
+                    continue;
+                };
+                let range = match crate::descriptor::view(table + u64::from(u.table_offset_dwords) * 4) {
+                    Some(View::Constant(address, size)) => Some((address, u64::from(size))),
+                    Some(view) => crate::descriptor::host::buffer_range(&view),
+                    None => None,
+                };
+                if let Some((address, len)) = range.filter(|&(_, len)| len <= MOST) {
+                    let at = bytes.len();
+                    bytes.resize(at + (len as usize & !3), 0);
+                    if !crate::host::read_into(address as *const u8, &mut bytes[at..]) {
+                        bytes.truncate(at);
+                    }
+                }
+            }
+        }
+        let now = crate::host::now_ms();
+        let mut made = 0;
+        for index in named_words(&bytes, |index| title_texture_there(heap, index)) {
+            if let Some(handle) = heap.handle(index)
+                && let Some(view) = host.mirror(index, handle, true)
+            {
+                crate::texture::whatever_the_room(|| readable(list, ResourceType::Srv, &view));
+                // The queue's to give up again once no shader takes it.
+                host.texture_slot_made(index, now);
+                made += 1;
+            }
+        }
+        made
     }
 
     /// The queue's side of the card accounting line
