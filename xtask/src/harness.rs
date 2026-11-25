@@ -841,11 +841,15 @@ fn prepare_cmd(
             env_vars.push(("VICTORY_CARD_BUFFERS_MIN_MB".to_owned(), "1".to_owned()));
             env_vars.push(("VICTORY_CARD_REHASH_RUNS".to_owned(), "1".to_owned()));
             env_vars.push(("VICTORY_JOIN_COPIES".to_owned(), "1".to_owned()));
+            env_vars.push(("VICTORY_TEXTURE_MIP_DROP_MIN_SIZE".to_owned(), "1024".to_owned()));
+            env_vars.push(("VICTORY_TEXTURE_ROOM_PERCENT".to_owned(), "94".to_owned()));
         }
         Profile::BvhTest => {
             env_vars.push(("VICTORY_QUEUE_COPIES".to_owned(), "1".to_owned()));
             env_vars.push(("VICTORY_RELAY_COPY_QUEUE".to_owned(), "1".to_owned()));
             env_vars.push(("VICTORY_CARD_BUFFERS_MIN_MB".to_owned(), "1".to_owned()));
+            env_vars.push(("VICTORY_TEXTURE_MIP_DROP_MIN_SIZE".to_owned(), "1024".to_owned()));
+            env_vars.push(("VICTORY_TEXTURE_ROOM_PERCENT".to_owned(), "94".to_owned()));
             env_vars.push(("VICTORY_BVH_BUILDER".to_owned(), "1".to_owned()));
             env_vars.push(("VICTORY_BVH_QUARANTINE".to_owned(), "1".to_owned()));
         }

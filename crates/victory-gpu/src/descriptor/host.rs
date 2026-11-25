@@ -1478,11 +1478,10 @@ impl HostHeap {
         // draw): no pass looks at it, and the same texture's view in a
         // slot shaders pick by index says what it says.
         let placed_view = match view {
-            Some(View::Placed(false, resource, desc))
-                if resource[0] != 1 && !self.tabled_lately(index, crate::frame::current()) =>
-            {
-                let first = crate::resource::first_mip(desc);
-                Some((resource, u64::from(desc[10]) | u64::from(desc[11]) << 32, first))
+            Some(View::Placed(false, resource, desc)) if resource[0] != 1 => {
+                let start = u64::from(desc[10]) | u64::from(desc[11]) << 32;
+                (start != 0 && !self.tabled_lately(index, crate::frame::current()))
+                    .then(|| (resource, start, crate::resource::first_mip(desc)))
             }
             _ => None,
         };
@@ -3419,6 +3418,23 @@ mod tests {
         assert!(spans.note(2, 0x2000, 0x4000, &shape(0x2000, 0x4000), true).is_empty());
         assert!(spans.note(3, 0x1000, 0x2000, &shape(0x1000, 0x2000), true).is_empty());
         assert_eq!(spans.slots_in(0, u64::MAX), [1]);
+    }
+
+    /// Uninitialized/null-address (`0x0`) placed texture views written across
+    /// distinct heap slots must not enter `Spans` or evict one another.
+    #[test]
+    fn zero_address_views_do_not_make_each_other_stale() {
+        let Some(heap) = HostHeap::new(false, 8) else {
+            return;
+        };
+        let view = |width: u32| {
+            View::Placed(false, [3, 0, 0, 0, width, 0, 64, 0x1_0001, 98, 1, 0, 0x105, 0, 0], [0; 16])
+        };
+        let before = STALE[0].load(std::sync::atomic::Ordering::Relaxed);
+        assert!(heap.note_buffer(1, Some(&view(64)), false).is_empty());
+        assert!(heap.note_buffer(2, Some(&view(128)), false).is_empty());
+        assert_eq!(STALE[0].load(std::sync::atomic::Ordering::Relaxed), before);
+        assert!(heap.placed.lock().unwrap().by_slot.is_empty());
     }
 
     /// A view written over memory that older views describe otherwise

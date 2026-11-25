@@ -23,7 +23,7 @@
 | :--- | :--- | :--- | :--- |
 | **Phase 0** | Host & Sandbox Setup | `DONE` | Testing copy (`109 files`, `208.62 GB`) + `victory.toml` + Agility SDK `1.614.1` SM 6.6 unlock verified on Win10 + RTX 3070. |
 | **Phase 1** | First Boot & Baseline Telemetry | `DONE` | `victory warm` (`25,750` translated, `2,725` compute pipelines); visible 1080p boot + `xtask harness` baseline captured (`1.8 fps` / `527.8 ms` 3D p50, `7,820 / 6,743 MB` VRAM, `6,352 MB` PC spill, `411.4 ms` CPU recording, `128,783` null texture slots, BVH off, `#f133e35efed2a48a` `E_INVALIDARG`). |
-| **Phase 2** | 100% Shaders & Full Visual Fidelity | `IN_PROGRESS` | **Wave A+B merged**: `dot4AddPacked`, DXGI formats `189..=191`, `Rule::Start` 4 KiB stale rule & `reupload_when_full` (`310c6eb`), `sync_heaps` + `record_print` + `VICTORY_HEAP_SYNC_TABLES` + `VICTORY_VIEW_OWN_COPY` + `PR #670` write-watch skip + `VICTORY_CARD_ROOM_FOR_TARGETS_MB` (`a26859f`/`9376fd6`). Next: live A/B run + Phase 2C (`#f133e35efed2a48a` & `40beb26`). |
+| **Phase 2** | 100% Shaders & Full Visual Fidelity | `IN_PROGRESS` | **Wave A+B + 8 GB Regression/Egress Fixes**: Fixed `targets_room_kept` 8 GB starvation (`0` on `<9 GiB`), skipped `start=0x0` false stale evictions, widened texture eviction age to `30 s` (`spill_room` active), added `VICTORY_TEXTURE_MIP_DROP_MIN_SIZE=1024` & `VICTORY_TEXTURE_ROOM_PERCENT=94` to `tuned-8gb`/`bvh-test`, and blocked `iphlpapi.dll` `Icmp*` raw ICMP egress (`net.rs`). Next: A/B `tuned-8gb` + `bvh-test` + Phase 2C (`#f133e35efed2a48a` & `40beb26`). |
 | **Phase 3** | 30 FPS Stable @ 1080p | `PENDING` | Eliminate queue flushes (`VICTORY_QUEUE_COPIES`), shadow copy-backs, tune 8 GB VRAM residency (`VICTORY_CARD_ROOM_FOR_TARGETS_MB`). |
 | **Phase 4** | 60 FPS Stable @ 1080p/1440p | `PENDING` | Decouple 30 Hz pacing, multi-core command translation, async compute queue, DXIL wave32 opts. |
 | **Phase 5** | 60+ FPS, 100% Completion & Polish | `PENDING` | Uncapped pacing, `<16 GB` RAM target, full playthrough verification. |
@@ -34,9 +34,9 @@
 - `cargo xtask policy`: **PASS** (`183 files ok`)
 - `cargo clippy --workspace --all-targets --locked -- -D warnings`: **PASS** (0 warnings)
 - `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`: **PASS** (0 warnings)
-- `cargo test --workspace --locked --exclude victory-gpu --exclude victory-shader`: **PASS** (`198 passed, 0 failed, 5 ignored` across 9 crates, including `xtask` 10/10)
-- `cargo test -p victory-shader --lib --locked`: **PASS** (`265 passed, 0 failed, 2 ignored` — includes `packed_dot_products_and_clamps_execute_cleanly` & SM 6.6 suite)
-- `cargo test -p victory-gpu --lib --locked -- --test-threads=1`: **PASS** (`205 passed, 0 failed, 4 ignored` — includes `packed_neighbours_stay`, `records_copied_as_bytes_are_made_at_the_next_sync`, `a_record_that_changed_prints_otherwise`, `a_view_off_its_copys_elements_gets_its_own_bytes`)
+- `cargo test --workspace --locked --exclude victory-gpu --exclude victory-shader`: **PASS** (`198 passed, 0 failed, 5 ignored` prior run; latest post-edit `victory-hle`: `98 + 1 passed`, `xtask`: `10 passed`)
+- `cargo test -p victory-shader --lib --locked`: **PASS** (`265 passed, 0 failed, 2 ignored` — unchanged since prior workspace run)
+- `cargo test -p victory-gpu --lib --locked -- --test-threads=1`: **PASS** (`207 passed, 0 failed, 4 ignored` — includes `targets_room_reservation_respects_budget_and_override` & `zero_address_views_do_not_make_each_other_stale`)
 - Shader diagnostic note (`#f133e35efed2a48a`): `dxil.dll` validation passes (`26,703` IR instructions, `52` used resources), `CreateComputePipelineState` fails with `E_INVALIDARG`; queued for Phase 2C root-signature / compute state inspection.
 
 ---

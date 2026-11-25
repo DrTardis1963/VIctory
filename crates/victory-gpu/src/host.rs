@@ -6882,6 +6882,15 @@ impl Meter {
         let picked = crate::draw::HEAP_BUFFER_PASSES.swap(0, Ordering::Relaxed) as f64 / frames;
         let picked_ms =
             crate::draw::HEAP_BUFFER_MICROS.swap(0, Ordering::Relaxed) as f64 / 1e3 / frames;
+        let heap_textures_ms =
+            crate::draw::HEAP_PASS_PARTS[0].swap(0, Ordering::Relaxed) as f64 / 1e3 / frames;
+        let heap_buf_slots =
+            crate::draw::HEAP_PASS_PARTS[1].swap(0, Ordering::Relaxed) as f64 / frames;
+        if picked > 0.0 {
+            tracing::info!(
+                "  heap pass breakdown per frame: textures {heap_textures_ms:.1} ms, {heap_buf_slots:.0} buffer slots inspected"
+            );
+        }
         // Copies between depth textures and their colour twins, each way.
         let [twin_to_depth, twin_to_colour] =
             [2, 3].map(|i| crate::resource::TWINS[i].swap(0, Ordering::Relaxed) as f64 / frames);

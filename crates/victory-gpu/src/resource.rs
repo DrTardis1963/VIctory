@@ -1468,28 +1468,43 @@ pub(crate) fn room() -> bool {
         return true;
     }
     match crate::host::host().and_then(|h| h.video_memory()) {
-        Some([budget, used, ..]) => used + targets_room_kept() < budget / 100 * room_percent(),
+        Some([budget, used, ..]) => used + targets_room_kept(budget) < budget / 100 * room_percent(),
         None => filled < WITHOUT_BUDGET,
     }
 }
 
+/// Pure helper computing how many bytes of card memory the texture queue
+/// leaves free for render targets and other host-written textures.
+pub(crate) fn targets_room_kept_for(budget: u64, explicit_mb: Option<u64>, targets: u64) -> u64 {
+    let default_bytes = if budget < (9 << 30) {
+        // <= 8 GB adapters (DXGI budget ~6.8-7.4 GB): reserving 3 GiB starves
+        // the texture queue to <2 GB and causes mass eviction/re-creation storms.
+        // Shared memory spilling (`spill_room`) and `VICTORY_TEXTURE_MIP_DROP`
+        // manage VRAM pressure instead.
+        0
+    } else {
+        3072 << 20
+    };
+    let most = explicit_mb.map_or(default_bytes, |mb| mb.min(8192) << 20);
+    most.saturating_sub(targets)
+}
+
 /// The bytes of the card's memory the texture queue leaves free for
 /// render targets and other host copies the host itself writes that are
-/// not made yet: `VICTORY_CARD_ROOM_FOR_TARGETS_MB` (3,072; 0: none, as
-/// before) less what such copies hold now.
+/// not made yet: `VICTORY_CARD_ROOM_FOR_TARGETS_MB` (default `3072` on
+/// >= 9 GiB budgets, `0` on <= 8 GiB budgets) less what such copies hold now.
 #[cfg(windows)]
-pub(crate) fn targets_room_kept() -> u64 {
+pub(crate) fn targets_room_kept(budget: u64) -> u64 {
     use std::sync::atomic::Ordering::Relaxed;
-    static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    let most = *MOST.get_or_init(|| {
+    static EXPLICIT: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    let explicit_mb = *EXPLICIT.get_or_init(|| {
         std::env::var("VICTORY_CARD_ROOM_FOR_TARGETS_MB")
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
-            .map_or(3072 << 20, |mb| mb.min(8192) << 20)
     });
     // Every host texture's bytes less those of the copies the title fills.
     let targets = HOST_TEXTURES[1].load(Relaxed).saturating_sub(KINDS[1].load(Relaxed));
-    most.saturating_sub(targets)
+    targets_room_kept_for(budget, explicit_mb, targets)
 }
 
 /// Whether, with no room on the card ([`room`]) and every texture there
@@ -2810,6 +2825,18 @@ mod tests {
         assert_eq!(compute_mip_drop_explicit(&sample_tex, 1, 2048), 0);
         assert_eq!(compute_mip_drop_explicit(&non_square_pot, 1, 2048), 0);
         assert_eq!(compute_mip_drop_explicit(&large_tex, 1, 2048), 1);
+    }
+
+    #[test]
+    fn targets_room_reservation_respects_budget_and_override() {
+        // <= 8 GB budgets default to 0 to avoid starving the texture queue.
+        assert_eq!(targets_room_kept_for(7 << 30, None, 500 << 20), 0);
+        // >= 9 GiB budgets reserve up to 3072 MiB minus already-allocated targets.
+        assert_eq!(targets_room_kept_for(12 << 30, None, 1024 << 20), 2048 << 20);
+        assert_eq!(targets_room_kept_for(12 << 30, None, 4096 << 20), 0);
+        // Explicit override applies regardless of budget size (clamped to 8192 MiB).
+        assert_eq!(targets_room_kept_for(7 << 30, Some(1536), 512 << 20), 1024 << 20);
+        assert_eq!(targets_room_kept_for(12 << 30, Some(0), 0), 0);
     }
 
     #[test]

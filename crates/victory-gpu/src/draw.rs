@@ -366,6 +366,9 @@ pub(crate) static HEAP_VIEWS_ELSEWHERE: AtomicU64 = AtomicU64::new(0);
 /// index ([`State::heap_buffers`]), and the microseconds they took.
 pub(crate) static HEAP_BUFFER_PASSES: AtomicU64 = AtomicU64::new(0);
 pub(crate) static HEAP_BUFFER_MICROS: AtomicU64 = AtomicU64::new(0);
+/// Of [`HEAP_BUFFER_MICROS`], the microseconds of the pass over textures
+/// picked by index (`heap_textures`), and the buffer slots inspected.
+pub(crate) static HEAP_PASS_PARTS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 /// Textures brought up to date for shaders that pick them by index
 /// ([`State::heap_textures`]), the bytes of their memory, and the slots
 /// still waiting.
@@ -1512,6 +1515,7 @@ impl State {
         // it is named below.
         static GONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         let mut alive = !GONE.load(Ordering::Relaxed) && crate::descriptor::host::device_removed().is_none();
+        HEAP_PASS_PARTS[1].fetch_add(slots.len() as u64, Ordering::Relaxed);
         for (n, &index) in slots.iter().enumerate() {
             ranges.remove(&index);
             let Some(handle) = heap.handle(index) else {
@@ -1590,7 +1594,9 @@ impl State {
             }
             shadow.refresh(list, *from, to - from);
         }
+        let textures_began = std::time::Instant::now();
         self.heap_textures(list, heap, host);
+        HEAP_PASS_PARTS[0].fetch_add(textures_began.elapsed().as_micros() as u64, Ordering::Relaxed);
         HEAP_BUFFER_PASSES.fetch_add(1, Ordering::Relaxed);
         HEAP_BUFFER_MICROS.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
         static LOGGED: AtomicU64 = AtomicU64::new(0);
@@ -1742,17 +1748,30 @@ impl State {
         if !room {
             HEAP_TEXTURES_FULL.fetch_add(1, Ordering::Relaxed);
             once!("textures picked by index: the card has no room for more; the least recently used make room");
-            // Once a frame (their copies go when the lists holding them
-            // are done): what no shader took for seconds goes first. Only
-            // when all that is there was used since does the PC's memory
-            // the system shares with the card take the rest
-            // (`resource::spill_room`).
+            // Evict slots unused for at least `VICTORY_TEXTURE_EVICT_MS` (30 s
+            // default, up to `VICTORY_TEXTURE_EVICT_MAX` = 256 slots per frame)
+            // while still permitting spillover into shared memory when active
+            // textures cannot all fit in dedicated VRAM.
             if first {
-                let evicted = host.texture_slots_evict(now.saturating_sub(3 * MARK_EVERY_MS), 1024) as u64;
+                static EVICT_AGE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+                let evict_age = *EVICT_AGE.get_or_init(|| {
+                    std::env::var("VICTORY_TEXTURE_EVICT_MS")
+                        .ok()
+                        .and_then(|v| v.trim().parse().ok())
+                        .unwrap_or(30_000)
+                });
+                static EVICT_MAX: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+                let evict_max = *EVICT_MAX.get_or_init(|| {
+                    std::env::var("VICTORY_TEXTURE_EVICT_MAX")
+                        .ok()
+                        .and_then(|v| v.trim().parse().ok())
+                        .unwrap_or(256)
+                });
+                let evicted = host.texture_slots_evict(now.saturating_sub(evict_age), evict_max) as u64;
                 EVICTED.store(evicted, Ordering::Relaxed);
                 HEAP_TEXTURES_EVICTED.fetch_add(evicted, Ordering::Relaxed);
             }
-            room = EVICTED.load(Ordering::Relaxed) == 0 && crate::resource::spill_room();
+            room = EVICTED.load(Ordering::Relaxed) < 64 && crate::resource::spill_room();
         } else if first {
             EVICTED.store(0, Ordering::Relaxed);
         }
