@@ -1101,8 +1101,10 @@ unsafe fn copy_wide(src: *const u8, dst: *mut u8, len: usize) {
 /// lists only afterwards).
 pub(crate) fn wide_back() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    // On by default; `VICTORY_WIDE_BACK=0` turns it off.
-    *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_BACK").is_none_or(|v| v != "0"))
+    // On by default; `VICTORY_WIDE_BACK=0` turns it off. The crate's own
+    // tests run without it unless they ask, as with the relay: their title
+    // memory is freed while the copy-back thread may still write it.
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_BACK").map_or(!cfg!(test), |v| v != "0"))
 }
 
 type Job = Box<dyn FnOnce() + Send>;
