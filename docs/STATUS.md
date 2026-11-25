@@ -14,6 +14,7 @@
 | Antigravity | `.worktrees/unified` | `synthesis/unified` | `WillyboPeep/victory-all-forks` security audit & Waves 1–3 synthesis | `DONE` | 2026-11-25 |
 | Existing local work | `.` (root) | `legal/policy-and-runtime-guards` | The 8 uncommitted files (table-CBV → root-CBV WIP) moved to a stash, superseded by `fix/table-cbv-raw-views` | `SHELVED` | 2026-11-26 |
 | Claude Code | `.worktrees/port-683` | `fix/table-cbv-raw-views` | Fork survey (`docs/fork-survey-2026-11-26.md`); table CBVs read as raw views (idea of upstream `683ad7a9`, spine-native) | `DONE` | 2026-11-26 |
+| Claude Code | `.claude/worktrees/community-port-4f21af` | `claude/community-port-4f21af` + `port/*` topic branches | Recurring community watch: vet fork commits, port onto `port/*` off `synthesis/unified`, queue in-game tests, digests in `F:\VIctory_Testing\community\` | `IN_PROGRESS` | 2026-11-26 |
 | Existing local work | `.worktrees/agy` | `fix/loader-tls-redirect-bounds-and-empty-section` | Existing worktree — **DO NOT TOUCH** | `RESERVED` | 2026-11-25 |
 
 ---
