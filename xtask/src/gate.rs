@@ -238,8 +238,18 @@ fn highlights(output: &str) -> Vec<String> {
             .collect();
     }
     kept.truncate(HIGHLIGHTS);
+    if output.contains("no SM 6.6 device") {
+        // Not the change's fault: say so first, before anyone debugs it.
+        kept.insert(0, SM66_HINT.into());
+    }
     kept
 }
+
+/// What a `no SM 6.6 device` failure means.
+const SM66_HINT: &str = "hint: no D3D12 device with shader model 6.6, so the GPU-backed tests \
+    fail on this machine whatever the change. Windows 10's built-in D3D12 runtime stops at \
+    SM 6.5: the test executables must opt into the Agility SDK (export D3D12SDKVersion and \
+    D3D12SDKPath) and find D3D12Core.dll in a D3D12 folder beside them.";
 
 fn summary_json(scope: &Scope, steps: &[Step], ok: bool) -> String {
     let scope = match scope {
@@ -493,6 +503,18 @@ test result: FAILED. 1 passed; 1 failed
                 "  assertion failed: false",
             ]
         );
+    }
+
+    #[test]
+    fn a_missing_sm66_device_is_explained_first() {
+        let output = "\
+test emit::a ... FAILED
+thread 'emit::a' panicked at crates/s/src/lib.rs:5:5:
+no SM 6.6 device
+";
+        let got = highlights(output);
+        assert_eq!(got[0], SM66_HINT);
+        assert_eq!(got[1], "test emit::a ... FAILED");
     }
 
     #[test]
