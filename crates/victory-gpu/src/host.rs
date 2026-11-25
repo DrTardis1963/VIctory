@@ -6222,6 +6222,8 @@ mod direct_copy {
 /// fail there instead). False if a page of `dst` is not writable for any
 /// other reason; the bytes before it may have landed.
 #[cfg(target_arch = "x86_64")]
+// A fault at `dst` is caught and reported as false, so the call is safe.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub fn write_title_memory(dst: *mut u8, src: &[u8]) -> bool {
     // SAFETY: `src` is the caller's; faults at `dst` are caught by `try_copy`.
     unsafe { direct_copy::try_copy(dst, src.as_ptr(), src.len()) }
@@ -6611,6 +6613,15 @@ impl Meter {
                     crate::descriptor::host::STALE[2].load(Ordering::Relaxed),
                     crate::descriptor::host::STALE[3].load(Ordering::Relaxed),
                     crate::descriptor::host::STALE[4].load(Ordering::Relaxed)
+                );
+                let [views, shown, waiting, tables, gone, own, free, start, other, shows, back] =
+                    [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10].map(|i: usize| crate::descriptor::host::SWEPT[i].load(Ordering::Relaxed));
+                tracing::info!(
+                    "placed texture views in the heap at the last look: {views}, of them {shown} shown, {waiting} in the queue, \
+                     {tables} read through tables, {gone} without memory; with memory and nothing to bring them up to date: \
+                     {own} of their own memory, {free} of memory no other view describes, {start} of memory another texture \
+                     begins at, {other} of another's memory ({shows} of all these show another view); {back} put back into the \
+                     queue since the start"
                 );
             }
             #[cfg(feature = "diagnostics")]
