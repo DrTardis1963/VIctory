@@ -42,18 +42,18 @@ Tradução dos shaders do console para este host e etapas do jogo
 (gerado por `cargo xtask progress`):
 
 <!-- progress:start -->
-![shaders: 99.9%](https://img.shields.io/badge/shaders-99.9%25-brightgreen)
+![shaders: 100.0%](https://img.shields.io/badge/shaders-100.0%25-brightgreen)
 ![shaders Mesh: 100.0%](https://img.shields.io/badge/shaders%20Mesh-100.0%25-brightgreen)
-![shaders Vertex/pixel: 99.9%](https://img.shields.io/badge/shaders%20Vertex%2Fpixel-99.9%25-brightgreen)
-![shaders Compute: 99.7%](https://img.shields.io/badge/shaders%20Compute-99.7%25-brightgreen)
+![shaders Vertex/pixel: 100.0%](https://img.shields.io/badge/shaders%20Vertex%2Fpixel-100.0%25-brightgreen)
+![shaders Compute: 100.0%](https://img.shields.io/badge/shaders%20Compute-100.0%25-brightgreen)
 ![medido: 2026-11-25](https://img.shields.io/badge/medido-2026--11--25-blue)
 
 | Parte | Progresso | % | Contagem |
 |---|---|---|---|
-| **Todos os shaders** | `████████████████████` | **99.9%** | 25750 / 25758 |
+| **Todos os shaders** | `████████████████████` | **100.0%** | 25758 / 25758 |
 | Shaders Mesh | `████████████████████` | 100.0% | 8765 / 8765 |
-| Shaders Vertex/pixel | `████████████████████` | 99.9% | 14258 / 14259 |
-| Shaders Compute | `████████████████████` | 99.7% | 2727 / 2734 |
+| Shaders Vertex/pixel | `████████████████████` | 100.0% | 14259 / 14259 |
+| Shaders Compute | `████████████████████` | 100.0% | 2734 / 2734 |
 | **Etapas do jogo funcionando** | `██████████░░░░░░░░░░` | **50.0%** | 3 / 6 |
 
 | Etapa do jogo | Estado | Medição |
@@ -65,7 +65,7 @@ Tradução dos shaders do console para este host e etapas do jogo
 | Jogável | ⚠️ | controle, HUD e pausa funcionam, mas a 4-7 fps em 1080p |
 | Luz por ray tracing | ❌ | ainda não roda; tudo na sombra fica preto |
 
-*Medido em 2026-11-25 em NVIDIA GeForce RTX 4060 Ti 8 GB, Intel Core i7-13700K, Windows 11 (`719e3b15`). As contagens de shaders são os shaders de console do dump do Xbox Series 1.0.2.1 que são traduzidos para este host (`victory translate`); as etapas do jogo são o que uma execução alcançou. Regenere com `cargo xtask progress` depois de editar `docs/progress/progress.json`.*
+*Medido em 2026-11-25 em NVIDIA GeForce RTX 4060 Ti 8 GB, Intel Core i7-13700K, Windows 11 (`783a54ca`). As contagens de shaders são os shaders de console do dump do Xbox Series 1.0.2.1 que são traduzidos para este host (`victory translate`); as etapas do jogo são o que uma execução alcançou. Regenere com `cargo xtask progress` depois de editar `docs/progress/progress.json`.*
 <!-- progress:end -->
 
 ## O que este fork acrescenta
