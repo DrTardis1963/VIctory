@@ -9,7 +9,7 @@ mod inspect;
 mod replay;
 mod run;
 mod shader;
-#[cfg(all(windows, feature = "diagnostics"))]
+#[cfg(windows)]
 mod title_patch;
 mod translate;
 #[cfg(windows)]
