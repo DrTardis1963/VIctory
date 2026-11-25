@@ -147,14 +147,18 @@ fn slow(p: &Pending) -> bool {
 const LOADING_FRAME_COMPUTE: Duration = Duration::from_secs(12);
 
 /// What is left of the bound on all such waits of a run, past the frames'
-/// budgets, after `spent`: `VICTORY_PIPELINE_GATE_S` (default 120, 0: none).
+/// budgets, after `spent`: `VICTORY_PIPELINE_GATE_S` seconds (victory-amd
+/// uses 120). Off by default: here every compute pipeline is started at
+/// its creation, `victory warm` puts them in the library ahead of a run,
+/// and waits past the frame's budget once made the world's first frame
+/// take minutes.
 fn loading_left(spent: Duration) -> Duration {
     static TOTAL: OnceLock<Duration> = OnceLock::new();
     let total = *TOTAL.get_or_init(|| {
         let seconds = std::env::var("VICTORY_PIPELINE_GATE_S")
             .ok()
             .and_then(|value| value.trim().parse::<u64>().ok())
-            .unwrap_or(120);
+            .unwrap_or(0);
         Duration::from_secs(seconds)
     });
     total.saturating_sub(spent)
