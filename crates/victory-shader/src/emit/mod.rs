@@ -322,6 +322,18 @@ pub fn emit(
     io: &io::Io,
     res: &resource::Resources,
 ) -> Result<HostShader, ShaderError> {
+    emit_sized(c, native, p, st, io, res).map(|(shader, _)| shader)
+}
+
+/// [`emit`], with the wave size the translation requires of the host.
+fn emit_sized(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    st: &structure::Structured,
+    io: &io::Io,
+    res: &resource::Resources,
+) -> Result<(HostShader, Option<u32>), ShaderError> {
     // (what an earlier program's lowering on this thread left behind)
     lower::take_needs();
     let original = emit_program(c, native, p, st, io, res);
@@ -386,7 +398,7 @@ pub fn emit(
                 let again = emit_program(c, native, p, st, io, res);
                 report(name, &again);
                 if done(&again) {
-                    return again.map(|(shader, _)| shader);
+                    return again;
                 }
             }
         }
@@ -417,7 +429,7 @@ pub fn emit(
                     let again = emit_program(c, native, p, st, io, res);
                     report("without skips, scalars followed", &again);
                     if done(&again) {
-                        return again.map(|(shader, _)| shader);
+                        return again;
                     }
                 }
                 // Still stopped where not every lane runs: the per-lane branches around
@@ -426,7 +438,7 @@ pub fn emit(
                 if wide_on {
                     let again = wide_form(deep.as_ref().map(|f| &f.0));
                     if done(&again) {
-                        return again.map(|(shader, _)| shader);
+                        return again;
                     }
                 }
                 if strict {
@@ -443,7 +455,7 @@ pub fn emit(
                     let local = lower::with_local_waves(|| emit_program(c, native, p, st, io, res));
                     report(&format!("local waves ({}), {name}", if exact { "idiom" } else { "APPROXIMATE" }), &local);
                     if done(&local) {
-                        return local.map(|(shader, _)| shader);
+                        return local;
                     }
                 }
             }
@@ -451,7 +463,7 @@ pub fn emit(
                 let local = lower::with_local_waves(|| emit_program(c, native, p, st, io, res));
                 report(if exact { "local waves (idiom)" } else { "local waves (APPROXIMATE)" }, &local);
                 if done(&local) {
-                    return local.map(|(shader, _)| shader);
+                    return local;
                 }
             }
         }
@@ -463,14 +475,14 @@ pub fn emit(
                         let local = lower::with_local_waves_any(|| emit_program(c, native, p, st, io, res));
                         report(&format!("local waves (APPROXIMATE, any mask), {name}"), &local);
                         if done(&local) {
-                            return local.map(|(shader, _)| shader);
+                            return local;
                         }
                     }
                 }
                 let local = lower::with_local_waves_any(|| emit_program(c, native, p, st, io, res));
                 report("local waves (APPROXIMATE, any mask)", &local);
                 if done(&local) {
-                    return local.map(|(shader, _)| shader);
+                    return local;
                 }
             }
         }
@@ -480,35 +492,52 @@ pub fn emit(
         // ([`widen`]). Not before the forms above: the programs they take keep their
         // translation.
         let wide_last = !wide_on && std::env::var_os("VICTORY_WAVE_WIDE").is_none_or(|v| v != "0");
-        if wide_last && matches!(&original, Ok((_, Some(64)))) {
+        let several = matches!(native.io, crate::native::StageIo::Cs(cs) if cs.threads.iter().product::<u32>() > 64);
+        let wide_last_form = || {
             let deep_on = std::env::var_os("VICTORY_WAVE_DEEP_SKIPS").is_none_or(|v| v != "0");
             let deep = if deep_on { form(ir::without_skips(p, true)) } else { None };
-            let again = wide_form(deep.as_ref().map(|f| &f.0));
+            wide_form(deep.as_ref().map(|f| &f.0))
+        };
+        if wide_last && !several && matches!(&original, Ok((_, Some(64)))) {
+            let again = wide_last_form();
             if done(&again) {
-                return again.map(|(shader, _)| shader);
+                return again;
             }
         }
-        // A thread group of several console waves, which the wave-wide form does not take:
-        // every form once more with the group's LDS left to the title's own barriers
-        // ([`lower::with_group_barriers`]; `VICTORY_WAVE_GROUP_BARRIERS=0` turns it off).
-        let several = matches!(native.io, crate::native::StageIo::Cs(cs) if cs.threads.iter().product::<u32>() > 64);
+        // A thread group of several console waves: every form once more with the group's LDS
+        // left to the title's own barriers ([`lower::with_group_barriers`];
+        // `VICTORY_WAVE_GROUP_BARRIERS=0` turns it off), and then the wave-wide form, whose
+        // halves meet alone there.
         let group_on = std::env::var_os("VICTORY_WAVE_GROUP_BARRIERS").is_none_or(|v| v != "0");
+        let mut grouped = None;
         if several && group_on && matches!(&original, Ok((_, Some(64)))) {
             if why {
                 eprintln!("WAVE64-RETRY the group's LDS left to the title's barriers:");
             }
-            if let Some(Ok(shader)) = lower::with_group_barriers(|| emit(c, native, p, st, io, res)) {
-                return Ok(shader);
+            if let Some(again @ Ok(_)) = lower::with_group_barriers(|| emit_sized(c, native, p, st, io, res)) {
+                if done(&again) {
+                    return again;
+                }
+                grouped = Some(again);
             }
         }
+        if wide_last && several && matches!(&original, Ok((_, Some(64)))) {
+            let again = wide_last_form();
+            if done(&again) {
+                return again;
+            }
+        }
+        if let Some(again) = grouped {
+            return again;
+        }
     }
-    // SCC of a mask operation joined with a scalar test behind a per-lane skip (the 32-lane
-    // trace programs): right once the wave takes that skip together ([`widen`]; the
-    // lowering has named the skipped blocks).
+    // Cross-lane code that needs every lane of the console wave where it
+    // stands (a mask operation, a lane read, a first-lane read): right once
+    // the wave takes the per-lane branches around it together ([`widen`];
+    // the lowering has named the blocks that could not meet).
     let original = match original {
         Err(ShaderError::Unsupported { what, .. })
-            if native.stage == HwStage::Cs
-                && what == lower::LANE_MASK
+            if needs_wave_wide(native.stage, what)
                 && std::env::var_os("VICTORY_WAVE_WIDE").is_none_or(|v| v != "0") =>
         {
             let again = widen(c, native, p, std::env::var_os("VICTORY_WAVE_WHY").is_some());
@@ -519,7 +548,6 @@ pub fn emit(
         }
         other => other,
     };
-    let original = original.map(|(shader, _)| shader);
     // Retry unsupported programs only. Threading can separate an unknown
     // register value from its apparent use on a mutually exclusive path.
     if !matches!(original, Err(ShaderError::Unsupported { .. })) {
@@ -533,43 +561,50 @@ pub fn emit(
     let st = structure::structure(&p)?;
     let io = io::raise(&p, native)?;
     let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
-    emit_program(c, native, &p, &st, &io, &res).map(|(shader, _)| shader)
+    emit_program(c, native, &p, &st, &io, &res)
+}
+
+/// Whether a refusal is of cross-lane code that the wave-wide retry can fix:
+/// a mask read as data, or code that needs every lane of the console wave
+/// where it stands (a lane read, a first-lane read).
+pub(super) fn needs_wave_wide(stage: HwStage, what: &str) -> bool {
+    stage == HwStage::Cs && (what == lower::LANE_MASK || lower::needs_every_lane(what))
 }
 
 /// `p` (a console wave64 compute program on a host of 32-lane waves) with the per-lane
 /// branches around its cross-lane code taken wave-wide ([`structure::structure_wide`]): the
 /// lowering names the blocks where the two host waves must meet and could not
 /// (`lower::take_needs`), the branches whose regions hold them are widened, and so on until
-/// it translates or a branch cannot be widened. Only where a thread group is one console
-/// wave: with several, the waves of a group would decide differently and a barrier inside
-/// such a branch would wait for threads that never come.
+/// it translates or a branch cannot be widened. Where a thread group holds several console
+/// waves, those decide such a branch each for themselves, and a group barrier inside it would
+/// wait for threads that never come: the two host waves of a console wave meet alone there
+/// ([`lower::with_pair_meetings`]).
 fn widen(
     c: &Container,
     native: &NativeProgram,
     p: &ir::Program,
     why: bool,
 ) -> Result<(HostShader, Option<u32>), ShaderError> {
-    const NOT: ShaderError = ShaderError::Unsupported {
-        offset: 0,
-        what: "wave-wide branches in a thread group of several console waves",
+    let crate::native::StageIo::Cs(cs) = native.io else {
+        return Err(ShaderError::Unsupported { offset: 0, what: "wave-wide branches outside compute" });
     };
-    match native.io {
-        // (a program whose waves are the host's meets no one: no barrier, any group)
-        crate::native::StageIo::Cs(_) if !(native.wave64 && lower::host_max_wave() == 32) => {}
-        crate::native::StageIo::Cs(cs) if cs.threads.iter().product::<u32>() == 64 => {}
-        crate::native::StageIo::Cs(cs) => {
-            if why {
-                eprintln!("WAVE64-WIDE not tried: thread groups of {:?}", cs.threads);
-            }
-            return Err(NOT);
-        }
-        _ => return Err(NOT),
+    // (a program whose waves are the host's meets no one: no barrier, any group)
+    if !(native.wave64 && lower::host_max_wave() == 32) {
+        return widen_from(c, native, p, why);
     }
     // (two host waves for a console wave: see [`lower::with_loop_exits`])
-    if native.wave64 && lower::host_max_wave() == 32 {
-        return lower::with_loop_exits(|| widen_from(c, native, p, why));
+    let halves = || lower::with_loop_exits(|| widen_from(c, native, p, why));
+    if cs.threads.iter().product::<u32>() > 64 {
+        // (not inside the retry with the title's barriers: that is tried before, this after)
+        if lower::group_barriers_on() {
+            return Err(ShaderError::Unsupported {
+                offset: 0,
+                what: "wave-wide branches in a thread group of several console waves",
+            });
+        }
+        return lower::with_pair_meetings(halves);
     }
-    widen_from(c, native, p, why)
+    halves()
 }
 
 fn widen_from(
