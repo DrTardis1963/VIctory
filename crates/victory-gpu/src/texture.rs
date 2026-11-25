@@ -122,6 +122,9 @@ pub(crate) struct Staging {
     /// The buffer's own size ([`take_buffer`] rounds up): what it goes
     /// back to the pool as.
     capacity: u64,
+    /// The slab and range it is in ([`take_range`]), instead of a buffer
+    /// of its own.
+    slab: Option<(usize, u64)>,
     /// Dropped mips count (offset into console mips for detiling).
     pub(crate) mip_drop: u32,
     memory: *const u8,
@@ -274,8 +277,9 @@ static POOLED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(
 const POOL_BYTES: u64 = 512 << 20;
 
 /// Since the last frame-rate line: staging buffers taken from the pool,
-/// made anew, and the microseconds making them took.
-pub(crate) static POOL_STATS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+/// made anew, the microseconds making them took, and ranges of slabs
+/// given out ([`take_range`]; a slab made counts as made).
+pub(crate) static POOL_STATS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
 struct Pooled {
     buffer: ID3D12Resource,
@@ -317,6 +321,126 @@ fn take_buffer(host: &crate::host::Host, size: u64) -> Option<(ID3D12Resource, *
     POOL_STATS[1].fetch_add(1, Relaxed);
     POOL_STATS[2].fetch_add(started.elapsed().as_micros() as u64, Relaxed);
     Some((buffer, data, capacity))
+}
+
+/// Staging buffers up to [`SLAB_PART`] bytes are ranges of shared upload
+/// buffers of [`SLAB`] bytes, not buffers of their own. Textures picked by
+/// index are staged, uploaded once and let go: each made an upload buffer
+/// of its own, up to 1,413 in one frame and 656 ms making them (run fork1,
+/// with the destruction of as many on the threads that reset lists), as
+/// the pool by size class missed for most sizes.
+const SLAB: u64 = 64 << 20;
+
+/// The largest staging buffer carved from a slab.
+const SLAB_PART: u64 = 16 << 20;
+
+/// What ranges of slabs are rounded to (a multiple of the copy placement
+/// alignment, 512 bytes).
+const SLAB_GRAIN: u64 = 4 << 10;
+
+/// Empty slabs kept for the next textures (as many bytes as [`POOL`]
+/// keeps): with two, every burst of textures picked by index made its
+/// slabs anew (12 in one frame of run slab1, 992 ms).
+const SLAB_SPARE: usize = (POOL_BYTES / SLAB) as usize;
+
+struct Slab {
+    buffer: ID3D12Resource,
+    data: *mut u8,
+    /// Free ranges, by offset, none touching another.
+    free: Vec<(u64, u64)>,
+    /// Bytes given out.
+    taken: u64,
+}
+
+// SAFETY: a mapped upload buffer; its ranges are written by one owner at
+// a time, under the allocation's rules below.
+unsafe impl Send for Slab {}
+
+/// The slabs, by a number that stays theirs ([`Staging::slab`]).
+static SLABS: Mutex<Vec<Option<Slab>>> = Mutex::new(Vec::new());
+
+/// Slabs alive and their bytes taken, for the frame-rate line.
+pub(crate) fn slabs() -> (u64, u64) {
+    let slabs = SLABS.lock().unwrap_or_else(|e| e.into_inner());
+    let alive = slabs.iter().flatten();
+    (alive.clone().count() as u64, alive.map(|s| s.taken).sum())
+}
+
+/// A range of `size` bytes of a slab: the slab's number, the buffer, its
+/// mapping, the range's offset and length. None for sizes over
+/// [`SLAB_PART`], or when no slab can be made.
+fn take_range(host: &crate::host::Host, size: u64) -> Option<(usize, ID3D12Resource, *mut u8, u64, u64)> {
+    use std::sync::atomic::Ordering::Relaxed;
+    if size > SLAB_PART {
+        return None;
+    }
+    let len = size.max(1).div_ceil(SLAB_GRAIN) * SLAB_GRAIN;
+    let mut slabs = SLABS.lock().unwrap_or_else(|e| e.into_inner());
+    // First fit, in the fullest slabs first would be better for letting
+    // slabs empty; the first slab that fits keeps the search short.
+    for (n, slot) in slabs.iter_mut().enumerate() {
+        let Some(slab) = slot.as_mut() else { continue };
+        if let Some(i) = slab.free.iter().position(|&(_, l)| l >= len) {
+            let (at, l) = slab.free[i];
+            if l == len {
+                slab.free.remove(i);
+            } else {
+                slab.free[i] = (at + len, l - len);
+            }
+            slab.taken += len;
+            POOL_STATS[3].fetch_add(1, Relaxed);
+            return Some((n, slab.buffer.clone(), slab.data, at, len));
+        }
+    }
+    let started = std::time::Instant::now();
+    let (buffer, data) = host.upload_buffer_not_zeroed(SLAB)?;
+    crate::host::name(&buffer, || "staging slab".to_string());
+    POOL_STATS[1].fetch_add(1, Relaxed);
+    POOL_STATS[2].fetch_add(started.elapsed().as_micros() as u64, Relaxed);
+    let slab = Slab {
+        buffer: buffer.clone(),
+        data,
+        free: vec![(len, SLAB - len)],
+        taken: len,
+    };
+    let n = match slabs.iter().position(Option::is_none) {
+        Some(n) => {
+            slabs[n] = Some(slab);
+            n
+        }
+        None => {
+            slabs.push(Some(slab));
+            slabs.len() - 1
+        }
+    };
+    Some((n, buffer, data, 0, len))
+}
+
+/// Gives a range back to its slab (no list reads it any more); lets go of
+/// the slab once empty if [`SLAB_SPARE`] others are.
+fn give_range(n: usize, at: u64, len: u64) {
+    let mut slabs = SLABS.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(slab) = slabs.get_mut(n).and_then(Option::as_mut) else {
+        return;
+    };
+    let i = slab.free.partition_point(|&(o, _)| o < at);
+    slab.free.insert(i, (at, len));
+    // Joins it with its neighbours.
+    if i + 1 < slab.free.len() && slab.free[i].0 + slab.free[i].1 == slab.free[i + 1].0 {
+        slab.free[i].1 += slab.free[i + 1].1;
+        slab.free.remove(i + 1);
+    }
+    if i > 0 && slab.free[i - 1].0 + slab.free[i - 1].1 == slab.free[i].0 {
+        slab.free[i - 1].1 += slab.free[i].1;
+        slab.free.remove(i);
+    }
+    slab.taken -= len;
+    if slab.taken == 0 {
+        let empty = slabs.iter().flatten().filter(|s| s.taken == 0).count();
+        if empty > SLAB_SPARE {
+            slabs[n] = None;
+        }
+    }
 }
 
 /// The buffer a texture the host writes is copied through into the texture
@@ -681,6 +805,10 @@ impl Drop for Staging {
         STAGED[1].fetch_sub(self.bytes, Relaxed);
         // Lists that uploaded from it have run (they held it until then):
         // the buffer is free for another texture.
+        if let Some((n, at)) = self.slab {
+            give_range(n, at, self.capacity);
+            return;
+        }
         if POOLED.fetch_add(self.capacity, Relaxed) + self.capacity <= POOL_BYTES {
             let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
             pool.get_or_insert_with(HashMap::new).entry(self.capacity).or_default().push(Pooled {
@@ -1634,13 +1762,27 @@ fn staging(resource: This, texture: &ID3D12Resource, first: u32) -> Option<Arc<S
             Some(&mut total),
         );
     }
-    let (buffer, data, capacity) = take_buffer(host, total)?;
-    crate::host::name(&buffer, || {
-        format!(
-            "staging of {resource:?} {}x{}x{} f{}",
-            d.Width, d.Height, d.DepthOrArraySize, d.Format.0
-        )
-    });
+    let (buffer, data, capacity, slab) = match take_range(host, total) {
+        Some((n, buffer, data, at, len)) => {
+            // The footprints are from the start of the range.
+            for f in &mut footprints {
+                f.Offset += at;
+            }
+            (buffer, data, len, Some((n, at)))
+        }
+        None => {
+            let (buffer, data, capacity) = take_buffer(host, total)?;
+            (buffer, data, capacity, None)
+        }
+    };
+    if slab.is_none() {
+        crate::host::name(&buffer, || {
+            format!(
+                "staging of {resource:?} {}x{}x{} f{}",
+                d.Width, d.Height, d.DepthOrArraySize, d.Format.0
+            )
+        });
+    }
     tracing::debug!(?desc, total, mip_drop, "texture contents uploaded from title memory");
     STAGED[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     STAGED[1].fetch_add(total, std::sync::atomic::Ordering::Relaxed);
@@ -1657,6 +1799,7 @@ fn staging(resource: This, texture: &ID3D12Resource, first: u32) -> Option<Arc<S
         size,
         bytes: total,
         capacity,
+        slab,
         mip_drop,
         memory,
         guard_view,

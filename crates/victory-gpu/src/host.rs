@@ -6681,6 +6681,25 @@ impl Host {
     }
 
     pub(crate) fn upload_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        self.upload_buffer_with(size, D3D12_HEAP_FLAG_NONE)
+    }
+
+    /// An upload buffer whose bytes are left as the driver finds them, for
+    /// buffers written whole before a list reads them (texture staging
+    /// slabs): the driver zeroed every new 64 MB slab, 83 ms each (run
+    /// slab1). Made zeroed where the flag is refused.
+    pub(crate) fn upload_buffer_not_zeroed(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        static REFUSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !REFUSED.load(Ordering::Relaxed) {
+            if let Some(made) = self.upload_buffer_with(size, D3D12_HEAP_FLAG_CREATE_NOT_ZEROED) {
+                return Some(made);
+            }
+            REFUSED.store(true, Ordering::Relaxed);
+        }
+        self.upload_buffer(size)
+    }
+
+    fn upload_buffer_with(&self, size: u64, flags: D3D12_HEAP_FLAGS) -> Option<(ID3D12Resource, *mut u8)> {
         MADE[0].fetch_add(1, Ordering::Relaxed);
         MADE[1].fetch_add(size, Ordering::Relaxed);
         let heap = D3D12_HEAP_PROPERTIES {
@@ -6707,7 +6726,7 @@ impl Host {
             self.device
                 .CreateCommittedResource(
                     &heap,
-                    D3D12_HEAP_FLAG_NONE,
+                    flags,
                     &desc,
                     D3D12_RESOURCE_STATE_GENERIC_READ,
                     None,
@@ -6721,7 +6740,7 @@ impl Host {
         match made {
             Ok(()) => Some((buffer?, data.cast())),
             Err(e) => {
-                tracing::warn!(error = %e, size, "no upload buffer");
+                tracing::warn!(error = %e, size, ?flags, "no upload buffer");
                 None
             }
         }
@@ -6894,12 +6913,14 @@ impl Meter {
                 "  heap pass breakdown per frame: textures {heap_textures_ms:.1} ms, {heap_buf_slots:.0} buffer slots inspected"
             );
         }
-        let [reused, made, made_us] =
-            [0, 1, 2].map(|i| crate::texture::POOL_STATS[i].swap(0, Ordering::Relaxed) as f64 / frames);
-        if reused + made > 0.0 {
+        let [reused, made, made_us, carved] =
+            [0, 1, 2, 3].map(|i| crate::texture::POOL_STATS[i].swap(0, Ordering::Relaxed) as f64 / frames);
+        if reused + made + carved > 0.0 {
+            let (slabs, taken) = crate::texture::slabs();
             tracing::info!(
-                "texture staging buffers per frame: {reused:.1} reused, {made:.1} made in {:.1} ms",
-                made_us / 1e3
+                "texture staging buffers per frame: {carved:.1} ranges of slabs, {reused:.1} reused, {made:.1} made in {:.1} ms; {slabs} slabs alive, {} MB of them taken",
+                made_us / 1e3,
+                taken >> 20
             );
         }
         // Copies between depth textures and their colour twins, each way.
