@@ -210,7 +210,7 @@ pub(crate) fn retire<T: 'static>(object: T) {
     let started = STARTED.load(Ordering::Acquire);
     if started <= FINISHED.load(Ordering::Acquire) {
         RETIREMENTS[0].fetch_add(1, Ordering::Relaxed);
-        drop(object);
+        reap(vec![Retired(Box::new(object))]);
         return;
     }
     RETIREMENTS[1].fetch_add(1, Ordering::Relaxed);
@@ -233,7 +233,53 @@ fn bury(finished: u64) {
         *retired = keep;
         done
     };
-    drop(done);
+    reap(done.into_iter().map(|(_, r)| r).collect());
+}
+
+/// Drops `objects` on a thread of their own. The driver's work to destroy
+/// a texture (its allocation and its GPU addresses) was a fifth of the
+/// submitting thread's time in gameplay, for the host copies the sweep
+/// lets go before a submission (run prof19: 121 of its samples in
+/// `NtGdiDdDDIDestroyAllocation2` and `FreeGpuVirtualAddress`). Dropped
+/// at once where the thread cannot be made.
+fn reap(objects: Vec<Retired>) {
+    struct Reaper {
+        queue: Mutex<Vec<Retired>>,
+        more: std::sync::Condvar,
+    }
+    static REAPER: OnceLock<Option<&'static Reaper>> = OnceLock::new();
+    if objects.is_empty() {
+        return;
+    }
+    let reaper = REAPER.get_or_init(|| {
+        let reaper: &'static Reaper = Box::leak(Box::new(Reaper {
+            queue: Mutex::new(Vec::new()),
+            more: std::sync::Condvar::new(),
+        }));
+        std::thread::Builder::new()
+            .name("victory-reaper".into())
+            .spawn(move || {
+                loop {
+                    let batch = {
+                        let mut queue = reaper.queue.lock().unwrap_or_else(|e| e.into_inner());
+                        while queue.is_empty() {
+                            queue = reaper.more.wait(queue).unwrap_or_else(|e| e.into_inner());
+                        }
+                        std::mem::take(&mut *queue)
+                    };
+                    drop(batch);
+                }
+            })
+            .ok()
+            .map(|_| reaper)
+    });
+    match reaper {
+        Some(reaper) => {
+            reaper.queue.lock().unwrap_or_else(|e| e.into_inner()).extend(objects);
+            reaper.more.notify_one();
+        }
+        None => drop(objects),
+    }
 }
 
 /// Objects [`retire`] dropped at once (no submission was running) and
