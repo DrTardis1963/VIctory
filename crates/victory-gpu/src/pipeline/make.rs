@@ -44,6 +44,8 @@ pub(crate) struct Pending {
     /// whether a draw or dispatch has requested it yet.
     key: String,
     used: AtomicBool,
+    /// When a worker began it ([`slow`]).
+    begun: OnceLock<Instant>,
 }
 
 // SAFETY: D3D12 objects are free-threaded; the graphics state (whose input
@@ -67,10 +69,12 @@ impl Pending {
             made: OnceLock::new(),
             key: key.finalize().to_hex()[..32].to_owned(),
             used: AtomicBool::new(false),
+            begun: OnceLock::new(),
         }
     }
 
     fn make(&self) {
+        let _ = self.begun.set(Instant::now());
         self.made
             .get_or_init(|| HostPipeline::new(&self.shaders, self.graphics.as_deref()));
         let (lock, done) = &DONE;
@@ -129,6 +133,37 @@ fn wait_budget(frame: u64) -> Duration {
     set.unwrap_or(Duration::from_millis(if frame < WARMUP_FRAMES { WARMUP_MS } else { STEADY_MS }))
 }
 
+/// Whether the host's driver has been at compute pipeline `p` for longer
+/// than most take (one of the title's takes 85 s): no frame waits for it.
+fn slow(p: &Pending) -> bool {
+    p.begun.get().is_some_and(|at| at.elapsed() > Duration::from_secs(10))
+}
+
+/// What a frame may wait for a compute pipeline while a world loads: the
+/// passes that unpack a world's models are dispatched once, and in a run
+/// whose pipelines were all still to be made 130 of them were dropped, and
+/// with them walls, floor, ceiling and faces (they never came back). A draw
+/// comes again next frame, so graphics pipelines keep the frame's budget.
+const LOADING_FRAME_COMPUTE: Duration = Duration::from_secs(12);
+
+/// What is left of the bound on all such waits of a run, past the frames'
+/// budgets, after `spent`: `VICTORY_PIPELINE_GATE_S` seconds (victory-amd
+/// uses 120). Off by default: here every compute pipeline is started at
+/// its creation, `victory warm` puts them in the library ahead of a run,
+/// and waits past the frame's budget once made the world's first frame
+/// take minutes.
+fn loading_left(spent: Duration) -> Duration {
+    static TOTAL: OnceLock<Duration> = OnceLock::new();
+    let total = *TOTAL.get_or_init(|| {
+        let seconds = std::env::var("VICTORY_PIPELINE_GATE_S")
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .unwrap_or(0);
+        Duration::from_secs(seconds)
+    });
+    total.saturating_sub(spent)
+}
+
 /// Pipelines queued and not made yet.
 static WAITING: AtomicU64 = AtomicU64::new(0);
 
@@ -159,6 +194,12 @@ pub(crate) fn now(p: &Arc<Pending>) -> bool {
     p.made.get().is_some_and(|made| made.is_some())
 }
 
+/// Makes the host pipeline of a compute program for the driver's library
+/// (`victory warm`); whether it has one.
+pub(crate) fn warm(shaders: Vec<Arc<Shader>>) -> bool {
+    HostPipeline::new(&shaders, None).is_some()
+}
+
 /// At the title's creation of a pipeline: starts it at once if an earlier
 /// run drew with it (during loading, so the world's first frames find it),
 /// and every compute pipeline: what a dropped dispatch writes is missing
@@ -186,15 +227,26 @@ fn shared_budget() -> bool {
 /// Waits for `p` while frame `frame` has budget left.
 fn wait(p: &Pending, frame: u64) {
     let budget = wait_budget(frame);
-    if budget.is_zero() {
+    let compute = p.compute();
+    if budget.is_zero() || compute && slow(p) {
         return;
     }
+    // What compute waits took past the frames' budgets since the start, in
+    // milliseconds; they have a budget of their own (ported from myokex's
+    // victory-amd).
+    static PAST: AtomicU64 = AtomicU64::new(0);
+    let budget = if compute {
+        budget.max(LOADING_FRAME_COMPUTE.min(loading_left(Duration::from_millis(PAST.load(Ordering::Relaxed)))))
+    } else {
+        budget
+    };
     // The frame the budget belongs to, and what was waited of it (or is
-    // taken by a thread waiting now).
-    static SPENT: Mutex<(u64, Duration)> = Mutex::new((u64::MAX, Duration::ZERO));
+    // taken by a thread waiting now); compute and graphics apart.
+    static SPENTS: [Mutex<(u64, Duration)>; 2] = [const { Mutex::new((u64::MAX, Duration::ZERO)) }; 2];
+    let frame_spent = &SPENTS[usize::from(compute)];
     let shared = shared_budget();
     let left = {
-        let mut spent = SPENT.lock().unwrap_or_else(|e| e.into_inner());
+        let mut spent = frame_spent.lock().unwrap_or_else(|e| e.into_inner());
         if spent.0 != frame {
             *spent = (frame, Duration::ZERO);
         }
@@ -210,17 +262,22 @@ fn wait(p: &Pending, frame: u64) {
     let started = Instant::now();
     let (lock, done) = &DONE;
     let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
-    while p.made.get().is_none() {
+    while p.made.get().is_none() && !(compute && slow(p)) {
         let rest = left.saturating_sub(started.elapsed());
         if rest.is_zero() {
             break;
         }
+        // Woken now and then to see whether it has become a slow one.
+        let rest = rest.min(Duration::from_millis(250));
         held = done.wait_timeout(held, rest).unwrap_or_else(|e| e.into_inner()).0;
     }
     drop(held);
     let waited = started.elapsed().min(left);
+    if compute {
+        PAST.fetch_add(waited.saturating_sub(wait_budget(frame)).as_millis() as u64, Ordering::Relaxed);
+    }
     {
-        let mut spent = SPENT.lock().unwrap_or_else(|e| e.into_inner());
+        let mut spent = frame_spent.lock().unwrap_or_else(|e| e.into_inner());
         // A frame that began meanwhile has its own budget.
         if spent.0 == frame {
             if shared {
