@@ -66,7 +66,7 @@ fn scalar_name(code: u8) -> String {
     }
 }
 
-fn const_name(code: u8) -> String {
+pub(super) fn const_name(code: u8) -> String {
     match code {
         128..=192 => (i32::from(code) - 128).to_string(),
         193..=208 => (192 - i32::from(code)).to_string(),
@@ -428,7 +428,7 @@ fn sendmsg(imm: u16) -> String {
     }
 }
 
-fn buffer_format(format: u8) -> String {
+pub(super) fn buffer_format(format: u8) -> String {
     const NAMES: [&str; 78] = [
         "INVALID",
         "8_UNORM",

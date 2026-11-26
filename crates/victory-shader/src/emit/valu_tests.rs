@@ -8,6 +8,7 @@
 
 use super::host::{Dispatch, Host, Root, Stride, View};
 use super::{HostShader, lower, validator};
+use crate::gfx10::asm::asm;
 use crate::native::{
     ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
 };
@@ -269,14 +270,16 @@ fn run_cases_on(
 
 #[test]
 fn scalar_quad_masks_pack_nibbles_and_set_scc() {
-    let pack_words = |opcode: u32| {
-        [
-            0xBE90_0000 | opcode << 8,   // s_quadmask s16, s0 (pairs for b64)
-            sop2(0x0a, 18, 129, 128),  // s_cselect_b32 s18, 1, 0
-            sop2(0x1e, 18, 18, 144),   // s_lshl_b32 s18, s18, 16
-            sop2(0x10, 16, 16, 18),    // s_or_b32 s16, s16, s18
-            vop1(1, 0, sgpr(16)),      // v_mov_b32 v0, s16
-        ]
+    let pack_words = |quadmask: &str| {
+        asm(&format!(
+            "
+            {quadmask}
+            s_cselect_b32 s18, 1, 0
+            s_lshl_b32 s18, s18, 16
+            s_or_b32 s16, s16, s18
+            v_mov_b32 v0, s16
+            "
+        ))
     };
     let cases = [
         ([0, 0, 0, 0], [0, 0]),
@@ -285,16 +288,17 @@ fn scalar_quad_masks_pack_nibbles_and_set_scc() {
         ([u32::MAX, u32::MAX, 0, 0], [0x1_00ff, 0x1_ffff]),
     ];
     let inputs = cases.map(|(input, _)| input);
-    for (wide, opcode) in [0x2c, 0x2d].into_iter().enumerate() {
-        let shader = build_valu_cs(&pack_words(opcode));
+    let quadmasks = ["s_quadmask_b32 s16, s0", "s_quadmask_b64 s[16:17], s[0:1]"];
+    for (wide, quadmask) in quadmasks.into_iter().enumerate() {
+        let shader = build_valu_cs(&pack_words(quadmask));
         run_cases(&shader, &inputs, |backend, i, _, got| {
-            assert_eq!(got, cases[i].1[wide], "{backend}, opcode {opcode:#x}");
+            assert_eq!(got, cases[i].1[wide], "{backend}, {quadmask}");
         });
     }
-    let high = build_valu_cs(&[
-        0xBE90_2D00, // s_quadmask_b64 s[16:17], s[0:1]
-        vop1(1, 0, sgpr(17)),
-    ]);
+    let high = build_valu_cs(&asm("
+        s_quadmask_b64 s[16:17], s[0:1]
+        v_mov_b32 v0, s17
+    "));
     run_cases(&high, &inputs, |backend, _, _, got| {
         assert_eq!(got, 0, "{backend}: high dword");
     });
@@ -457,17 +461,17 @@ fn packed_add_selects_halves_of_inline_constants() {
     // The same GFX10 source field (248) has a different bit pattern for a
     // packed floating-point and a packed integer instruction.
     let cases = [
-        // v_pk_add_f16 v0, 0x3118, v1
-        ([0xcc0f4000, 0x1a0202f8], 0x0000_3118),
-        // v_pk_add_f16 v0, 0x3118, v1 op_sel_hi:[0,1] (use low twice)
-        ([0xcc0f4000, 0x120202f8], 0x3118_3118),
-        // v_pk_add_u16 v0, 0x3e22f983, v1
-        ([0xcc0a4000, 0x1a0202f8], 0x3e22_f983),
+        // f16 0x3118 in the low half; the high half reads as zero.
+        ("v_pk_add_f16 v0, 0.15915494, v1", 0x0000_3118),
+        // op_sel_hi:[0,1]: the low half twice.
+        ("v_pk_add_f16 v0, sel_lo(0.15915494), v1", 0x3118_3118),
+        // As integers: the f32 bits 0x3e22f983.
+        ("v_pk_add_u16 v0, 0.15915494, v1", 0x3e22_f983),
     ];
-    for (words, expected) in cases {
-        let shader = build_valu_cs(&words);
+    for (text, expected) in cases {
+        let shader = build_valu_cs(&asm(text));
         run_cases(&shader, &[[0; 4]], |backend, _, _, got| {
-            assert_eq!(got, expected, "{backend}: {words:08x?}");
+            assert_eq!(got, expected, "{backend}: {text}");
         });
     }
 }
@@ -486,8 +490,7 @@ fn cvt_f32_f64_reference(x: f64) -> u32 {
 
 #[test]
 fn v_cvt_f32_f64_rounds_to_nearest_even() {
-    // v_cvt_f32_f64 v0, v[1:2] (VOP1 opcode 0x0f)
-    let shader = build_valu_cs(&[vop1(0x00f, 0, vgpr(1))]);
+    let shader = build_valu_cs(&asm("v_cvt_f32_f64 v0, v[1:2]"));
     let tie_even = 1.0f64 + f64::from(f32::EPSILON) / 2.0; // ties to 1.0
     let tie_odd = 1.0f64 + 1.5 * f64::from(f32::EPSILON); // ties up to 1 + 2 ulp
     let values = [
@@ -577,8 +580,7 @@ fn v_permlane16_and_x16_read_the_lanes_their_selectors_pick() {
 
 #[test]
 fn v_med3_f32_matches_rdna2_with_nan() {
-    // v_med3_f32 v0, v1, v2, v3 (VOP3 opcode 0x157)
-    let shader = build_valu_cs(&vop3(0x157, 0, vgpr(1), vgpr(2), vgpr(3)));
+    let shader = build_valu_cs(&asm("v_med3_f32 v0, v1, v2, v3"));
     let nan = f32::NAN.to_bits();
     let f = f32::to_bits;
 
@@ -636,23 +638,22 @@ fn max_and_min_order_negative_zero_below_positive_zero() {
         [pz, nz, pz, 0],
     ];
     let ops = [
-        ("v_max_f32", 0x110, pz),
-        ("v_min_f32", 0x10F, nz),
-        ("v_max3_f32", 0x154, pz),
-        ("v_min3_f32", 0x151, nz),
+        ("v_max_f32_e64 v0, v1, v2", pz),
+        ("v_min_f32_e64 v0, v1, v2", nz),
+        ("v_max3_f32 v0, v1, v2, v3", pz),
+        ("v_min3_f32 v0, v1, v2, v3", nz),
     ];
-    for (name, op, want) in ops {
-        let shader = build_valu_cs(&vop3(op, 0, vgpr(1), vgpr(2), vgpr(3)));
+    for (text, want) in ops {
+        let shader = build_valu_cs(&asm(text));
         run_cases(&shader, &cases, |backend, _, inp, got| {
-            assert_eq!(got, want, "{backend}: {name} {inp:x?}");
+            assert_eq!(got, want, "{backend}: {text} {inp:x?}");
         });
     }
 }
 
 #[test]
 fn v_med3_f16_matches_rdna2_with_nan() {
-    // v_med3_f16 v0, v1, v2, v3 (VOP3 opcode 0x357)
-    let shader = build_valu_cs(&vop3(0x357, 0, vgpr(1), vgpr(2), vgpr(3)));
+    let shader = build_valu_cs(&asm("v_med3_f16 v0, v1, v2, v3"));
     let h0 = 0x0000u32; // 0.0
     let h1 = 0x3C00u32; // 1.0
     let h2 = 0x4000u32; // 2.0
@@ -694,8 +695,6 @@ fn v_med3_f16_matches_rdna2_with_nan() {
 /// either operand is a NaN (RDNA2 ISA; the same on gfx1036 hardware).
 #[test]
 fn v_cmp_lg_is_false_for_nan() {
-    // v_cmp_lg_{f32,f16}_e64 s20, v1, v2 (VOPC 0x005 / 0x0cd in VOP3);
-    // v_cndmask_b32_e64 v0, 0, 1, s20 (VOP3 0x101)
     let nan = f32::NAN.to_bits();
     let (inf, ninf) = (f32::INFINITY.to_bits(), f32::NEG_INFINITY.to_bits());
     let f = f32::to_bits;
@@ -723,13 +722,13 @@ fn v_cmp_lg_is_false_for_nan() {
         ([0x7C01, 0x0000, 0, 0], 0),           // a signalling NaN
         ([0xABCD_3C00, 0x1234_7E00, 0, 0], 0), // only the low halves are read
     ];
-    for (op, what, cases) in [
-        (0x005u16, "v_cmp_lg_f32", f32_cases),
-        (0x0cd, "v_cmp_lg_f16", f16_cases),
-    ] {
-        let mut body = vop3(op, 20, vgpr(1), vgpr(2), 0x80).to_vec();
-        body.extend_from_slice(&vop3(0x101, 0, 0x80, 0x81, sgpr(20)));
-        let shader = build_valu_cs(&body);
+    for (what, cases) in [("v_cmp_lg_f32", f32_cases), ("v_cmp_lg_f16", f16_cases)] {
+        let shader = build_valu_cs(&asm(&format!(
+            "
+            {what} s20, v1, v2
+            v_cndmask_b32 v0, 0, 1, s20
+            "
+        )));
         let inputs: Vec<[u32; 4]> = cases.iter().map(|c| c.0).collect();
         run_cases(&shader, &inputs, |backend, i, inp, got| {
             let want = cases[i].1;
@@ -749,19 +748,19 @@ fn v_cmp_lg_is_false_for_nan() {
 #[test]
 fn v_cmp_u64_and_i64_order_by_the_high_dword() {
     type Order = fn(u64, u64) -> bool;
-    let ops: [(u16, &str, Order); 12] = [
-        (0x0a1, "v_cmp_lt_i64", |a, b| (a as i64) < (b as i64)),
-        (0x0a2, "v_cmp_eq_i64", |a, b| a == b),
-        (0x0a3, "v_cmp_le_i64", |a, b| (a as i64) <= (b as i64)),
-        (0x0a4, "v_cmp_gt_i64", |a, b| (a as i64) > (b as i64)),
-        (0x0a5, "v_cmp_ne_i64", |a, b| a != b),
-        (0x0a6, "v_cmp_ge_i64", |a, b| (a as i64) >= (b as i64)),
-        (0x0e1, "v_cmp_lt_u64", |a, b| a < b),
-        (0x0e2, "v_cmp_eq_u64", |a, b| a == b),
-        (0x0e3, "v_cmp_le_u64", |a, b| a <= b),
-        (0x0e4, "v_cmp_gt_u64", |a, b| a > b),
-        (0x0e5, "v_cmp_ne_u64", |a, b| a != b),
-        (0x0e6, "v_cmp_ge_u64", |a, b| a >= b),
+    let ops: [(&str, Order); 12] = [
+        ("v_cmp_lt_i64", |a, b| (a as i64) < (b as i64)),
+        ("v_cmp_eq_i64", |a, b| a == b),
+        ("v_cmp_le_i64", |a, b| (a as i64) <= (b as i64)),
+        ("v_cmp_gt_i64", |a, b| (a as i64) > (b as i64)),
+        ("v_cmp_ne_i64", |a, b| a != b),
+        ("v_cmp_ge_i64", |a, b| (a as i64) >= (b as i64)),
+        ("v_cmp_lt_u64", |a, b| a < b),
+        ("v_cmp_eq_u64", |a, b| a == b),
+        ("v_cmp_le_u64", |a, b| a <= b),
+        ("v_cmp_gt_u64", |a, b| a > b),
+        ("v_cmp_ne_u64", |a, b| a != b),
+        ("v_cmp_ge_u64", |a, b| a >= b),
     ];
     let values: [u64; 10] = [
         0,
@@ -780,14 +779,17 @@ fn v_cmp_u64_and_i64_order_by_the_high_dword() {
         .flat_map(|&a| values.iter().map(move |&b| (a, b)))
         .map(|(a, b)| [a as u32, (a >> 32) as u32, b as u32, (b >> 32) as u32])
         .collect();
-    for (op, name, order) in ops {
-        // op s20, v[1:2], v[3:4] and, sharing v2, op s20, v[1:2], v[2:3];
-        // v_cndmask_b32_e64 v0, 0, 1, s20
+    for (name, order) in ops {
+        // v[1:2] against v[3:4] and, sharing v2, against v[2:3].
         for second in [3, 2] {
-            let mut body = vop3(op, 20, vgpr(1), vgpr(second), 0x80).to_vec();
-            body.extend_from_slice(&vop3(0x101, 0, 0x80, 0x81, sgpr(20)));
-            let shader = build_valu_cs(&body);
-            let at = usize::from(second) - 1;
+            let shader = build_valu_cs(&asm(&format!(
+                "
+                {name} s20, v[1:2], v[{second}:{}]
+                v_cndmask_b32 v0, 0, 1, s20
+                ",
+                second + 1
+            )));
+            let at = second - 1;
             run_cases(&shader, &inputs, |backend, _, inp, got| {
                 let a = u64::from(inp[0]) | u64::from(inp[1]) << 32;
                 let b = u64::from(inp[at]) | u64::from(inp[at + 1]) << 32;
@@ -800,8 +802,7 @@ fn v_cmp_u64_and_i64_order_by_the_high_dword() {
 
 #[test]
 fn v_cvt_off_f32_i4_uses_the_signed_low_nibble() {
-    // v_cvt_off_f32_i4 v0, v1 (VOP1 opcode 0x00e)
-    let shader = build_valu_cs(&[vop1(0x00e, 0, vgpr(1))]);
+    let shader = build_valu_cs(&asm("v_cvt_off_f32_i4 v0, v1"));
     let nibble = |n: u32| (((n as i32) << 28) >> 28) as f32 / 16.0;
 
     let mut cases: Vec<u32> = (0..16).collect();
@@ -825,8 +826,7 @@ fn v_cvt_off_f32_i4_uses_the_signed_low_nibble() {
 
 #[test]
 fn v_fract_f32_never_returns_one() {
-    // v_fract_f32 v0, v1 (VOP1 opcode 0x020)
-    let shader = build_valu_cs(&[vop1(0x020, 0, vgpr(1))]);
+    let shader = build_valu_cs(&asm("v_fract_f32 v0, v1"));
     let f = f32::to_bits;
     let below_one = 0x3F7F_FFFFu32;
 
