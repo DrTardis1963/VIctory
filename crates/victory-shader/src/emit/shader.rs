@@ -762,6 +762,17 @@ impl Shader {
         }
 
         let graphics = self.threads.is_none() || self.mesh.is_some();
+        // DXIL requires every signature element packed into the same row to
+        // share one interpolation mode. Integer / SV_IsFrontFace elements must
+        // stay constant (1); otherwise a read element's mode wins over unread
+        // siblings in the same row. (Before the view-id state, which counts
+        // the rows an element moved to.)
+        if self.pixel {
+            isolate_front_face(&mut self.inputs);
+            reconcile_row_interp(&mut self.inputs);
+        } else if graphics {
+            reconcile_row_interp(&mut self.outputs);
+        }
         if graphics {
             // shortcut: every output is declared to depend on every input; the
             // exact sets need a dependence pass. Drivers read this state.
@@ -798,17 +809,6 @@ impl Shader {
             let arr = self.m.md_value(arr);
             let view_node = self.m.md_node(vec![Some(arr)]);
             self.m.named_md("dx.viewIdState", vec![view_node]);
-        }
-
-        // DXIL requires every signature element packed into the same row to
-        // share one interpolation mode. Integer / SV_IsFrontFace elements must
-        // stay constant (1); otherwise a read element's mode wins over unread
-        // siblings in the same row.
-        if self.pixel {
-            isolate_front_face(&mut self.inputs);
-            reconcile_row_interp(&mut self.inputs);
-        } else if graphics {
-            reconcile_row_interp(&mut self.outputs);
         }
 
         let sigs = if graphics {
