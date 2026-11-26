@@ -90,6 +90,10 @@ mod diff_tests;
 mod intersect_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
+#[cfg(test)]
+mod interp;
+#[cfg(all(test, windows))]
+mod interp_tests;
 mod lower;
 mod own_bits;
 mod rect;

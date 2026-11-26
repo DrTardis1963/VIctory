@@ -1,6 +1,7 @@
 //! Repository maintenance. Run with `cargo xtask <command>`.
 
 mod agility;
+mod difftest;
 mod gate;
 mod harness;
 #[cfg(test)]
@@ -99,6 +100,19 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// Run synthetic GFX10 programs on a reference interpreter and, translated,
+    /// on the GPU, and compare the outputs: the corpus, then random programs.
+    DiffTest {
+        /// Random straight-line programs to run after the corpus.
+        #[arg(long, default_value_t = 200)]
+        cases: u64,
+        /// The first random program's seed (each next one adds 1).
+        #[arg(long, default_value_t = 1)]
+        seed: u64,
+        /// Also run the known miscompiles (tests marked #[ignore]).
+        #[arg(long)]
+        ignored: bool,
+    },
 }
 
 fn main() -> Result<()> {
@@ -137,6 +151,7 @@ fn main() -> Result<()> {
         Cmd::Todo { files, limit, json } => todo::run(&root, files, limit, json),
         Cmd::Agility { from, check } => agility::run(&root, from, check),
         Cmd::Opcodes { from, all, json } => opcodes::run(&root, from, all, json),
+        Cmd::DiffTest { cases, seed, ignored } => difftest::run(&root, cases, seed, ignored),
     }
 }
 
