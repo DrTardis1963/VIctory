@@ -14,7 +14,7 @@ Este fork tem um alvo só: **placa NVIDIA de 8 GB com ondas de 32 lanes**
 ter a sua própria cópia. Nada aqui tem ligação com o desenvolvedor ou a
 editora do jogo, nem é aprovado por eles.
 
-## Onde está (2026-11-25)
+## Onde está (2026-11-26)
 
 A base foi trocada por uma que, na mesma placa de 8 GB, mostra rostos, pele,
 cabelo e luz bem melhores. Por cima dela vieram os ajustes para NVIDIA de 8 GB.
@@ -24,14 +24,18 @@ cabelo e luz bem melhores. Por cima dela vieram os ajustes para NVIDIA de 8 GB.
 | Imagem, perfil Series X | rostos e pele com textura, luz coerente nas cutscenes |
 | fps, perfil Series X, release | ~5,6 (a placa sozinha leva ~105 ms por quadro) |
 | Memória da placa, Series X | no limite; na prisão passa do orçamento e a textura borra |
-| Perfil Series S, release | imagem certa (composição de planos), placa em 5,3 de 6,9 GB, ~6,8 fps |
+| Perfil Series S, release | imagem certa (composição de planos), placa em 5,3 de 6,9 GB, ~10,9 fps (10% piores: 8,6) |
 
-**Não é jogável ainda.** O alvo é 15 fps ou mais nas cutscenes e na prisão, nítido.
+**Ainda não está jogável.** O alvo é ter 15 fps ou mais, com imagem nítida, nas cutscenes e na prisão. Use o perfil Series S.
 
 ## O que este fork acrescenta
 
 - **`VICTORY_RT_MISS=1`**: o teste de raio não acerta nada; sem a estrutura de ray
   tracing montada, as sombras de luzes locais saíam de lixo (rosto preto ou com "purpurina").
+- **Skinning do ray tracing pulado** com `RT_MISS=1`: os 30 programas `CSComputeSkinning*`
+  (`bvh_skinning`) refaziam a pose de todo personagem só para a estrutura de ray tracing,
+  que ninguém usa assim, e eram a maior parte do tempo da placa (~6,8 → ~10,9 fps no
+  Series S). `VICTORY_RT_SKIN=1` volta a rodá-los.
 - **Assado de decoração do rosto reconhecido pelo nome** (`PS_DecorationBlend_*`,
   `PS_BakeDecorations_*`, 51 programas): a lista de 4 hashes deixava de fora o que
   faz os rostos da cutscene, e o rosto saía preto.
@@ -54,12 +58,12 @@ cabelo e luz bem melhores. Por cima dela vieram os ajustes para NVIDIA de 8 GB.
 copy victory.example.toml victory.toml      # e aponte game_dir para a sua cópia
 cargo build --locked --release -p victory
 target\release\victory.exe shaders <os arquivos de shaders do jogo>
-target\release\victory.exe run <o executável do jogo> --console series-x --execute
+target\release\victory.exe run <o executável do jogo> --console series-s --execute
 ```
 
-Configuração usada nas medições acima: `VICTORY_RT_MISS=1`, `VICTORY_RELAY=1`,
+Configuração usada nas medições acima: `VICTORY_RT_MISS=1`, `VICTORY_RELAY=2`,
 `VICTORY_THIN=0`, `VICTORY_DISPLAY_MODE=1920x1080`, `VICTORY_PIPELINE_BOOK=1`,
-`VICTORY_MEMORY_CARD_MB=1024`, `VICTORY_TEXTURE_ROOM_PERCENT=85`. Não ligue
+`VICTORY_MEMORY_CARD_MB=1024`, `VICTORY_UPSCALER=6` (Series S). Não ligue
 `VICTORY_THIN=1` numa NVIDIA (o fps cai a menos da metade).
 
 ## Licença
