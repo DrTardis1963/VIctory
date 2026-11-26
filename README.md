@@ -14,29 +14,21 @@ Este fork tem um alvo só: **placa NVIDIA de 8 GB com ondas de 32 lanes**
 ter a sua própria cópia. Nada aqui tem ligação com o desenvolvedor ou a
 editora do jogo, nem é aprovado por eles.
 
-Origem: [VIctory](https://github.com/Marvisak/VIctory) →
-[fxceless/victory-fork](https://github.com/fxceless/victory-fork) →
-[avatarmanz/VIctory-7900XTX](https://github.com/avatarmanz/VIctory-7900XTX) → este fork.
-O README da árvore do avatarmanz está em [docs/README-avatarmanz.md](docs/README-avatarmanz.md)
-e o do fxceless em [docs/README-fxceless.md](docs/README-fxceless.md).
-
 ## Onde está (2026-11-25)
 
-A base passou a ser a árvore do avatarmanz: na mesma placa de 8 GB ela mostra
-rostos, pele, cabelo e luz bem melhores que a nossa base anterior. Por cima dela
-vieram os nossos ajustes para NVIDIA de 8 GB.
+A base foi trocada por uma que, na mesma placa de 8 GB, mostra rostos, pele,
+cabelo e luz bem melhores. Por cima dela vieram os ajustes para NVIDIA de 8 GB.
 
 | | Medido (RTX 4060 Ti 8 GB, i7-13700K, 1080p) |
 |---|---|
 | Imagem, perfil Series X | rostos e pele com textura, luz coerente nas cutscenes |
 | fps, perfil Series X, release | ~5,6 (a placa sozinha leva ~105 ms por quadro) |
 | Memória da placa, Series X | no limite; na prisão passa do orçamento e a textura borra |
-| Perfil Series S | composição de planos portada, em teste |
-| Termos e telas iniciais | passam sozinhos (`scripts` do usuário) |
+| Perfil Series S, release | imagem certa (composição de planos), placa em 5,3 de 6,9 GB, ~6,8 fps |
 
 **Não é jogável ainda.** O alvo é 15 fps ou mais nas cutscenes e na prisão, nítido.
 
-## O que este fork acrescenta à base
+## O que este fork acrescenta
 
 - **`VICTORY_RT_MISS=1`**: o teste de raio não acerta nada; sem a estrutura de ray
   tracing montada, as sombras de luzes locais saíam de lixo (rosto preto ou com "purpurina").
@@ -44,7 +36,7 @@ vieram os nossos ajustes para NVIDIA de 8 GB.
   `PS_BakeDecorations_*`, 51 programas): a lista de 4 hashes deixava de fora o que
   faz os rostos da cutscene, e o rosto saía preto.
 - **Listas de memória alterada compactadas em vez de apagadas** quando enchem: apagar
-  deixava texturas com bytes velhos (o vídeo da intro "voltava quadros").
+  deixava texturas com bytes velhos depois de a memória mudar.
 - **Composição de planos do present** (Series S: o mundo e a interface em planos separados).
 - **Patches do título também no release** (`VICTORY_UPSCALER=6`: o upscaler do próprio
   jogo no Series S, já que os passes do FidelityFX não têm DXIL aqui).
