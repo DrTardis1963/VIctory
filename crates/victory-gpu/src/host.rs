@@ -755,6 +755,35 @@ mod tests {
     }
 
     #[test]
+    fn copies_over_a_guard_page_zero_it_and_leave_the_guard() {
+        use windows_sys::Win32::System::Memory::*;
+        const PAGE: usize = 4096;
+        // SAFETY: a private test allocation, freed before returning; the
+        // guarded page is only read through the fault-catching copy.
+        unsafe {
+            let base = VirtualAlloc(std::ptr::null(), 3 * PAGE, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE)
+                .cast::<u8>();
+            assert!(!base.is_null());
+            base.write_bytes(0x11, 3 * PAGE);
+            let guard = base.add(PAGE);
+            let mut old = 0;
+            assert_ne!(VirtualProtect(guard.cast(), PAGE, PAGE_READWRITE | PAGE_GUARD, &mut old), 0);
+            for _ in 0..2 {
+                // The bulk read fails at the guard; pieces give the other pages.
+                assert!(!super::read_into(base, &mut vec![0u8; 3 * PAGE]));
+                let mut out = vec![0xeeu8; 3 * PAGE];
+                super::copy_mapped(out.as_mut_ptr(), base, 3 * PAGE, false);
+                assert!(out[..PAGE].iter().chain(&out[2 * PAGE..]).all(|&b| b == 0x11));
+                assert!(out[PAGE..2 * PAGE].iter().all(|&b| b == 0));
+                let mut info: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+                assert_eq!(VirtualQuery(guard.cast(), &mut info, size_of_val(&info)), size_of_val(&info));
+                assert_ne!(info.Protect & PAGE_GUARD, 0, "the guard is put back");
+            }
+            assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
+        }
+    }
+
+    #[test]
     fn write_mapped_skips_unmapped_and_readonly_pages_and_marks_write_watch() {
         use windows_sys::Win32::System::Memory::*;
         const PAGE: usize = 4096;
@@ -6482,6 +6511,7 @@ mod direct_copy {
         let code = record.ExceptionCode;
         if code != EXCEPTION_ACCESS_VIOLATION as NTSTATUS
             && code != EXCEPTION_IN_PAGE_ERROR as NTSTATUS
+            && code != STATUS_GUARD_PAGE_VIOLATION
         {
             return EXCEPTION_CONTINUE_SEARCH;
         }
@@ -6503,8 +6533,38 @@ mod direct_copy {
         {
             return EXCEPTION_CONTINUE_EXECUTION;
         }
+        // A guard page of the title's (a thread stack's next page): Windows
+        // took the guard off to raise this. Put it back, so the title's own
+        // touch still finds it, and report the page unreadable (2026-11-26:
+        // a shadow update read one and the uncaught 0x80000001 ended the run).
+        if code == STATUS_GUARD_PAGE_VIOLATION && record.NumberParameters >= 2 {
+            rearm_guard(record.ExceptionInformation[1]);
+        }
         ctx.Rip = (&raw const victory_try_copy_fault) as u64;
         EXCEPTION_CONTINUE_EXECUTION
+    }
+
+    /// `STATUS_GUARD_PAGE_VIOLATION`.
+    const STATUS_GUARD_PAGE_VIOLATION: NTSTATUS = 0x8000_0001_u32 as NTSTATUS;
+
+    /// Puts `PAGE_GUARD` back on the page holding `address`.
+    fn rearm_guard(address: usize) {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_GUARD, VirtualProtect, VirtualQuery,
+        };
+        let page = address & !0xfff;
+        // SAFETY: the query fills a local structure; the protection change
+        // adds the guard Windows just removed from a committed page.
+        unsafe {
+            let mut info: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+            if VirtualQuery(page as *const _, &mut info, size_of_val(&info)) != size_of_val(&info)
+                || info.State != MEM_COMMIT
+            {
+                return;
+            }
+            let mut old = 0;
+            VirtualProtect(page as *const _, 0x1000, info.Protect | PAGE_GUARD, &mut old);
+        }
     }
 
     fn install() {
