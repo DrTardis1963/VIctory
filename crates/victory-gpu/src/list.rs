@@ -840,6 +840,27 @@ fn unlike(dst: This, src: This) -> bool {
     unlike
 }
 
+/// Copies left out because both sides were one host texture
+/// ([`copy_resource`], [`copy_texture_region`]), since the last
+/// frame-rate line.
+#[cfg(windows)]
+pub(crate) static SELF_COPIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Notes a copy left out by [`copy_resource`] or [`copy_texture_region`]
+/// because both sides were one host texture; logs the first one.
+#[cfg(windows)]
+fn self_copy(dst: This, src: This) {
+    SELF_COPIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        tracing::info!(
+            ?dst,
+            ?src,
+            "a copy between two title textures that share one host texture is left out: the first one"
+        );
+    });
+}
+
 extern "system" fn copy_resource(this: This, dst: This, src: This) {
     #[cfg(windows)]
     {
@@ -866,6 +887,17 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
                 });
                 return;
             }
+            // Two title textures over the same memory have one host
+            // texture between them: the copy would be of that texture onto
+            // itself, which the host does not allow, and it would change
+            // nothing. It was recorded all the same, with the texture left
+            // in the source state as the copy's destination (fxceless run
+            // 205's debug layer: "CopyResource with its destination in the
+            // COPY_SOURCE state", 37 times, a 2560x1440 depth texture).
+            // Only the two state changes and the copy are left out: what
+            // is noted of the textures stays as it was. After
+            // triippywhale 6e502b3b.
+            let same = windows::core::Interface::as_raw(to) == windows::core::Interface::as_raw(from);
             // A source the title fills itself is uploaded first (upstream
             // PR #671): a copy read whatever the host texture held.
             if crate::texture::title_written(from) {
@@ -874,9 +906,13 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             // Depth textures shaders also write: what they wrote, first.
             list.twin_use(dst, false, true);
             list.twin_use(src, false, false);
+            crate::texture::host_written(dst);
+            if same {
+                self_copy(dst, src);
+                return;
+            }
             ensure_state(list, dst, COPY_DEST);
             ensure_state(list, src, COPY_SOURCE);
-            crate::texture::host_written(dst);
             #[cfg(feature = "diagnostics")]
             list.note_op(|| format!("copy resource {src:?} to {dst:?}"));
             // SAFETY: an open list and live textures.
@@ -990,6 +1026,9 @@ extern "system" fn copy_texture_region(
         if src.kind != FOOTPRINT {
             from.footprint.offset = u64::from(from_sub);
         }
+        // Both sides are the same host subresource of one host texture
+        // (two title textures over one memory; set below).
+        let mut same = false;
         let _upload; // keeps the source alive while this call records it
         #[cfg(feature = "diagnostics")]
         let mut read = None;
@@ -1018,18 +1057,32 @@ extern "system" fn copy_texture_region(
             let Some(texture) = crate::resource::host_resource(src.resource) else {
                 return;
             };
+            // The same host subresource of one host texture on both sides
+            // (two title textures over one memory): not a copy the host
+            // allows (fxceless a2537066). The states and the copy are left
+            // out below; the rest is noted as before.
+            // shortcut: a copy of one region of the subresource to another
+            // (a box away from x, y, z) would move texels on the console;
+            // that needs a copy through a second texture, and is left out too.
+            same =texture.as_raw() == to.as_raw() && dst.kind != FOOTPRINT && from_sub == to_sub;
             list.twin_use(src.resource, false, false);
             if crate::texture::title_written(texture) {
                 crate::texture::upload(list, src.resource, texture);
             }
-            ensure_state(list, src.resource, COPY_SOURCE);
+            if !same {
+                ensure_state(list, src.resource, COPY_SOURCE);
+            }
             from.resource = texture.as_raw().cast_const().cast();
         }
         // A depth texture shaders also write: what they wrote, first (the
         // source above too).
         list.twin_use(dst.resource, false, true);
-        ensure_state(list, dst.resource, COPY_DEST);
         crate::texture::host_written(dst.resource);
+        if same {
+            self_copy(dst.resource, src.resource);
+            return;
+        }
+        ensure_state(list, dst.resource, COPY_DEST);
         let mut to_location = dst;
         to_location.resource = to.as_raw().cast_const().cast();
         if dst.kind != FOOTPRINT {

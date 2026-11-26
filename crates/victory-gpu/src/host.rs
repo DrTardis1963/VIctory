@@ -6894,6 +6894,10 @@ impl Meter {
                 "  heap pass breakdown per frame: textures {heap_textures_ms:.1} ms, {heap_buf_slots:.0} buffer slots inspected"
             );
         }
+        let self_copies = crate::list::SELF_COPIES.swap(0, Ordering::Relaxed);
+        if self_copies > 0 {
+            tracing::info!("copies of a host texture onto itself left out: {self_copies}");
+        }
         // Copies between depth textures and their colour twins, each way.
         let [twin_to_depth, twin_to_colour] =
             [2, 3].map(|i| crate::resource::TWINS[i].swap(0, Ordering::Relaxed) as f64 / frames);
