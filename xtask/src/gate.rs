@@ -125,9 +125,21 @@ pub fn run(root: &Path, options: &Options) -> Result<()> {
         steps.push(step);
     }
 
+    let summary = summary_json(&scope, &steps, !failed);
     if options.json {
-        println!("{}", summary_json(&scope, &steps, !failed));
+        println!("{summary}");
     }
+    // For `cargo xtask worktrees`: the last gate's result and the commit it
+    // checked (a dirty tree is marked, as its result is not the commit's).
+    let head = git(root, &["rev-parse", "HEAD"]).unwrap_or_default();
+    let dirty = git(root, &["status", "--porcelain", "--untracked-files=no"])
+        .is_ok_and(|s| !s.trim().is_empty());
+    let stamped = format!(
+        "{{\"head\":{},\"dirty\":{dirty},\"changed_only\":{},\"gate\":{summary}}}",
+        json::string(head.trim()),
+        options.changed
+    );
+    let _ = std::fs::write(logs.join("summary.json"), stamped);
     if failed {
         let names: Vec<_> = steps
             .iter()

@@ -1,6 +1,8 @@
 //! Repository maintenance. Run with `cargo xtask <command>`.
 
 mod agility;
+mod bench;
+mod corpus;
 mod gate;
 mod harness;
 #[cfg(test)]
@@ -10,6 +12,7 @@ mod opcodes;
 mod policy;
 mod progress;
 mod todo;
+mod worktrees;
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -41,6 +44,45 @@ enum Cmd {
     Harness {
         #[command(subcommand)]
         cmd: harness::HarnessCmd,
+    },
+    /// Parallel agents: make worktrees, show their state and last gate, and
+    /// land the ones that passed.
+    Worktrees {
+        #[command(subcommand)]
+        cmd: worktrees::WorktreesCmd,
+    },
+    /// Run the benchmark tests (release) and compare with a saved run.
+    Bench {
+        /// Keep this run under NAME (e.g. `main`).
+        #[arg(long)]
+        save: Option<String>,
+        /// Compare with the run saved under NAME.
+        #[arg(long)]
+        against: Option<String>,
+        /// Percent worse that counts as a regression.
+        #[arg(long, default_value_t = 5.0)]
+        threshold: f64,
+        /// Fail when a benchmark regressed.
+        #[arg(long)]
+        strict: bool,
+        /// Print as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Compare two `victory translate --json` reports of the same shaders:
+    /// programs fixed and broken, totals by stage and failure reason.
+    CorpusDiff {
+        before: PathBuf,
+        after: PathBuf,
+        /// List every program and reason, not the first 20.
+        #[arg(long)]
+        all: bool,
+        /// Print as one JSON object.
+        #[arg(long)]
+        json: bool,
+        /// Fail when any program broke.
+        #[arg(long)]
+        strict: bool,
     },
     /// GFX10 opcode coverage: which opcodes the decoder knows, the shader
     /// tests lower, and the lowering names. Runs victory-shader's unit tests.
@@ -107,6 +149,7 @@ fn main() -> Result<()> {
         Cmd::Policy { staged } => policy::run(&root, staged),
         Cmd::Progress => progress::run(&root),
         Cmd::Harness { cmd } => harness::run(&root, cmd),
+        Cmd::Worktrees { cmd } => worktrees::run(&root, cmd),
         Cmd::InstallHooks => {
             let status = Command::new("git")
                 .args(["config", "core.hooksPath", ".githooks"])
@@ -137,6 +180,29 @@ fn main() -> Result<()> {
         Cmd::Todo { files, limit, json } => todo::run(&root, files, limit, json),
         Cmd::Agility { from, check } => agility::run(&root, from, check),
         Cmd::Opcodes { from, all, json } => opcodes::run(&root, from, all, json),
+        Cmd::Bench {
+            save,
+            against,
+            threshold,
+            strict,
+            json,
+        } => bench::run(
+            &root,
+            &bench::Options {
+                save,
+                against,
+                threshold,
+                strict,
+                json,
+            },
+        ),
+        Cmd::CorpusDiff {
+            before,
+            after,
+            all,
+            json,
+            strict,
+        } => corpus::run(&before, &after, all, json, strict),
     }
 }
 

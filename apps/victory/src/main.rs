@@ -99,6 +99,10 @@ enum Command {
         /// Worker threads (default: every logical core).
         #[arg(long)]
         jobs: Option<usize>,
+        /// Also write every program's outcome to FILE (outside the
+        /// repository), for `cargo xtask corpus-diff`.
+        #[arg(long, value_name = "FILE")]
+        json: Option<PathBuf>,
     },
     /// Translate the shaders of a title's archives into the cache and make
     /// their compute pipelines, so that a run finds them there.
@@ -181,6 +185,7 @@ fn main() -> Result<()> {
             used_only,
             host_lanes,
             jobs,
+            json,
         } => {
             // `VICTORY_VIEW_LIMIT=<null slot>`: translate as on a host whose view heap is capped
             if let Some(n) = std::env::var("VICTORY_VIEW_LIMIT").ok().and_then(|v| v.parse().ok()) {
@@ -190,7 +195,9 @@ fn main() -> Result<()> {
             if let Some(n) = std::env::var("VICTORY_HOST_WAVE").ok().and_then(|v| v.parse().ok()) {
                 victory_shader::emit::set_host_max_wave(n);
             }
-            translate::run(paths, validate, pipelines, list, write_cache, used_only, host_lanes, jobs)
+            translate::run(
+                paths, validate, pipelines, list, write_cache, used_only, host_lanes, jobs, json,
+            )
         }
         Command::Warm { paths, jobs, no_pipelines } => translate::warm(paths, jobs, !no_pipelines),
         Command::Run {
