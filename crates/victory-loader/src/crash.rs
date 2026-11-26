@@ -64,10 +64,30 @@ pub fn log_crashes_to(file: std::path::PathBuf) {
 /// Appends a failure that is not an exception (the host GPU's) to the crash
 /// log, with the title's last debug output, and prints it.
 pub fn log_crash(text: &str) {
+    log_crash_at(text, None);
+}
+
+/// [`log_crash`] with the address the failure is at, if there is one (a
+/// trapped import's caller), for the crash bundle.
+pub(crate) fn log_crash_at(text: &str, fault: Option<usize>) {
+    let bundle = bundle_beside_log(&format!("{text}\n"), fault);
     let text = format!("{text}
-{}", report_end());
+{}{bundle}", report_end());
     eprint!("{text}");
     append_to_log(&text);
+}
+
+/// Writes a crash bundle beside the crash log, if there is one; returns the
+/// crash log's line naming it (or nothing).
+fn bundle_beside_log(report: &str, fault: Option<usize>) -> String {
+    let Some(dir) = LOG.get().and_then(|log| log.parent()) else {
+        return String::new();
+    };
+    let crash = crate::bundle::Crash { report, fault };
+    match crate::bundle::write(dir, &crash) {
+        Some(path) => format!("  bundle: {}\n", path.display()),
+        None => String::new(),
+    }
 }
 
 fn append_to_log(text: &str) {
@@ -102,7 +122,7 @@ pub fn note_title_output(line: &str) {
 
 /// The kept lines, one per report line; nothing if another thread holds
 /// them (it may be the one that faulted).
-fn title_output() -> String {
+pub(crate) fn title_output() -> String {
     let Ok(said) = SAID.try_lock() else {
         return String::new();
     };
@@ -515,9 +535,11 @@ unsafe fn report(what: &str, info: *const EXCEPTION_POINTERS, to_file: bool) {
         line(format!("  #{i:<2} {}", locate(pc as usize)));
     }
     if to_file {
+        let bundle = bundle_beside_log(&text, Some(at));
         let said = report_end();
-        eprint!("{said}");
+        eprint!("{said}{bundle}");
         text.push_str(&said);
+        text.push_str(&bundle);
         append_to_log(&text);
     }
     #[cfg(feature = "diagnostics")]
