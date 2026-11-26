@@ -9304,8 +9304,31 @@ impl Host {
             let Ok(back) = p.swap_chain.GetBuffer::<ID3D12Resource>(index) else {
                 return None;
             };
-            p.copy.reset();
-            let list = &p.copy.list;
+            // Sent ahead like a single plane ([`late_free_present`]): the
+            // synchronous way settled every flight at each present, some
+            // 20 ms of a 95 ms Series S frame with the submitting thread
+            // standing. A saved frame is read back at once, the old way.
+            #[cfg(feature = "diagnostics")]
+            let read_now = crate::capture::wanted(frame) || crate::capture::listed(frame);
+            #[cfg(not(feature = "diagnostics"))]
+            let read_now = false;
+            let slot = if late_free_present() && !read_now {
+                let finished = FINISHED.load(Ordering::Acquire);
+                p.ahead.iter().position(|(_, flown)| *flown <= finished).or_else(|| {
+                    let list = self.new_list().ok()?;
+                    list.close();
+                    p.ahead.push((list, 0));
+                    Some(p.ahead.len() - 1)
+                })
+            } else {
+                None
+            };
+            let copy = match slot {
+                Some(i) => &p.ahead[i].0,
+                None => &p.copy,
+            };
+            copy.reset();
+            let list = &copy.list;
             let mut before = moves(true);
             before.push(transition(&back, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET));
             list.ResourceBarrier(&before);
@@ -9328,8 +9351,14 @@ impl Host {
             let mut after = moves(false);
             after.push(transition(&back, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT));
             list.ResourceBarrier(&after);
-            p.copy.close();
-            self.execute(&[&p.copy]);
+            copy.close();
+            match slot {
+                Some(i) => {
+                    let flown = self.execute_own(copy);
+                    p.ahead[i].1 = flown;
+                }
+                None => self.execute(&[copy]),
+            }
             #[cfg(feature = "diagnostics")]
             if let Some(Some((buffer, footprint))) = capture {
                 crate::capture::save_read_back(frame, &buffer, &footprint);
