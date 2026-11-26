@@ -73,7 +73,11 @@ enum Cmd {
         json: bool,
     },
     /// Compare two `victory translate --json` reports of the same shaders:
-    /// programs fixed and broken, totals by stage and failure reason.
+    /// programs fixed and broken, totals by stage and failure reason. Both
+    /// must be made with the same checks and host; scoreboard runs on a
+    /// 32-lane GPU (NVIDIA): `translate --validate --pipelines --host-lanes
+    /// 32-32 --json <file>`, as without --host-lanes 64-lane programs keep
+    /// a wave size such a GPU refuses.
     CorpusDiff {
         before: PathBuf,
         after: PathBuf,
@@ -86,6 +90,9 @@ enum Cmd {
         /// Fail when any program broke.
         #[arg(long)]
         strict: bool,
+        /// Compare reports made for different hosts or checks anyway.
+        #[arg(long)]
+        any_host: bool,
     },
     /// GFX10 opcode coverage: which opcodes the decoder knows, the shader
     /// tests lower, and the lowering names. Runs victory-shader's unit tests.
@@ -237,7 +244,8 @@ fn main() -> Result<()> {
             all,
             json,
             strict,
-        } => corpus::run(&before, &after, all, json, strict),
+            any_host,
+        } => corpus::run(&before, &after, all, json, strict, any_host),
         Cmd::GpuView { dir } => gpu_view::run(&root, &dir),
         Cmd::Trace { cmd } => trace::run(cmd),
         Cmd::HleStub {

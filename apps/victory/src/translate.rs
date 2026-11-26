@@ -435,6 +435,14 @@ pub fn run(
             "paths": paths,
             "validate": validate,
             "pipelines": pipelines,
+            // What the translation targeted: runs made for different hosts
+            // differ for that reason alone (corpus-diff refuses to mix them).
+            "host": {
+                "max_wave": emit::host_max_wave(),
+                "lanes": host_lanes.map(|(min, max)| format!("{min}-{max}")),
+                "rovs": emit::host_rovs(),
+                "view_limit": emit::view_heap_limit(),
+            },
             "summary": summary,
             "failed": failed,
             "programs": corpus_programs(&t.outcomes),

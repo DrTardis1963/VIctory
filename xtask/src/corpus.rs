@@ -37,9 +37,24 @@ struct Diff {
     reasons: BTreeMap<String, (usize, usize)>,
 }
 
-pub fn run(before: &Path, after: &Path, all: bool, json: bool, strict: bool) -> Result<()> {
-    let a = load(before)?;
-    let b = load(after)?;
+pub fn run(
+    before: &Path,
+    after: &Path,
+    all: bool,
+    json: bool,
+    strict: bool,
+    any_host: bool,
+) -> Result<()> {
+    let (sa, a) = load(before)?;
+    let (sb, b) = load(after)?;
+    if sa != sb && !any_host {
+        bail!(
+            "the two reports were made for different hosts or checks, which changes \
+             results by itself:\n  before: {sa}\n  after:  {sb}\nMake both with the same \
+             flags (scoreboard runs on this machine: `translate --validate --pipelines \
+             --host-lanes 32-32 --json <file>`), or pass --any-host"
+        );
+    }
     let d = diff(&a, &b);
     if json {
         println!("{}", to_json(&d));
@@ -52,7 +67,20 @@ pub fn run(before: &Path, after: &Path, all: bool, json: bool, strict: bool) -> 
     Ok(())
 }
 
-fn load(file: &Path) -> Result<BTreeMap<String, Program>> {
+/// What a report's results depend on besides the translator: the checks run
+/// and the host translated for (`"unknown"` in reports older than that).
+fn settings(report: &Value) -> String {
+    let host = &report["host"];
+    if host.is_null() {
+        return "unknown host".into();
+    }
+    format!(
+        "validate={} pipelines={} max_wave={} rovs={} view_limit={}",
+        report["validate"], report["pipelines"], host["max_wave"], host["rovs"], host["view_limit"]
+    )
+}
+
+fn load(file: &Path) -> Result<(String, BTreeMap<String, Program>)> {
     let text =
         std::fs::read_to_string(file).with_context(|| format!("reading {}", file.display()))?;
     let report: Value =
@@ -79,7 +107,7 @@ fn load(file: &Path) -> Result<BTreeMap<String, Program>> {
             },
         );
     }
-    Ok(out)
+    Ok((settings(&report), out))
 }
 
 fn diff(a: &BTreeMap<String, Program>, b: &BTreeMap<String, Program>) -> Diff {
@@ -137,7 +165,10 @@ fn print(d: &Diff, all: bool) {
             d.removed.len()
         );
     }
-    println!("\n{:<6} {:>8} {:>8} {:>8} {:>9}", "stage", "before", "after", "delta", "programs");
+    println!(
+        "\n{:<6} {:>8} {:>8} {:>8} {:>9}",
+        "stage", "before", "after", "delta", "programs"
+    );
     for (stage, (a, b, n)) in &d.stages {
         println!(
             "{stage:<6} {a:>8} {b:>8} {:>+8} {n:>9}",
@@ -161,7 +192,11 @@ fn print(d: &Diff, all: bool) {
             continue;
         }
         println!("\n{title}: {}", list.len());
-        let shown = if all { list.len() } else { SHOWN.min(list.len()) };
+        let shown = if all {
+            list.len()
+        } else {
+            SHOWN.min(list.len())
+        };
         for (key, pa, pb) in &list[..shown] {
             println!(
                 "  {key}\n      {} -> {}",
@@ -272,9 +307,23 @@ mod tests {
                 {"key":"#3 ~c Ps","stage":"Ps","status":"fail","reason":"emit: q","label":"z"}]}"##,
         )
         .unwrap();
-        let got = load(&file).unwrap();
+        let (settings, got) = load(&file).unwrap();
+        assert_eq!(settings, "unknown host");
         assert_eq!(got.len(), 2);
         assert_eq!(got["#3 ~c Ps"].reason.as_deref(), Some("emit: q"));
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn reports_for_different_hosts_differ_in_their_settings() {
+        let report = |wave: u32| {
+            serde_json::json!({
+                "validate": true, "pipelines": true,
+                "host": {"max_wave": wave, "lanes": null, "rovs": false, "view_limit": 0},
+            })
+        };
+        assert_eq!(settings(&report(32)), settings(&report(32)));
+        assert_ne!(settings(&report(32)), settings(&report(64)));
+        assert!(settings(&report(32)).contains("max_wave=32"));
     }
 }
