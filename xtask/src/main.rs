@@ -3,6 +3,7 @@
 mod agility;
 mod gate;
 mod harness;
+mod hlestub;
 #[cfg(test)]
 mod hook_tests;
 mod json;
@@ -106,6 +107,25 @@ enum Cmd {
         #[command(subcommand)]
         cmd: trace::TraceCmd,
     },
+    /// Scaffold an HLE function for `<dll>!<function>` in the module that
+    /// serves the DLL: a stub handler, its export, a test. Prints the
+    /// patch; --write applies it.
+    HleStub {
+        dll: String,
+        function: String,
+        /// Edit the module file instead of printing the patch.
+        #[arg(long)]
+        write: bool,
+        /// The module file, when several serve the DLL.
+        #[arg(long)]
+        module: Option<PathBuf>,
+        /// The modules folder (default: victory-hle's).
+        #[arg(long)]
+        modules_dir: Option<PathBuf>,
+        /// What the stub returns, as Rust code.
+        #[arg(long, default_value = "0")]
+        returns: String,
+    },
 }
 
 fn main() -> Result<()> {
@@ -145,6 +165,24 @@ fn main() -> Result<()> {
         Cmd::Agility { from, check } => agility::run(&root, from, check),
         Cmd::Opcodes { from, all, json } => opcodes::run(&root, from, all, json),
         Cmd::Trace { cmd } => trace::run(cmd),
+        Cmd::HleStub {
+            dll,
+            function,
+            write,
+            module,
+            modules_dir,
+            returns,
+        } => hlestub::run(
+            &root,
+            &hlestub::Options {
+                dll,
+                function,
+                write,
+                module,
+                modules_dir,
+                returns,
+            },
+        ),
     }
 }
 
