@@ -1587,7 +1587,13 @@ impl<'a> Lower<'a> {
             // LDS past what a host thread group may have)
             // (each host wave on its own exchanges nothing; the relabelling's dword can be borrowed,
             // `wave_base`)
-            let exchange_dwords = if LOCAL_WAVES.get() { 0 } else { 2 * group.div_ceil(64) };
+            // Only where they would not fit, though: every program that fitted keeps the layout
+            // (and so the translation) it had before, the white-screen run of 4a9265f5 having
+            // changed 54 of them that worked.
+            let exchange_dwords = match 2 * group.div_ceil(64) {
+                n if LOCAL_WAVES.get() && s.lds_dwords + n + 1 > 32768 / 4 => 0,
+                n => n,
+            };
             let ordered = GROUP_BARRIERS.get() && group > 64 && s.lds_dwords + exchange_dwords <= 32768 / 4;
             if wave == 64 && host_max_wave() == 32 && (console_lanes || one_wave && s.lds_dwords > 0) {
                 let crosses = insts().any(|i| {
