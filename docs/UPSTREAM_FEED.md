@@ -52,6 +52,14 @@ All 6 tracked VIctory-family remotes are mirrored as `backup/*` branches on priv
 
 7. **[2026-11-26 pass 2] Community base moved.** `avatarmanz/VIctory-7900XTX` ("avatar", remote `upstream-avatar`, 433 commits past upstream `ffe310eb`) is the new base of VI-BR-PORT's `vibr/1126` (Series X ~5.6 fps, Series S prison ~13 fps on a 4060 Ti 8 GB) and of Fayberr/Victory-United (5.0 -> 9.3 fps in the room). Its ray-tracing builder bring-up (VI-BR-PORT `b558934d` and the commits around it) needs upstream's title-memory-by-address model (`0f637570`, `6d021fe3`), which our spine lacks. Ported: `port/vibr-builder` (`0b5f191b` pipeline sync barrier, `30f46c92` builder fences) and `port/rt-skin-skip` (`ab4571df`, `1556de82`). Duplicates or avatar-only, not ported: `689be4d2`, `a46bbdc6`, `44ead3c5`, avatar `4cd2d133`, fxceless `619b2dc5`, `025b042a`. Batch 1 in game: load failures were cold shader caches; `pd-switches` was the default config.
 
+7. **[2026-11-26 pass 3]** Avatar as a base is a final no-go on the RTX 3070: warmed in game, the screen stayed black ~4 min, then showed a smeared, ghosted frame at ~1,400 drops a frame. The milestone-1 spine is `port/vibr-builder`. New branches off it, on `fork`, not merged:
+   - `port/bvh-bound`: all-forks `a6cc12d7` (`VICTORY_BVH_BOUND`, on). Builder windows outside title buffers stay in the host copies. In game: copy-back ~84 vs ~104 MB a frame, back 203 vs 243 ms.
+   - `port/early-load`: all-forks `eea9951f` (pages a copy never took count as stale under shader writes) and `a498c0cf` (`VICTORY_HEAP_EVERY_LIST`). Aimed at the short-lived defect in the first ~2 min of the world.
+   - `port/avatar-wave32`: avatar PR shader commits for 32-lane hosts (`ad0f9dda`, `25025d2f`, `431cab5d`, `7bf91de4`, `abbbd6b0`, `7348b80a`, `4fd34fdd`, `368293ec`, `2d30943e`). Every program's corpus outcome is identical to `vibr-shaders`.
+   - `port/legacy-mad`: fxceless `f6a09d3b`, shader part. `v_mad`/`v_mac_legacy` are now RDNA 2's fused `fma_legacy`.
+   - Already in the spine under another form: all-forks `96800256`, `52c9d8c7`, `4a45000f`.
+   - Design-level only: VI-BR-PORT `18c01292` (`VICTORY_SEND_OWN`), `2aa8134b` (`VICTORY_LIGHT_REFRESH`), fxceless `d4a528ba` (`VICTORY_HEAP_WORKER`), avatar `06fe22a7`, and upstream PR #2121 (NVIDIA view-heap paging; the cap never overflows in our runs).
+
 ---
 
 ## 3. External Radar (To Monitor Before Implementing New Fixes)
