@@ -2,6 +2,7 @@
 
 mod agility;
 mod gate;
+mod gpu_view;
 mod harness;
 #[cfg(test)]
 mod hook_tests;
@@ -99,6 +100,13 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// Write view.html beside a GPU command recording (the frame-<n>.ndjson
+    /// files `VICTORY_GPU_RECORD=<dir>` writes): per frame a queue timeline,
+    /// command lists as trees of passes, totals; pipelines by draws.
+    GpuView {
+        /// The recording's folder, outside the repository.
+        dir: PathBuf,
+    },
 }
 
 fn main() -> Result<()> {
@@ -137,6 +145,7 @@ fn main() -> Result<()> {
         Cmd::Todo { files, limit, json } => todo::run(&root, files, limit, json),
         Cmd::Agility { from, check } => agility::run(&root, from, check),
         Cmd::Opcodes { from, all, json } => opcodes::run(&root, from, all, json),
+        Cmd::GpuView { dir } => gpu_view::run(&root, &dir),
     }
 }
 

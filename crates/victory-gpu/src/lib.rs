@@ -27,6 +27,7 @@ mod draw;
 pub mod dxgi;
 pub mod fence;
 pub mod frame;
+mod gpu_record;
 #[cfg(windows)]
 mod host;
 #[cfg(windows)]

@@ -403,6 +403,15 @@ pub(crate) fn bound(this: This) {
     }
 }
 
+/// Each stage's container of a title pipeline as `stage hash`, for the GPU
+/// command recorder.
+pub(crate) fn shader_names(this: This) -> Vec<String> {
+    if this.is_null() {
+        return Vec::new();
+    }
+    pipeline(this).shaders.iter().map(|s| format!("{} {}", s.stage, s.hash)).collect()
+}
+
 /// The host pipeline of a title pipeline; `None` if one of its shaders does
 /// not translate, the host refuses it, or it is still being made (its first
 /// use starts that, see [`make`]).
