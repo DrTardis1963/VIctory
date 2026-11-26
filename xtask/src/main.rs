@@ -10,6 +10,7 @@ mod opcodes;
 mod policy;
 mod progress;
 mod todo;
+mod trace;
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -99,6 +100,12 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// Read HLE call traces (`VICTORY_HLE_TRACE`): `summary` (where each
+    /// thread stopped) and `diff` (where two runs part).
+    Trace {
+        #[command(subcommand)]
+        cmd: trace::TraceCmd,
+    },
 }
 
 fn main() -> Result<()> {
@@ -137,6 +144,7 @@ fn main() -> Result<()> {
         Cmd::Todo { files, limit, json } => todo::run(&root, files, limit, json),
         Cmd::Agility { from, check } => agility::run(&root, from, check),
         Cmd::Opcodes { from, all, json } => opcodes::run(&root, from, all, json),
+        Cmd::Trace { cmd } => trace::run(cmd),
     }
 }
 

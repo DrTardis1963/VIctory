@@ -93,6 +93,7 @@ fn bundle_beside_log(report: &str, fault: Option<usize>) -> String {
 fn append_to_log(text: &str) {
     use std::io::Write;
     crate::thunks::save_ledger();
+    crate::trace::flush();
     let Some(file) = LOG.get() else { return };
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

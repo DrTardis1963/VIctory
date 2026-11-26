@@ -38,6 +38,8 @@ mod thunks;
 #[cfg(windows)]
 mod tls;
 #[cfg(windows)]
+mod trace;
+#[cfg(windows)]
 mod windows;
 
 #[cfg(windows)]
