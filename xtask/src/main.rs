@@ -9,6 +9,7 @@ mod json;
 mod opcodes;
 mod policy;
 mod progress;
+mod shadertest;
 mod todo;
 
 use std::path::{Path, PathBuf};
@@ -99,6 +100,13 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// Lower victory-shader's synthetic snapshot shaders and compare their
+    /// `dxc -dumpbin` text with crates/victory-shader/tests/snapshots/.
+    Snapshots {
+        /// Rewrite the snapshots from the current lowering.
+        #[arg(long)]
+        bless: bool,
+    },
 }
 
 fn main() -> Result<()> {
@@ -137,6 +145,7 @@ fn main() -> Result<()> {
         Cmd::Todo { files, limit, json } => todo::run(&root, files, limit, json),
         Cmd::Agility { from, check } => agility::run(&root, from, check),
         Cmd::Opcodes { from, all, json } => opcodes::run(&root, from, all, json),
+        Cmd::Snapshots { bless } => shadertest::snapshots(&root, bless),
     }
 }
 

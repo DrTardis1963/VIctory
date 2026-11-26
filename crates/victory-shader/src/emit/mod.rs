@@ -95,6 +95,10 @@ mod own_bits;
 mod rect;
 mod sampler;
 mod shader;
+#[cfg(all(test, windows))]
+mod snapshot_tests;
+#[cfg(all(test, windows))]
+mod synth;
 mod threading;
 #[cfg(windows)]
 pub mod validator;
