@@ -3,6 +3,10 @@
 //! Every command reads the user's own files and writes only to stdout or to
 //! the user's cache directory (outside the repository).
 
+// Lint debt of the base this branch takes as is (edsuuu/VI-BR-PORT 3fd18be8;
+// warm.rs, the Command enum): allowed here rather than edited in upstream code.
+#![allow(clippy::manual_is_multiple_of, clippy::large_enum_variant)]
+
 mod census;
 mod inspect;
 #[cfg(all(windows, feature = "diagnostics"))]

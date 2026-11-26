@@ -15,6 +15,32 @@
 //! share, [`console`] which console model the title sees. Planned:
 //! `present` (swap chain).
 
+// Lint debt of the base this branch takes as is (edsuuu/VI-BR-PORT 3fd18be8,
+// avatarmanz/VIctory-7900XTX): none of these is in code of ours. Allowed here,
+// in one place, rather than edited across ~20 upstream files that every sync
+// with that base would then conflict on. Remove a line once upstream's code
+// no longer needs it.
+#![allow(
+    dead_code,
+    private_interfaces,
+    unused_assignments,
+    unused_variables,
+    dropping_copy_types,
+    clippy::int_plus_one,
+    clippy::unusual_byte_groupings,
+    clippy::precedence,
+    clippy::needless_borrow,
+    clippy::unnecessary_sort_by,
+    clippy::large_enum_variant,
+    clippy::manual_is_multiple_of,
+    clippy::too_many_arguments,
+    clippy::wrong_self_convention,
+    clippy::unnecessary_cast,
+    clippy::mem_replace_with_default,
+    clippy::if_same_then_else,
+    clippy::cloned_ref_to_slice_refs
+)]
+
 #[cfg(windows)]
 mod ambient;
 #[cfg(all(windows, feature = "diagnostics"))]

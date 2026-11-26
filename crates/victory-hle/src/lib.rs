@@ -11,6 +11,10 @@
 //! Resolution order for every import: an implementation in [`modules`],
 //! then the host if [`HostPolicy`] allows that DLL, then `Missing`.
 
+// Lint debt of the base this branch takes as is (edsuuu/VI-BR-PORT 3fd18be8;
+// modules/dstorage.rs): allowed here rather than edited in upstream code.
+#![allow(clippy::precedence, clippy::manual_is_multiple_of)]
+
 mod host;
 mod image_watch;
 #[cfg(all(windows, feature = "diagnostics"))]
