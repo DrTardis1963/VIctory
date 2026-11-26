@@ -87,6 +87,11 @@ impl Pending {
         &self.key
     }
 
+    /// A compute pipeline: one program, of the compute stage.
+    fn compute(&self) -> bool {
+        matches!(self.shaders.as_slice(), [cs] if cs.stage == "compute")
+    }
+
     fn make(&self) {
         self.made.get_or_init(|| {
             let began = Instant::now();
