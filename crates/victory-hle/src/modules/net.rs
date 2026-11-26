@@ -1200,6 +1200,8 @@ mod tests {
         for e in m.exports.iter().filter(|e| !e.name.starts_with('#')) {
             let dll = if e.name.starts_with("WinHttp") {
                 "winhttp.dll"
+            } else if e.name.starts_with("Icmp") {
+                "iphlpapi.dll"
             } else {
                 "ws2_32.dll"
             };
