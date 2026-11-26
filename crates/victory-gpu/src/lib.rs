@@ -27,6 +27,7 @@ mod draw;
 pub mod dxgi;
 pub mod fence;
 pub mod frame;
+mod gpu_record;
 #[cfg(windows)]
 pub mod frametime;
 #[cfg(windows)]
@@ -53,6 +54,7 @@ mod memory;
 #[cfg(windows)]
 mod shadow;
 pub mod signature;
+pub mod stats;
 mod switch;
 #[cfg(windows)]
 mod texture;

@@ -277,6 +277,81 @@ struct ParsedLog {
     warnings: BTreeMap<String, usize>,
     errors: BTreeMap<String, usize>,
     refused_shaders: Vec<String>,
+    /// The cache lines (`victory_gpu::stats`), each with how many frame
+    /// lines came before it.
+    cache: Vec<(usize, BTreeMap<String, f64>)>,
+}
+
+/// The `key=value` pairs of a `cache: shader_disk_hits=...` line
+/// (`victory_gpu::stats::Snapshot::line`), or `None` for any other line.
+fn parse_cache_line(line: &str) -> Option<BTreeMap<String, f64>> {
+    let at = line.find("cache: shader_disk_hits=")?;
+    let pairs: BTreeMap<String, f64> = line[at + "cache: ".len()..]
+        .split_whitespace()
+        .filter_map(|pair| {
+            let (k, v) = pair.split_once('=')?;
+            Some((k.to_owned(), v.trim_end_matches([',', ';']).parse().ok()?))
+        })
+        .collect();
+    (!pairs.is_empty()).then_some(pairs)
+}
+
+/// The report's `cache` section: the last line's totals, and how much of
+/// them came after the 3D scene began (translations and pipeline compiles
+/// there are frame hitches; during loading they are not).
+fn cache_report(p: &ParsedLog) -> Value {
+    let Some((_, last)) = p.cache.last() else {
+        return json!({ "lines": 0 });
+    };
+    let scene_start = p.frames.iter().position(|f| f.draws > 60);
+    // The last totals before the scene began; none if it began first.
+    let before_scene = scene_start.and_then(|start| {
+        p.cache.iter().rev().find(|(frames, _)| *frames <= start).map(|(_, m)| m)
+    });
+    let get = |m: &BTreeMap<String, f64>, k: &str| m.get(k).copied().unwrap_or(0.0);
+    let timing = |m: &BTreeMap<String, f64>, name: &str, count: &str| {
+        json!({
+            "count": get(m, count) as u64,
+            "total_ms": round1(get(m, &format!("{name}_ms"))),
+            "max_ms": round1(get(m, &format!("{name}_max_ms"))),
+        })
+    };
+    let totals = |m: &BTreeMap<String, f64>| {
+        json!({
+            "shader_disk_hits": get(m, "shader_disk_hits") as u64,
+            "shader_disk_misses": get(m, "shader_disk_misses") as u64,
+            "shader_memory_hits": get(m, "shader_memory_hits") as u64,
+            "shader_memory_misses": get(m, "shader_memory_misses") as u64,
+            "translations": timing(m, "translate", "translations"),
+            "pipelines": {
+                "graphics": timing(m, "graphics", "graphics"),
+                "compute": timing(m, "compute", "compute"),
+                "mesh": timing(m, "mesh", "mesh"),
+            },
+            "pipeline_failures": get(m, "pipeline_failures") as u64,
+            "library_hits": get(m, "library_hits") as u64,
+            "library_misses": get(m, "library_misses") as u64,
+        })
+    };
+    let in_scene = scene_start.map(|_| {
+        let since = |k: &str| {
+            let base = before_scene.map_or(0.0, |m| get(m, k));
+            (get(last, k) - base).max(0.0)
+        };
+        json!({
+            "translations": since("translations") as u64,
+            "translate_ms": round1(since("translate_ms")),
+            "pipelines": (since("graphics") + since("compute") + since("mesh")) as u64,
+            "pipeline_ms": round1(since("graphics_ms") + since("compute_ms") + since("mesh_ms")),
+            "shader_disk_misses": since("shader_disk_misses") as u64,
+            "library_misses": since("library_misses") as u64,
+        })
+    });
+    json!({
+        "lines": p.cache.len(),
+        "totals": totals(last),
+        "during_scene": in_scene.unwrap_or(Value::Null),
+    })
 }
 
 fn analyze_cmd(root: &Path, log: &Path, out: Option<&Path>) -> Result<()> {
@@ -315,6 +390,10 @@ fn parse_log<R: BufRead>(reader: R) -> Result<ParsedLog> {
         }
         if let Some(s) = parse_frame_line(trimmed) {
             parsed.frames.push(s);
+            continue;
+        }
+        if let Some(cache) = parse_cache_line(trimmed) {
+            parsed.cache.push((parsed.frames.len(), cache));
             continue;
         }
         if trimmed.contains("recording per frame") {
@@ -664,6 +743,7 @@ fn build_report(log: &Path, p: &ParsedLog) -> Value {
             "tex_made_null_max": p.tex_made_null_max,
         },
         "dropped_pipeline_reasons_max_per_frame": dropped_reasons,
+        "cache": cache_report(p),
         "warnings_count": p.warnings.len(),
         "errors_count": p.errors.len(),
         "refused_shader_samples": p.refused_shaders.len(),
@@ -754,6 +834,41 @@ fn render_markdown(r: &Value) -> String {
         r["scene_3d"]["max_null_buffer_views"],
         m["private_ram_peak_mb"]
     ));
+
+    let c = &r["cache"]["totals"];
+    if c.is_object() {
+        let t = &c["translations"];
+        s.push_str("## Shader & Pipeline Caches (totals)\n\n");
+        s.push_str(&format!(
+            "- **Shaders**: {} from disk, {} translated ({} in {} ms, longest {} ms); {} shared in memory, {} new\n",
+            c["shader_disk_hits"],
+            c["shader_disk_misses"],
+            t["count"],
+            t["total_ms"],
+            t["max_ms"],
+            c["shader_memory_hits"],
+            c["shader_memory_misses"]
+        ));
+        for kind in ["graphics", "compute", "mesh"] {
+            let p = &c["pipelines"][kind];
+            s.push_str(&format!(
+                "- **{kind} pipelines**: {} in {} ms, longest {} ms\n",
+                p["count"], p["total_ms"], p["max_ms"]
+            ));
+        }
+        s.push_str(&format!(
+            "- **Refused**: {}; **library**: {} loaded, {} missed\n",
+            c["pipeline_failures"], c["library_hits"], c["library_misses"]
+        ));
+        let d = &r["cache"]["during_scene"];
+        if d.is_object() {
+            s.push_str(&format!(
+                "- **During the 3D scene**: {} translations ({} ms), {} pipelines ({} ms)\n",
+                d["translations"], d["translate_ms"], d["pipelines"], d["pipeline_ms"]
+            ));
+        }
+        s.push('\n');
+    }
 
     if let Some(drops) = r["dropped_pipeline_reasons_max_per_frame"].as_object()
         && !drops.is_empty()
@@ -1039,6 +1154,48 @@ mod tests {
         let diags = report["diagnoses"].as_array().unwrap();
         assert!(diags.iter().any(|d| d.as_str().unwrap().contains("VRAM_OVER_BUDGET")));
         assert!(diags.iter().any(|d| d.as_str().unwrap().contains("BVH_BUILDER_OFF")));
+    }
+
+    #[test]
+    fn the_cache_line_lands_in_the_report_with_what_the_scene_added() {
+        let cache = |translations: u32, graphics: u32| {
+            format!(
+                "\x1b[32mINFO\x1b[0m victory_gpu::stats: cache: shader_disk_hits=812 shader_disk_misses={translations} \
+                 shader_memory_hits=1450 shader_memory_misses=815 translations={translations} translate_ms={}.0 \
+                 translate_max_ms=30.2 graphics={graphics} graphics_ms={}.5 graphics_max_ms=80.1 compute=40 \
+                 compute_ms=300.0 compute_max_ms=12.5 mesh=2 mesh_ms=10.0 mesh_max_ms=6.0 pipeline_failures=1 \
+                 library_hits=150 library_misses=12\n",
+                translations * 10,
+                graphics * 20
+            )
+        };
+        let menu = "INFO victory_gpu::host: 60.0 fps, 16.6 ms/frame (1.0 preparing: copies 0.1 ms 0.1 MB, textures 0.1 ms 0.1 MB; 5.0 on the GPU; 0.0 copying back 0.0 MB), 20 draws/frame, dropped 0 without a host pipeline (0 being made) and 0 indirect;\n";
+        let scene = "INFO victory_gpu::host: 20.0 fps, 50.0 ms/frame (1.0 preparing: copies 0.1 ms 0.1 MB, textures 0.1 ms 0.1 MB; 40.0 on the GPU; 0.0 copying back 0.0 MB), 4000 draws/frame, dropped 0 without a host pipeline (0 being made) and 0 indirect;\n";
+        let log = [menu.to_owned(), cache(3, 100), scene.to_owned(), cache(5, 110)].concat();
+        let parsed = parse_log(BufReader::new(log.as_bytes())).unwrap();
+        let report = build_report(Path::new("synthetic.log"), &parsed);
+        let c = &report["cache"];
+        assert_eq!(c["lines"], 2);
+        assert_eq!(c["totals"]["shader_disk_hits"], 812);
+        assert_eq!(c["totals"]["translations"]["count"], 5);
+        assert_eq!(c["totals"]["translations"]["max_ms"], 30.2);
+        assert_eq!(c["totals"]["pipelines"]["graphics"]["count"], 110);
+        assert_eq!(c["totals"]["pipelines"]["graphics"]["total_ms"], 2200.5);
+        assert_eq!(c["totals"]["pipelines"]["mesh"]["max_ms"], 6.0);
+        assert_eq!(c["totals"]["pipeline_failures"], 1);
+        assert_eq!(c["totals"]["library_misses"], 12);
+        assert_eq!(c["during_scene"]["translations"], 2);
+        assert_eq!(c["during_scene"]["translate_ms"], 20.0);
+        assert_eq!(c["during_scene"]["pipelines"], 10);
+        assert!(render_markdown(&report).contains("Shader & Pipeline Caches"));
+        // Not mistaken for a frame line, nor a frame line for it.
+        assert_eq!(report["frame_counts"]["total"], 2);
+    }
+
+    #[test]
+    fn a_log_without_cache_lines_reports_none() {
+        let parsed = parse_log(BufReader::new("nothing here\n".as_bytes())).unwrap();
+        assert_eq!(build_report(Path::new("x.log"), &parsed)["cache"]["lines"], 0);
     }
 
     #[test]

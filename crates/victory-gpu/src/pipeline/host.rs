@@ -598,6 +598,7 @@ impl HostPipeline {
                 ..Default::default()
             };
             let name = super::library::name("compute", &root_blob, &[&code_bytes(&code(0))], "");
+            let began = std::time::Instant::now();
             let made = super::library::pipeline(
                 &name,
                 // SAFETY: the description points at live data.
@@ -605,6 +606,7 @@ impl HostPipeline {
                 // SAFETY: as above.
                 || unsafe { host.device.CreateComputePipelineState(&desc) },
             );
+            crate::stats::pipeline_made(crate::stats::Kind::Compute, began, made.is_ok());
             let pso = match made {
                 Ok(pso) => pso,
                 Err(e) => {
@@ -658,7 +660,10 @@ impl HostPipeline {
                 &[&code_bytes(&code(0)), &code_bytes(&code(1))],
                 &state,
             );
-            let pso = match mesh_pipeline(&host.device, &root, code(0), code(1), g, depth_bounds, &name) {
+            let began = std::time::Instant::now();
+            let made = mesh_pipeline(&host.device, &root, code(0), code(1), g, depth_bounds, &name);
+            crate::stats::pipeline_made(crate::stats::Kind::Mesh, began, made.is_ok());
+            let pso = match made {
                 Ok(pso) => pso,
                 Err(e) => {
                     tracing::warn!(error = %e, ?shaders, "host mesh pipeline refused");
@@ -755,6 +760,7 @@ impl HostPipeline {
                 || unsafe { host.device.CreateGraphicsPipelineState(desc) },
             )
         };
+        let began = std::time::Instant::now();
         let mut made = make(&desc, &name(rect_gs.as_ref()));
         if made.is_err() && rect_gs.is_some() {
             // The host refused the geometry stage: once more without it.
@@ -764,6 +770,7 @@ impl HostPipeline {
             rect_gs = None;
             made = make(&desc, &name(None));
         }
+        crate::stats::pipeline_made(crate::stats::Kind::Graphics, began, made.is_ok());
         let pso = match made {
             Ok(pso) => pso,
             Err(e) => {
