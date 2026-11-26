@@ -829,6 +829,7 @@ impl Shader {
         // stay constant (1); otherwise a read element's mode wins over unread
         // siblings in the same row.
         if self.pixel {
+            isolate_front_face(&mut self.inputs);
             reconcile_row_interp(&mut self.inputs);
         } else if graphics {
             reconcile_row_interp(&mut self.outputs);
@@ -1050,6 +1051,28 @@ impl Shader {
     }
 }
 
+/// Moves a pixel program's `SV_IsFrontFace` that shares its console row with an
+/// interpolated element to a row of its own past the others. The rasterizer
+/// gives it, not the stage before, so its row links to nothing, and the
+/// sibling keeps its own interpolation mode: [`reconcile_row_interp`] would
+/// otherwise make the whole row constant, and a texture coordinate read in it
+/// flat. (`loadInput` addresses an element by its id and its own rows, so the
+/// lowered code is unchanged.)
+fn isolate_front_face(elems: &mut [SigElement]) {
+    for i in 0..elems.len() {
+        let Some(row) = elems[i].row else { continue };
+        let shared = elems
+            .iter()
+            .enumerate()
+            .any(|(j, e)| j != i && e.row == Some(row) && e.interp != 0 && e.interp != 1);
+        if elems[i].kind == 13 && shared {
+            let free = elems.iter().filter_map(|e| e.row).max().map_or(0, |r| r + 1);
+            elems[i].row = Some(free);
+            elems[i].col = 0;
+        }
+    }
+}
+
 /// Ensures elements sharing a signature row declare one DXIL interpolation
 /// mode. Any integer or `SV_IsFrontFace` element forces the row to `constant`
 /// (`1`); otherwise, a used element's mode overrides unread siblings.
@@ -1117,5 +1140,20 @@ mod tests {
         assert_eq!(elems[1].interp, 1);
         assert_eq!(elems[2].interp, 3);
         assert_eq!(elems[3].interp, 3);
+    }
+
+    /// A read texture coordinate the console packs beside `SV_IsFrontFace` keeps its
+    /// interpolation: the face moves to a row of its own.
+    #[test]
+    fn front_face_beside_a_read_texcoord_takes_a_row_of_its_own() {
+        let mut elems = vec![
+            elem("SV_Position", 3, 9, 4, 0, 0, 0xF),
+            elem("TEXCOORD", 0, 9, 2, 9, 0, 1),
+            elem("SV_IsFrontFace", 13, 5, 1, 9, 1, 1),
+        ];
+        isolate_front_face(&mut elems);
+        reconcile_row_interp(&mut elems);
+        assert_eq!((elems[1].row, elems[1].interp), (Some(9), 2));
+        assert_eq!((elems[2].row, elems[2].col, elems[2].interp), (Some(10), 0, 1));
     }
 }
