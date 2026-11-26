@@ -32,6 +32,14 @@ fn fnv(state: &mut [u64; 2], bytes: &[u8]) {
 }
 
 fn main() {
+    // This crate's test executables export the Agility SDK symbols (defined
+    // in `lib.rs`), so on Windows 10 the GPU tests get the SM 6.6 runtime in
+    // `.\D3D12\` beside them, as the executable does (apps/victory/build.rs).
+    if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
+        for arg in ["/INCLUDE:D3D12SDKVersion", "/INCLUDE:D3D12SDKPath", "/EXPORT:D3D12SDKVersion,DATA", "/EXPORT:D3D12SDKPath,DATA"] {
+            println!("cargo:rustc-link-arg={arg}");
+        }
+    }
     let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     println!("cargo:rerun-if-changed=src");
     println!("cargo:rerun-if-changed=Cargo.toml");
