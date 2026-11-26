@@ -58,6 +58,12 @@ All 6 tracked VIctory-family remotes are mirrored as `backup/*` branches on priv
    - `port/avatar-wave32`: avatar PR shader commits for 32-lane hosts (`ad0f9dda`, `25025d2f`, `431cab5d`, `7bf91de4`, `abbbd6b0`, `7348b80a`, `4fd34fdd`, `368293ec`, `2d30943e`). Every program's corpus outcome is identical to `vibr-shaders`.
    - `port/legacy-mad`: fxceless `f6a09d3b`, shader part. `v_mad`/`v_mac_legacy` are now RDNA 2's fused `fma_legacy`.
    - Already in the spine under another form: all-forks `96800256`, `52c9d8c7`, `4a45000f`.
+   - Batch 5 in game:
+     - `port/early-load` is the milestone-1 lead. The yard is almost clean; one blue patch is left in a window shot; the jacket smear is gone. `VICTORY_HEAP_EVERY_LIST=1` is rejected: it brings the defect back and adds glossy specular.
+     - `port/avatar-wave32` is rejected: bands, blocks and a staircase in the yard.
+     - `port/legacy-mad` was not judged: the cache was cold and the world took 10.2 min. It is re-queued.
+     - Port branches now carry the guard-page copy fix `b54939e6` (`port/early-load` `c9ccb03f`, `port/legacy-mad` `f33a9f34`).
+   - Our loader DLL-name PR (`66dc5df7`) is not opened. Upstream PR #2672 (Rickeal-Boss, open, reviewed) does the same with a junction/symlink check added, so ours would duplicate it.
    - Design-level only: VI-BR-PORT `18c01292` (`VICTORY_SEND_OWN`), `2aa8134b` (`VICTORY_LIGHT_REFRESH`), fxceless `d4a528ba` (`VICTORY_HEAP_WORKER`), avatar `06fe22a7`, and upstream PR #2121 (NVIDIA view-heap paging; the cap never overflows in our runs).
 
 ---
