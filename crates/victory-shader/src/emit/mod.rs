@@ -911,7 +911,7 @@ mod tests {
     /// The LLVM text `dxc -dumpbin` prints for a DXIL container, when dxc
     /// is installed.
     #[cfg(windows)]
-    fn dump_dxil(container: &[u8]) -> Option<String> {
+    pub(super) fn dump_dxil(container: &[u8]) -> Option<String> {
         let dxc = match std::env::var_os("VICTORY_PC_DXC") {
             Some(p) => std::path::PathBuf::from(p),
             None => super::validator::Validator::default_path()?.with_file_name("dxc.exe"),
@@ -2581,6 +2581,34 @@ mod barycentric_tests {
         indices.sort();
         assert_eq!(indices, [0, 1], "{inputs:?}");
         validate(&shader);
+    }
+
+    /// A pixel's quad neighbour (a hand-taken derivative, `quad_perm`)
+    /// is read through quad reads, which see helper lanes; wave reads give
+    /// 0 from helpers at a triangle's edge.
+    #[test]
+    fn quad_permutes_in_pixel_shaders_read_helper_lanes() {
+        let [e0, e1] = exp_mrt0(3);
+        let words = [
+            0xC808_0000, // v_interp_p1_f32 v2, v0, attr0.x
+            0xC809_0001, // v_interp_p2_f32 v2, v1, attr0.x
+            0x7E06_02FA, // v_mov_b32 v3, v2 quad_perm:[1,0,3,2] bound_ctrl:1
+            0xFF08_B102,
+            e0,
+            e1,
+            0xBF81_0000,
+        ];
+        let shader = pixel(&words, PERSP_CENTER).unwrap();
+        validate(&shader);
+        #[cfg(windows)]
+        {
+            let Some(text) = super::tests::dump_dxil(&shader.dxil) else {
+                eprintln!("no dxc.exe; DXIL check skipped");
+                return;
+            };
+            assert!(text.contains("dx.op.quadReadLaneAt.i32"), "{text}");
+            assert!(!text.contains("dx.op.waveReadLaneAt"), "{text}");
+        }
     }
 
     /// I and J only fed to `v_interp_*` stay host interpolation: no
