@@ -22,6 +22,22 @@ This file guides Claude Code and other AI coding agents working in this reposito
   - `victory translate --validate [--pipelines] --json <file outside repo>` then `cargo xtask corpus-diff <before.json> <after.json> [--all] [--json] [--strict]` — the shader scoreboard: "fixes N, breaks M", ok programs by stage and failure reasons before → after. Programs match by `#<hash> ~<code> <stage>`, the same on every machine.
   - `cargo xtask bench [--save main] [--against main] [--strict]` — runs the `#[ignore = "benchmark"]` `*_throughput` tests in release (BCPack, texture tile/detile, XMA) and compares with a saved run (`target/xtask-bench/`). Expect ±10-30 % noise while other builds run.
   - `cargo xtask worktrees new <name> | status | land <name>... [--push]` — one worktree per parallel agent (`.worktrees/claude-<name>`, branch `claude/<name>`); `status` shows each one's distance from `unified/main` and last gate (`target/xtask-gate/summary.json`, stamped with the HEAD it checked); `land` merges only branches whose full gate passed on their clean HEAD, gates the result, and with `--push` fast-forwards `unified/main`.
+  - Shader correctness:
+    - `cargo xtask diff-test [--cases N] [--seed S] [--ignored]`: synthetic GFX10 programs run on a reference interpreter (`emit/interp.rs`) and, translated, on the GPU, then compared.
+      - Known miscompiles are `#[ignore]` tests; `--ignored` runs them.
+    - `cargo xtask fuzz [--cases N] [--seed S]`: the decoder on random words, and random programs lowered and validated; prints failing seeds.
+    - `cargo xtask snapshots [--bless]`: `dxc -dumpbin` text of synthetic shaders, compared with `crates/victory-shader/tests/snapshots/`.
+    - Tests can write GFX10 as text with `gfx10::asm::asm("v_add_f32 v0, v1, s2")`, a test-only assembler that reads what `sp3.rs` prints.
+  - Crashes and hangs:
+    - A crash writes `crash-<unix>-<pid>.txt` beside `crashes.log`: the report, the module map, the last HLE calls, and the unimplemented imports.
+    - `victory triage <bundle> [--decompile]` summarises it. `--decompile` needs Ghidra 12.2 with JDK 25 or newer.
+    - `VICTORY_HLE_TRACE=<file outside repo>|ring` traces HLE calls as ndjson; `VICTORY_HLE_TRACE_HOST=1` also traces host waits and events.
+    - `cargo xtask trace summary <file>` shows where each thread stopped; `cargo xtask trace diff <a> <b>` shows where two runs part.
+  - `cargo xtask hle-stub <dll> <fn> [--write]`: scaffolds a stub handler, its export and a test in the module serving the DLL. `xtask todo` prints the command for each ranked import.
+  - `crates/victory-testkit`: builds synthetic PE32+ images (imports, exports, TLS, `.pdata`, relocations) for loader tests.
+  - GPU:
+    - A `cache:` line every 5 s and an exit summary give shader cache hits and misses, translation time, and pipeline creation by kind with total and max ms. `xtask harness analyze` puts these under `"cache"`.
+    - `VICTORY_GPU_RECORD=<dir outside repo>` (with `VICTORY_GPU_RECORD_FRAMES`, `VICTORY_GPU_RECORD_AT`) records the D3D12.X calls of a few world frames; `cargo xtask gpu-view <dir>` writes `view.html`.
   - `crates/victory-formats/tests/round_trip.rs` — random layouts in every swizzle mode tile and detile back exactly (`VICTORY_TILE_CASES`, `VICTORY_TILE_SEED`).
   - Project agents in `.claude/agents/` (`hle-implementer`, `shader-op-implementer`, `policy-reviewer`) and the `victory-run` skill in `.claude/skills/` (how to run the title: screenshots, no auto-close timers, results under `F:\VIctory_Testing\`).
 - **Use the Clean-Room Diagnostic Harness** (`cargo xtask harness --help`):
