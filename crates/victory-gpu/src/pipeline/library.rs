@@ -612,6 +612,37 @@ pub(crate) fn save_due() {
     }
 }
 
+/// A save asked for by a worker while others still wait: at most every
+/// `VICTORY_LIBRARY_BUSY_SAVE_S` seconds (default 300), counted from the first
+/// ask. Each save serialises the whole library under its write lock, which
+/// holds up every store: with a 2.1 GB library on an 8-thread PC, saves every
+/// 20 s wrote ~34 GB in 7 min and the workers made ~3 pipelines a second
+/// while ~3,000 waited and ~1,200 draws a frame were dropped. The workers
+/// running out of work, and the title's end, still save at once.
+pub(crate) fn save_while_busy() {
+    static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+    static EVERY: OnceLock<std::time::Duration> = OnceLock::new();
+    let every = *EVERY.get_or_init(|| {
+        let secs = std::env::var("VICTORY_LIBRARY_BUSY_SAVE_S")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(300);
+        std::time::Duration::from_secs(secs)
+    });
+    {
+        let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+        match *last {
+            Some(t) if t.elapsed() < every => return,
+            None => {
+                *last = Some(std::time::Instant::now());
+                return;
+            }
+            _ => *last = Some(std::time::Instant::now()),
+        }
+    }
+    save(false);
+}
+
 /// Writes the library and the early list if pipelines were added since the
 /// last save and `SAVE_EVERY` has passed (or `now`).
 pub(crate) fn save(now: bool) {
