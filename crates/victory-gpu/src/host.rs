@@ -549,6 +549,16 @@ pub(crate) fn host() -> Option<&'static Host> {
     .as_ref()
 }
 
+/// The host adapter's name and dedicated video memory (bytes), for the
+/// frametime dump's header.
+pub(crate) fn adapter_summary() -> Option<(String, u64)> {
+    let adapter = host()?.adapter.as_ref()?;
+    // SAFETY: a plain query of the adapter the device was made on.
+    let desc = unsafe { adapter.GetDesc1() }.ok()?;
+    let end = desc.Description.iter().position(|&c| c == 0).unwrap_or(desc.Description.len());
+    Some((String::from_utf16_lossy(&desc.Description[..end]), desc.DedicatedVideoMemory as u64))
+}
+
 fn create() -> windows::core::Result<Host> {
     // SAFETY: plain D3D12 object creation with valid descriptions.
     unsafe {
@@ -6789,6 +6799,7 @@ impl Meter {
         tracing::debug!(target: "victory_gpu::frame", token = crate::frame::current(), "present");
         #[cfg(feature = "diagnostics")]
         crate::copystat::presented();
+        crate::frametime::tick();
         self.frames += 1;
         #[cfg(feature = "diagnostics")]
         {
@@ -6827,7 +6838,7 @@ impl Meter {
         late_line(frames);
         card_clock_line(frames, ms);
         crate::shadow::back_line(frames);
-        {
+        let [card_passes, card_compares] = {
             let [passes, pieces, compares] = [0, 1, 2].map(|i| CARD_PASSES[i].swap(0, Ordering::Relaxed) as f64 / frames);
             if passes + compares > 0.0 {
                 tracing::info!(
@@ -6836,8 +6847,9 @@ impl Meter {
                     if rehash_runs() { "on" } else { "off" }
                 );
             }
-        }
-        {
+            [passes, compares]
+        };
+        let texture_refresh_ms = {
             let [own, asking, still, all] =
                 [0, 1, 2, 3].map(|i| crate::texture::REFRESH_WAITS[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames);
             let deferred = crate::texture::DEFERRED.swap(0, Ordering::Relaxed) as f64 / frames;
@@ -6870,7 +6882,8 @@ impl Meter {
                     if crate::watch::by_range() { "the bytes it changes" } else { "all of title memory" }
                 );
             }
-        }
+            all
+        };
         {
             let [copies, joined] = [0, 1].map(|i| COPIES_JOINED[i].swap(0, Ordering::Relaxed) as f64 / frames);
             if copies > 0.0 {
@@ -6901,6 +6914,33 @@ impl Meter {
         let planes = crate::resource::PLANES[0].swap(0, Ordering::Relaxed) as f64 / frames;
         // Copies in the card's memory (`crate::shadow::cards`).
         let card = crate::shadow::card_stats();
+        // `VICTORY_FRAMETIME_DUMP`: one row per summary, with the buckets above.
+        crate::frametime::record(&crate::frametime::Row {
+            frames,
+            fps,
+            ms,
+            cpu_prepare_ms: cpu,
+            gpu_ms: gpu,
+            copies_ms: copy_ms,
+            copies_mb: copy_mb,
+            textures_ms: texture_ms,
+            textures_mb: texture_mb,
+            copyback_ms: back_ms,
+            copyback_mb: back_mb,
+            draws,
+            dropped,
+            making: crate::pipeline::making() as f64,
+            indirect,
+            heap_passes: picked,
+            heap_ms: picked_ms,
+            texture_refresh_ms,
+            card_passes,
+            card_compares,
+            card,
+            twins_into_depth: twin_to_depth,
+            twins_into_colour: twin_to_colour,
+            depth_planes: planes,
+        });
         #[cfg(feature = "diagnostics")]
         let slow = crate::watch::slow_asks();
         // Over the same frames as the counts above.

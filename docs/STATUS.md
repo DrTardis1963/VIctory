@@ -15,6 +15,7 @@
 | Existing local work | `.` (root) | `legal/policy-and-runtime-guards` | The 8 uncommitted files (table-CBV → root-CBV WIP) moved to a stash, superseded by `fix/table-cbv-raw-views` | `SHELVED` | 2026-11-26 |
 | Claude Code | `.worktrees/port-683` | `fix/table-cbv-raw-views` | Fork survey (`docs/fork-survey-2026-11-26.md`); table CBVs read as raw views (idea of upstream `683ad7a9`, spine-native) | `DONE` | 2026-11-26 |
 | Claude Code | `.worktrees/claude-tooling` | `claude/unified-tooling` | Agent tooling on unified: `xtask gate`, unimplemented-import ledger + `xtask todo`, `xtask agility`, asset-policy write hook, `xtask opcodes` | `DONE` | 2026-11-26 |
+| Claude Code | `.worktrees/claude-frametime` | `claude/frametime-dump` | Frametime CSV dump from `skornuta/victory-fork` (`VICTORY_FRAMETIME_DUMP=1` → `<cache>\frametime.csv`, or a path; refused inside the repo). Same columns as the community dumps | `DONE` | 2026-11-26 |
 | Existing local work | `.worktrees/agy` | `fix/loader-tls-redirect-bounds-and-empty-section` | Existing worktree — **DO NOT TOUCH** | `RESERVED` | 2026-11-25 |
 
 ---
