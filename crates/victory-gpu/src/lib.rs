@@ -51,6 +51,7 @@ mod memory;
 #[cfg(windows)]
 mod shadow;
 pub mod signature;
+pub mod stats;
 mod switch;
 #[cfg(windows)]
 mod texture;

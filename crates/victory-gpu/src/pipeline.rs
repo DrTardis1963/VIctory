@@ -101,8 +101,9 @@ pub(crate) fn kept() -> [u64; 7] {
 fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
     let full = blake3::hash(bytes);
     let mut shaders = SHADERS.lock().unwrap_or_else(|e| e.into_inner());
-    shaders
-        .get_or_insert_with(HashMap::new)
+    let table = shaders.get_or_insert_with(HashMap::new);
+    crate::stats::shader_seen(!table.contains_key(full.as_bytes()));
+    table
         .entry(*full.as_bytes())
         .or_insert_with(|| {
             KEPT[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);

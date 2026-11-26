@@ -117,6 +117,7 @@ pub fn run(
     println!("ledger         {}", ledger.display());
     victory_loader::save_unimplemented_to(ledger.clone());
     victory_hle::runtime::use_console_timers();
+    victory_gpu::stats::report_at_exit();
     #[cfg(feature = "diagnostics")]
     diagnostics(&image, &cfg);
     let late = LateDlls {
