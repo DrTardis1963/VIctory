@@ -248,7 +248,9 @@ fn reap(objects: Vec<Retired>) {
         more: std::sync::Condvar,
     }
     static REAPER: OnceLock<Option<&'static Reaper>> = OnceLock::new();
-    if objects.is_empty() {
+    // `VICTORY_REAPER=0`: dropped where they are let go, as before.
+    static ON: OnceLock<bool> = OnceLock::new();
+    if objects.is_empty() || !*ON.get_or_init(|| std::env::var_os("VICTORY_REAPER").is_none_or(|v| v != "0")) {
         return;
     }
     let reaper = REAPER.get_or_init(|| {
