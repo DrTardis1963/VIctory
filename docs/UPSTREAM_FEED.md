@@ -37,6 +37,15 @@ All 6 tracked VIctory-family remotes are mirrored as `backup/*` branches on priv
 5. **[DONE 2026-11-26] Table constant buffers as raw views** (`fix/table-cbv-raw-views`): the idea of upstream `683ad7a9` ("table constants read in place"), ported spine-native because `683ad7a9` rests on upstream `c75fdba3` (heap constants as raw views + change journal), which the spine does not have. Fresh table slots hold a raw view of the shadow copy (16-byte alignment) instead of a per-draw upload copy for buffers off 256 bytes.
 6. **[2026-11-26 all-forks scan]** 1,122 GitHub forks compared with upstream `main`: 79 with own commits, 34 with 10+. Ranked findings (PainDe0Mie staging slabs/reaper, hyphen `f85101b6`/`a2537066`/`0b0074e0`, Belobug guard-hole cache, Machad3x NVIDIA fixes, bodnjenie14 LDS lead for `#f133e35efed2a48a`) in `docs/fork-survey-2026-11-26.md`.
 
+7. **[2026-11-26 community pass 1]** Ported onto topic branches off `synthesis/unified` `97b90e61`, pushed to `fork`, queued for in-game A/B (`F:\VIctory_Testing\loop\requests.jsonl`), not merged:
+   - `port/quad-reads-helper-lanes`: vitoriabr/beloooo `2b3c339e` (a pixel's quad read through quad reads, helper lanes included) + a test.
+   - `port/staging-pool-slabs`: PainDe0Mie `66ad6e85` (staging pool only), `ec77dc0b` (64 MB upload slabs), `d76c6dd5` (reaper thread); `VICTORY_STAGING_POOL=0` / `VICTORY_REAPER=0` restore the old path.
+   - `port/no-self-copy`: fxceless `a2537066`, self-copy part only (a copy between two title textures sharing one host texture is left out).
+   - Already in the spine: all-forks `faca57e`, `7291337`, `b3400bb`; Belobug `2b6adbb7` (as `watch::Guards.absent`).
+   - Deferred: all-forks `7cdc3ef`/`a1ce5315`/`a498c0cf` (need the heap pass of `claude/heap-pass-copyback`); bodnjenie14 `52e65197` (no measured case); hyphen `f85101b6` async submit (size); ScarlettPort `precompiled.rs` (Series S parked).
+   - Next lead: upstream `main`'s texture residency series since `940d32f` (`fdf34ab7`, `8a3d9759`, `52d14b10`, `4959d349`, `69d1e8e7`, `cc5f9612`).
+   - Digests: `F:\VIctory_Testing\community\digest-*.md`; state: `F:\VIctory_Testing\community\state.json`.
+
 ---
 
 ## 3. External Radar (To Monitor Before Implementing New Fixes)
