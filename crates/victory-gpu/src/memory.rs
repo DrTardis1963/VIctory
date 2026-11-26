@@ -500,7 +500,7 @@ mod tests {
         let host_heap = heap(h).host().expect("host view heap");
         let key = std::ptr::from_ref(host_heap) as usize;
 
-        assert!(ready(&list, host_heap, &[], &[], false).is_some());
+        assert!(ready(&list, host_heap, &[], &[], &[], false).is_some());
         {
             let guard = MEMORY.lock().unwrap();
             assert!(guard.as_ref().unwrap().heaps.contains_key(&key));
