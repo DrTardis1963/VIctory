@@ -24,7 +24,8 @@ cabelo e luz bem melhores. Por cima dela vieram os ajustes para NVIDIA de 8 GB.
 | Imagem, perfil Series X | rostos e pele com textura, luz coerente nas cutscenes |
 | fps, perfil Series X, release | ~5,6 (a placa sozinha leva ~105 ms por quadro) |
 | Memória da placa, Series X | no limite; na prisão passa do orçamento e a textura borra |
-| Perfil Series S, release | imagem certa (composição de planos), placa em 5,3 de 6,9 GB, ~10,9 fps (10% piores: 8,6) |
+| Perfil Series S, release, cutscene de abertura | imagem certa, placa em 5,3 de 6,9 GB, ~10–11 fps (10% piores: ~9) |
+| Perfil Series S, release, prisão (jogável, ~430 s depois do início) | ~13 fps; a imagem está posterizada (poucas faixas de cor) |
 
 **Ainda não está jogável.** O alvo é ter 15 fps ou mais, com imagem nítida, nas cutscenes e na prisão. Use o perfil Series S.
 
@@ -41,7 +42,11 @@ cabelo e luz bem melhores. Por cima dela vieram os ajustes para NVIDIA de 8 GB.
   faz os rostos da cutscene, e o rosto saía preto.
 - **Listas de memória alterada compactadas em vez de apagadas** quando enchem: apagar
   deixava texturas com bytes velhos depois de a memória mudar.
-- **Composição de planos do present** (Series S: o mundo e a interface em planos separados).
+- **Composição de planos do present** (Series S: o mundo e a interface em planos separados),
+  enviada à frente como o present de um plano só, sem esperar a placa.
+- **Textura nova só aparece depois do upload** (`VICTORY_SHOW_AFTER`, agora ligado; `0`
+  desliga): um pedaço reaproveitado do pool mostrava bytes velhos, e o banco do carro
+  da abertura virava um quadriculado verde e azul.
 - **Patches do título também no release** (`VICTORY_UPSCALER=6`: o upscaler do próprio
   jogo no Series S, já que os passes do FidelityFX não têm DXIL aqui).
 - **Pipelines**: pilha de 64 MB para o compilador do driver da NVIDIA, compute começando
