@@ -64,6 +64,9 @@ pub(crate) struct Shader {
     /// Its part in the stand-in for the indirect light.
     #[cfg(windows)]
     pub(crate) ambient: Option<crate::ambient::Role>,
+    /// A pixel program of the title's decoration bake ([`bakes`]).
+    #[cfg(windows)]
+    pub(crate) bakes: bool,
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
 }
@@ -116,6 +119,8 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                 container: bytes.to_vec(),
                 #[cfg(windows)]
                 ambient: (stage == "compute").then(|| crate::ambient::role(bytes)).flatten(),
+                #[cfg(windows)]
+                bakes: bakes(bytes),
                 #[cfg(windows)]
                 translated: OnceLock::new(),
             })
@@ -906,4 +911,25 @@ mod tests {
             );
         }
     }
+}
+
+/// Whether a container is a pixel program of the title's decoration bake,
+/// by its name inside (`PS_DecorationBlend_*`, `PS_BakeDecorations_*`: 51
+/// of them). A list of four hashes ([`crate::draw`]'s) missed the one the
+/// cutscene's faces are baked with (`PS_DecorationBlend_0011`,
+/// fcee612943c008e0): its sources were not on the card and the face came
+/// out black.
+#[cfg(windows)]
+fn bakes(bytes: &[u8]) -> bool {
+    [&b"PS_DecorationBlend_"[..], b"PS_BakeDecorations_"]
+        .iter()
+        .any(|name| bytes.windows(name.len()).any(|w| w == *name))
+}
+
+#[cfg(all(test, windows))]
+#[test]
+fn bake_programs_are_known_by_name() {
+    assert!(bakes(b"..\0PS_DecorationBlend_0011_ff00f5de_Wrapped\0.."));
+    assert!(bakes(b"PS_BakeDecorations_0100_583f45fe_Wrapped"));
+    assert!(!bakes(b"PS_PedSkin_0001"));
 }
