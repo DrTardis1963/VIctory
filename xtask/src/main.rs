@@ -3,6 +3,7 @@
 mod agility;
 mod bench;
 mod corpus;
+mod difftest;
 mod gate;
 mod gpu_view;
 mod harness;
@@ -183,6 +184,19 @@ enum Cmd {
         #[arg(long, default_value = "0")]
         returns: String,
     },
+    /// Run synthetic GFX10 programs on a reference interpreter and, translated,
+    /// on the GPU, and compare the outputs: the corpus, then random programs.
+    DiffTest {
+        /// Random straight-line programs to run after the corpus.
+        #[arg(long, default_value_t = 200)]
+        cases: u64,
+        /// The first random program's seed (each next one adds 1).
+        #[arg(long, default_value_t = 1)]
+        seed: u64,
+        /// Also run the known miscompiles (tests marked #[ignore]).
+        #[arg(long)]
+        ignored: bool,
+    },
 }
 
 fn main() -> Result<()> {
@@ -266,6 +280,11 @@ fn main() -> Result<()> {
                 returns,
             },
         ),
+        Cmd::DiffTest {
+            cases,
+            seed,
+            ignored,
+        } => difftest::run(&root, cases, seed, ignored),
     }
 }
 
