@@ -45,6 +45,10 @@ All 6 tracked VIctory-family remotes are mirrored as `backup/*` branches on priv
    - Deferred: all-forks `7cdc3ef`/`a1ce5315`/`a498c0cf` (need the heap pass of `claude/heap-pass-copyback`); bodnjenie14 `52e65197` (no measured case); hyphen `f85101b6` async submit (size); ScarlettPort `precompiled.rs` (Series S parked).
    - Next lead: upstream `main`'s texture residency series since `940d32f` (`fdf34ab7`, `8a3d9759`, `52d14b10`, `4959d349`, `69d1e8e7`, `cc5f9612`).
    - Digests: `F:\VIctory_Testing\community\digest-*.md`; state: `F:\VIctory_Testing\community\state.json`.
+8. **[2026-11-26 shader-complete survey]** (`F:\VIctory_Testing\community\shader-complete-survey.md`). A 3070 run drops 9 console wave64 compute programs; the corpus baseline's 399 compute `E_INVALIDARG` come from translating without `--host-lanes 32-32` (`WaveSize(64)`). `upstream-vi-br-port` (our base, `7a30f506`) claims 25,758 of 25,758 on a 32-lane card, and its commits name our exact refusals. Ported, not merged:
+   - `port/vibr-shaders`: edsuuu `0615710b`, `f237fecc`, `dc75ed82`, `592a5796` + `a75eb970` (dispatch by thread count), `8a1b59cf`, `256af633`, `96981b74`, `6e9de756`, `40d2b1b0`, `783a54ca`, `8b349eee` (`dcfae27a` skipped: duplicate of `0615710b`; `7bcc909c` = `port/quad-reads-helper-lanes`).
+   - `port/vibr-lighting`: edsuuu `8b4c86c6`, `561b6fe9`, `1209a642` (after Belobug): constant indirect diffuse while rays are off, reflections held to ambient (`VICTORY_AMBIENT=off` for A/B).
+   - Deferred: fxceless/Pilote `26600c61` (paired form + mesh linking; 4,562 lines duplicating the spine's ROV, f64 and descriptor-as-data code), PiloteCode `1f0773bd` (195 voxel GS), `5177d899` (71 mesh > 32 KiB), KomanderDG88 `f3d0483c` (FidelityFX), and the rest of `upstream-vi-br-port` since `7a30f506` (GPU perf, present composition, bakes).
 
 ---
 
