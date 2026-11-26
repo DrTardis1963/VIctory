@@ -166,7 +166,11 @@ def destinations(command, cwd, powershell):
 
 def segment_writes(seg, cwd):
     """The writes one simple command makes, and the directory after it."""
-    here = lambda p: os.path.normpath(os.path.join(cwd, os.path.expanduser(p)))
+    # A trailing slash says "into this directory" even when the directory
+    # does not exist (yet, or in a worktree that builds elsewhere): keep it.
+    here = lambda p: os.path.normpath(os.path.join(cwd, os.path.expanduser(p))) + (
+        os.sep if p.endswith(("/", "\\")) else ""
+    )
     out, plain, i = [], [], 0
     # The command's name: the first word that is not an assignment.
     cmd = next(
