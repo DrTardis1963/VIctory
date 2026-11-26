@@ -35,6 +35,13 @@ impl Table {
         let row = *self.rows.get(usize::from(opcode))?;
         self.entries.get(usize::from(row)).map(|&(_, name)| name)
     }
+
+    /// The opcode named `name`, for the test assembler (`asm.rs`). A scan
+    /// is fine: tables hold at most a few hundred names.
+    #[cfg(test)]
+    pub(super) fn opcode(&self, name: &str) -> Option<u16> {
+        self.entries.iter().find(|e| e.1 == name).map(|e| e.0)
+    }
 }
 
 // One byte per possible opcode avoids repeated searches while keeping
