@@ -50,6 +50,8 @@ All 6 tracked VIctory-family remotes are mirrored as `backup/*` branches on priv
    - `port/vibr-lighting`: edsuuu `8b4c86c6`, `561b6fe9`, `1209a642` (after Belobug): constant indirect diffuse while rays are off, reflections held to ambient (`VICTORY_AMBIENT=off` for A/B).
    - Deferred: fxceless/Pilote `26600c61` (paired form + mesh linking; 4,562 lines duplicating the spine's ROV, f64 and descriptor-as-data code), PiloteCode `1f0773bd` (195 voxel GS), `5177d899` (71 mesh > 32 KiB), KomanderDG88 `f3d0483c` (FidelityFX), and the rest of `upstream-vi-br-port` since `7a30f506` (GPU perf, present composition, bakes).
 
+7. **[2026-11-26 pass 2] Community base moved.** `avatarmanz/VIctory-7900XTX` ("avatar", remote `upstream-avatar`, 433 commits past upstream `ffe310eb`) is the new base of VI-BR-PORT's `vibr/1126` (Series X ~5.6 fps, Series S prison ~13 fps on a 4060 Ti 8 GB) and of Fayberr/Victory-United (5.0 -> 9.3 fps in the room). Its ray-tracing builder bring-up (VI-BR-PORT `b558934d` and the commits around it) needs upstream's title-memory-by-address model (`0f637570`, `6d021fe3`), which our spine lacks. Ported: `port/vibr-builder` (`0b5f191b` pipeline sync barrier, `30f46c92` builder fences) and `port/rt-skin-skip` (`ab4571df`, `1556de82`). Duplicates or avatar-only, not ported: `689be4d2`, `a46bbdc6`, `44ead3c5`, avatar `4cd2d133`, fxceless `619b2dc5`, `025b042a`. Batch 1 in game: load failures were cold shader caches; `pd-switches` was the default config.
+
 ---
 
 ## 3. External Radar (To Monitor Before Implementing New Fixes)
