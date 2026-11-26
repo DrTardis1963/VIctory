@@ -22,10 +22,12 @@ pub fn run(
     let original = std::fs::read(exe).with_context(|| format!("reading {}", exe.display()))?;
     let prepared = victory_loader::prepare(&original)?;
     let hash = prepared.original_hash.to_hex();
-    match victory_game::identify(&hash) {
-        Some(build) => println!("build          {} ({hash})", build.label),
-        None => println!("build          unknown ({hash})"),
-    }
+    let label = match victory_game::identify(&hash) {
+        Some(build) => format!("{} ({hash})", build.label),
+        None => format!("unknown ({hash})"),
+    };
+    println!("build          {label}");
+    frametime_dump(&cfg, label)?;
 
     let images = cfg.cache_subdir("images")?;
     victory_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
@@ -346,6 +348,30 @@ mod tests {
         other.join().unwrap();
         assert_eq!(*order.lock().unwrap(), [1, 2]);
     }
+}
+
+/// `VICTORY_FRAMETIME_DUMP`: `1` writes a frametime CSV to
+/// `<cache>\frametime.csv`, any other value is the file to write. A path
+/// inside the repository is refused (the asset policy).
+#[cfg(windows)]
+fn frametime_dump(cfg: &victory_core::Config, label: String) -> Result<()> {
+    let Some(value) = std::env::var_os("VICTORY_FRAMETIME_DUMP").filter(|v| !v.is_empty()) else {
+        return Ok(());
+    };
+    let path = if value == "1" {
+        cfg.cache_dir.join("frametime.csv")
+    } else {
+        std::path::PathBuf::from(value)
+    };
+    victory_core::ensure_outside_repo(&path)
+        .with_context(|| format!("VICTORY_FRAMETIME_DUMP={}", path.display()))?;
+    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+        std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    }
+    println!("frametime dump {}", path.display());
+    victory_gpu::frametime::set_build_label(label);
+    victory_gpu::frametime::set_path(path);
+    Ok(())
 }
 
 #[cfg(not(windows))]
