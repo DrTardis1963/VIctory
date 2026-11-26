@@ -1,115 +1,75 @@
-# VIctory on an RX 7900 XTX
+# VI-BR-PORT: a versão para placas de 8 GB
 
-A fork of [VIctory](https://github.com/Marvisak/VIctory), a compatibility layer
-that runs an Xbox Series title natively on Windows from files the user supplies.
-This one is about **speed on AMD RDNA 3**: the world at 30 frames a second on
-one PC, without giving up the picture. It is not there yet.
+Camada de compatibilidade que roda no Windows, de forma nativa, a versão de
+**Xbox Series X|S** (plataforma *Scarlett*, jogos feitos com o **GDK**) de um
+título, a partir dos arquivos do próprio usuário. O código x86-64 do console
+roda sem alteração dentro do nosso processo; por baixo dele ficam as bibliotecas
+do sistema do console reescritas (HLE) e um back-end Direct3D 12 que recompila
+os shaders da GPU do console (GFX10/RDNA2) para DXIL.
 
-**This repository contains no game files, code or assets.** You need your own
-copy of the game. It is not affiliated with or endorsed by the game's developer
-or publisher.
+Este fork tem um alvo só: **placa NVIDIA de 8 GB com ondas de 32 lanes**
+(testado numa RTX 4060 Ti) ligada a um **monitor 1080p**.
 
-## Where it stands (2026-11-25)
+**Este repositório não contém arquivos, código ou recursos do jogo.** É preciso
+ter a sua própria cópia. Nada aqui tem ligação com o desenvolvedor ou a
+editora do jogo, nem é aprovado por eles.
 
-Tested on one machine only: Windows 11, Intel i9-12900K, 64 GB RAM, Radeon
-RX 7900 XTX, 1440p, the Series X profile.
+Origem: [VIctory](https://github.com/Marvisak/VIctory) →
+[fxceless/victory-fork](https://github.com/fxceless/victory-fork) →
+[avatarmanz/VIctory-7900XTX](https://github.com/avatarmanz/VIctory-7900XTX) → este fork.
+O README da árvore do avatarmanz está em [docs/README-avatarmanz.md](docs/README-avatarmanz.md)
+e o do fxceless em [docs/README-fxceless.md](docs/README-fxceless.md).
 
-| | |
+## Onde está (2026-11-25)
+
+A base passou a ser a árvore do avatarmanz: na mesma placa de 8 GB ela mostra
+rostos, pele, cabelo e luz bem melhores que a nossa base anterior. Por cima dela
+vieram os nossos ajustes para NVIDIA de 8 GB.
+
+| | Medido (RTX 4060 Ti 8 GB, i7-13700K, 1080p) |
 |---|---|
-| Menus, videos, loading screens | 30 fps |
-| Prologue, indoors | 50-75 ms a frame (13-20 fps) |
-| First mission with the boat | 46-53 ms (19-22 fps) |
-| Street chase with many cars and people | 100-165 ms (6-10 fps), single frames far longer |
-| Outdoors on foot, the camp | 60-90 ms |
-| Flying | 42-57 ms |
-| Longest session so far | 41 minutes, no crash |
-| Memory | 40-46 GB of private memory: **64 GB of RAM recommended** |
+| Imagem, perfil Series X | rostos e pele com textura, luz coerente nas cutscenes |
+| fps, perfil Series X, release | ~5,6 (a placa sozinha leva ~105 ms por quadro) |
+| Memória da placa, Series X | no limite; na prisão passa do orçamento e a textura borra |
+| Perfil Series S | composição de planos portada, em teste |
+| Termos e telas iniciais | passam sozinhos (`scripts` do usuário) |
 
-It started at 280 ms a frame in the same scenes two days earlier.
+**Não é jogável ainda.** O alvo é 15 fps ou mais nas cutscenes e na prisão, nítido.
 
-What is known to be wrong:
+## O que este fork acrescenta à base
 
-- Trees, plants and far buildings flicker outdoors in some places.
-- Rooms with little direct light are too dark without `-RayTracing`.
-- Textures of what just came into view appear late while the title streams.
-- The first run with a new driver or a new build stutters while the driver makes
-  pipelines (`victory warm` makes them ahead).
-- Recording a frame in the world makes the title's own watchdog end it.
+- **`VICTORY_RT_MISS=1`**: o teste de raio não acerta nada; sem a estrutura de ray
+  tracing montada, as sombras de luzes locais saíam de lixo (rosto preto ou com "purpurina").
+- **Assado de decoração do rosto reconhecido pelo nome** (`PS_DecorationBlend_*`,
+  `PS_BakeDecorations_*`, 51 programas): a lista de 4 hashes deixava de fora o que
+  faz os rostos da cutscene, e o rosto saía preto.
+- **Listas de memória alterada compactadas em vez de apagadas** quando enchem: apagar
+  deixava texturas com bytes velhos (o vídeo da intro "voltava quadros").
+- **Composição de planos do present** (Series S: o mundo e a interface em planos separados).
+- **Patches do título também no release** (`VICTORY_UPSCALER=6`: o upscaler do próprio
+  jogo no Series S, já que os passes do FidelityFX não têm DXIL aqui).
+- **Pipelines**: pilha de 64 MB para o compilador do driver da NVIDIA, compute começando
+  na criação, espera de 500 ms só nos 60 primeiros quadros (8 ms depois) e uma pipeline
+  atrasada segurando só o primeiro quadro que a pede.
+- **wave64 em placas de 32 lanes**: programas que pediriam ondas de 64 lanes usam a forma larga.
+- **DirectStorage** grava em páginas somente leitura como o motor do console.
+- `VICTORY_NO_WATCHDOG`, `VICTORY_NULL_MAGENTA` (diagnóstico) e o teto de 262.144
+  faixas remapeadas.
 
-## How to run it
-
-You need Windows 10/11 x64, a CPU with AVX2, a Direct3D 12 GPU with shader
-model 6.6 and mesh shaders, Rust (the toolchain is pinned), the MSVC build
-tools, and your own dump of the title.
-
-```powershell
-git clone https://github.com/avatarmanz/VIctory-7900XTX
-cd VIctory-7900XTX
-copy victory.example.toml victory.toml      # then set your paths, outside this folder
-cargo build --locked --profile diag -p victory --features diagnostics
-scripts\play.ps1 -Exe <path of your copy's executable>
-```
-
-`scripts\play.ps1 -Safe` leaves out the newest, faster ways; try it first when
-something is wrong. `-RayTracing` turns the title's ray-traced indirect light on.
-
-Before the first run, ahead of time (both can be stopped and go on later):
+## Como rodar
 
 ```powershell
-target\diag\victory.exe shaders <the shader archives>   # every shader translated, minutes
-target\diag\victory.exe warm --used                     # pipelines earlier runs drew with, for a new driver or build
+copy victory.example.toml victory.toml      # e aponte game_dir para a sua cópia
+cargo build --locked --release -p victory
+target\release\victory.exe shaders <os arquivos de shaders do jogo>
+target\release\victory.exe run <o executável do jogo> --console series-x --execute
 ```
 
-Commands, debugging switches and upstream's own description:
-[docs/README-fxceless.md](docs/README-fxceless.md). Every `VICTORY_...` switch is
-described in a comment where it is read.
+Configuração usada nas medições acima: `VICTORY_RT_MISS=1`, `VICTORY_RELAY=1`,
+`VICTORY_THIN=0`, `VICTORY_DISPLAY_MODE=1920x1080`, `VICTORY_PIPELINE_BOOK=1`,
+`VICTORY_MEMORY_CARD_MB=1024`, `VICTORY_TEXTURE_ROOM_PERCENT=85`. Não ligue
+`VICTORY_THIN=1` numa NVIDIA (o fps cai a menos da metade).
 
-## What is different here
+## Licença
 
-In short; the reasons and the measurements are in [docs/findings.md](docs/findings.md).
-
-- **List calls are written down, not carried out, on the title's threads**
-  (`VICTORY_THIN`): eight threads of ours translate them.
-- **Submissions are prepared by a thread of ours and joined**
-  (`VICTORY_ASYNC_SUBMIT`, `VICTORY_JOIN_PARTS`), with what can be spread over
-  threads spread: refreshes, compares (AVX2), descriptor records, landings.
-- **What shaders wrote comes back beside the write guards**, by the dwords that
-  changed, on a thread of its own (`VICTORY_RELAY`, `VICTORY_LAND`).
-- **Buffer fills that need bytes still on the card are done on the card**
-  (`VICTORY_CARD_STEPS`) instead of waiting for it.
-- **The title's writes are caught more cheaply**: one view opened at a fault,
-  blocks that rest, places in the title's code that look before they write.
-- **Textures go up on a copy queue of their own** and a slot shows one only after
-  its upload ran, which also ended a device loss that came every 15 minutes or so.
-- **Boats float**: textures that shaders write and the title's CPU reads go back
-  to title memory (from fxceless and Geckomacabre, on by default here).
-- **Frame record and replay** with per-pass times and shader variants compared
-  turn by turn ([docs/replay.md](docs/replay.md)).
-
-## Credits
-
-This is a tree of other people's work with more on top. The history is kept, and
-commits taken from elsewhere name the commit and its author.
-
-- **[VIctory](https://github.com/Marvisak/VIctory)** by Marvisak and its
-  contributors: the loader, the runtime services, the Direct3D 12 back end and
-  the shader recompiler.
-- **[fxceless/victory-fork](https://github.com/fxceless/victory-fork)**: the fork
-  this one started from, and the people whose pull requests it carries.
-- **[DexNom/VIctory](https://github.com/DexNom/VIctory)**: ray tracing fixes,
-  cube gradients, sparse textures.
-- **[Belobug/VIctory-Belobug-AMD](https://github.com/Belobug/VIctory-Belobug-AMD)**:
-  the ambient light idea, pipeline workers, and work by romainhedouin.
-- **[FQY55kai/ZJOU-VICTORY](https://github.com/FQY55kai/ZJOU-VICTORY)**.
-- **[myokex/victory-amd](https://github.com/myokex/victory-amd)**: the guard over
-  every view of a page (with Spexivus, joroyt and tightfall), and Joshua Odom's
-  reads into title memory.
-- **Geckomacabre** and **cxy0072019-sketch**: the texture read-back.
-- **[XCL](https://github.com/ivall/xcl)** (GPL-2.0-only) was read for how the same
-  title behaves under another layer; no code of it is here.
-- This fork's changes were made with [Claude Code](https://claude.com/claude-code).
-
-## License
-
-GPL-3.0-or-later, as VIctory. See [LICENSE](LICENSE); the one file that is not
-covered is named in [docs/asset-policy.md](docs/asset-policy.md).
+GPL-3.0-or-later, como o VIctory. Ver [LICENSE](LICENSE).
