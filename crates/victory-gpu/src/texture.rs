@@ -305,6 +305,10 @@ fn capacity(size: u64) -> u64 {
 /// frame instead of zeros.
 fn take_buffer(host: &crate::host::Host, size: u64) -> Option<(ID3D12Resource, *mut u8, u64)> {
     use std::sync::atomic::Ordering::Relaxed;
+    if !pooled() {
+        let (buffer, data) = host.upload_buffer(size)?;
+        return Some((buffer, data, size));
+    }
     let capacity = capacity(size);
     let pooled = POOL
         .lock()
@@ -371,7 +375,7 @@ pub(crate) fn slabs() -> (u64, u64) {
 /// [`SLAB_PART`], or when no slab can be made.
 fn take_range(host: &crate::host::Host, size: u64) -> Option<(usize, ID3D12Resource, *mut u8, u64, u64)> {
     use std::sync::atomic::Ordering::Relaxed;
-    if size > SLAB_PART {
+    if size > SLAB_PART || !pooled() {
         return None;
     }
     let len = size.max(1).div_ceil(SLAB_GRAIN) * SLAB_GRAIN;
@@ -380,13 +384,7 @@ fn take_range(host: &crate::host::Host, size: u64) -> Option<(usize, ID3D12Resou
     // slabs empty; the first slab that fits keeps the search short.
     for (n, slot) in slabs.iter_mut().enumerate() {
         let Some(slab) = slot.as_mut() else { continue };
-        if let Some(i) = slab.free.iter().position(|&(_, l)| l >= len) {
-            let (at, l) = slab.free[i];
-            if l == len {
-                slab.free.remove(i);
-            } else {
-                slab.free[i] = (at + len, l - len);
-            }
+        if let Some(at) = carve(&mut slab.free, len) {
             slab.taken += len;
             POOL_STATS[3].fetch_add(1, Relaxed);
             return Some((n, slab.buffer.clone(), slab.data, at, len));
@@ -416,6 +414,80 @@ fn take_range(host: &crate::host::Host, size: u64) -> Option<(usize, ID3D12Resou
     Some((n, buffer, data, 0, len))
 }
 
+/// The offset of `len` bytes taken from the first free range (by offset,
+/// none touching another) that holds them.
+fn carve(free: &mut Vec<(u64, u64)>, len: u64) -> Option<u64> {
+    let i = free.iter().position(|&(_, l)| l >= len)?;
+    let (at, l) = free[i];
+    if l == len {
+        free.remove(i);
+    } else {
+        free[i] = (at + len, l - len);
+    }
+    Some(at)
+}
+
+/// Puts `[at, at + len)` back among the free ranges, joined with the
+/// ranges it touches.
+fn give_back(free: &mut Vec<(u64, u64)>, at: u64, len: u64) {
+    let i = free.partition_point(|&(o, _)| o < at);
+    free.insert(i, (at, len));
+    if i + 1 < free.len() && free[i].0 + free[i].1 == free[i + 1].0 {
+        free[i].1 += free[i + 1].1;
+        free.remove(i + 1);
+    }
+    if i > 0 && free[i - 1].0 + free[i - 1].1 == free[i].0 {
+        free[i - 1].1 += free[i].1;
+        free.remove(i);
+    }
+}
+
+/// Whether texture staging buffers are pooled and carved from slabs
+/// (on by default; `VICTORY_STAGING_POOL=0` makes and lets go of one
+/// upload buffer per staged texture, as before).
+fn pooled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_STAGING_POOL").is_none_or(|v| v != "0"))
+}
+
+#[cfg(test)]
+mod slab_tests {
+    use super::{capacity, carve, give_back};
+
+    #[test]
+    fn capacities_round_up_to_an_eighth_of_their_power_of_two() {
+        assert_eq!(capacity(1), 64 << 10);
+        assert_eq!(capacity((1 << 20) + 1), (1 << 20) + (256 << 10));
+        assert_eq!(capacity(16 << 20), 16 << 20);
+        for size in [1u64, 4095, 65_537, 3 << 20, (5 << 20) + 7, 100 << 20] {
+            let c = capacity(size);
+            assert!(c >= size && c - size <= size.next_power_of_two() / 8 + (64 << 10), "{size} -> {c}");
+        }
+    }
+
+    #[test]
+    fn ranges_given_back_join_their_neighbours() {
+        let mut free = vec![(0, 64)];
+        let a = carve(&mut free, 16).unwrap();
+        let b = carve(&mut free, 16).unwrap();
+        let c = carve(&mut free, 16).unwrap();
+        assert_eq!((a, b, c), (0, 16, 32));
+        assert_eq!(free, [(48, 16)]);
+        assert_eq!(carve(&mut free, 32), None);
+        give_back(&mut free, b, 16);
+        assert_eq!(free, [(16, 16), (48, 16)]);
+        // First fit: the hole left by `b`.
+        assert_eq!(carve(&mut free, 8), Some(16));
+        give_back(&mut free, 16, 8);
+        give_back(&mut free, c, 16);
+        assert_eq!(free, [(16, 48)]);
+        give_back(&mut free, a, 16);
+        assert_eq!(free, [(0, 64)]);
+        assert_eq!(carve(&mut free, 64), Some(0));
+        assert!(free.is_empty());
+    }
+}
+
 /// Gives a range back to its slab (no list reads it any more); lets go of
 /// the slab once empty if [`SLAB_SPARE`] others are.
 fn give_range(n: usize, at: u64, len: u64) {
@@ -423,17 +495,7 @@ fn give_range(n: usize, at: u64, len: u64) {
     let Some(slab) = slabs.get_mut(n).and_then(Option::as_mut) else {
         return;
     };
-    let i = slab.free.partition_point(|&(o, _)| o < at);
-    slab.free.insert(i, (at, len));
-    // Joins it with its neighbours.
-    if i + 1 < slab.free.len() && slab.free[i].0 + slab.free[i].1 == slab.free[i + 1].0 {
-        slab.free[i].1 += slab.free[i + 1].1;
-        slab.free.remove(i + 1);
-    }
-    if i > 0 && slab.free[i - 1].0 + slab.free[i - 1].1 == slab.free[i].0 {
-        slab.free[i - 1].1 += slab.free[i].1;
-        slab.free.remove(i);
-    }
+    give_back(&mut slab.free, at, len);
     slab.taken -= len;
     if slab.taken == 0 {
         let empty = slabs.iter().flatten().filter(|s| s.taken == 0).count();
@@ -807,6 +869,9 @@ impl Drop for Staging {
         // the buffer is free for another texture.
         if let Some((n, at)) = self.slab {
             give_range(n, at, self.capacity);
+            return;
+        }
+        if !pooled() {
             return;
         }
         if POOLED.fetch_add(self.capacity, Relaxed) + self.capacity <= POOL_BYTES {
