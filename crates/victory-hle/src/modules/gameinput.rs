@@ -1204,38 +1204,89 @@ mod host {
     /// 0.2 s that long after input starts, with or without focus. A key is a
     /// letter, a digit, or `Enter`, `Esc`, `Tab`, `Back`, `Up`, `Down`,
     /// `Left`, `Right` (the stand-in pad's table maps them to buttons).
+    ///
+    /// `VICTORY_KEYS_FILE=<path>` adds keys a test driver writes while the
+    /// title runs: one `<unix milliseconds>:<key>` per line (the same key
+    /// names), each held 0.2 s from that wall-clock time. The file is read
+    /// again when it changes, at most every 100 ms. A driver can so wait
+    /// for the world before moving the player: keys pressed on loading and
+    /// title screens instead steer their menus (a run sat 19 minutes on the
+    /// loading screen with movement keys scripted from a fixed time).
     #[cfg(feature = "diagnostics")]
     fn scripted() -> Vec<u8> {
         static SCRIPT: LazyLock<(Instant, Vec<(Duration, u8)>)> = LazyLock::new(|| {
             let list = std::env::var("VICTORY_KEYS").unwrap_or_default();
             let keys = list.split(',').filter_map(|entry| {
                 let (at, key) = entry.split_once(':')?;
-                let vk = match key.trim() {
-                    "Enter" => 0x0D,
-                    "Esc" => 0x1B,
-                    "Tab" => 0x09,
-                    "Back" => 0x08,
-                    "Up" => 0x26,
-                    "Down" => 0x28,
-                    "Left" => 0x25,
-                    "Right" => 0x27,
-                    k if k.len() == 1 && k.as_bytes()[0].is_ascii_alphanumeric() => {
-                        k.as_bytes()[0].to_ascii_uppercase()
-                    }
-                    _ => return None,
-                };
-                Some((
-                    Duration::try_from_secs_f64(at.trim().parse().ok()?).ok()?,
-                    vk,
-                ))
+                Some((Duration::try_from_secs_f64(at.trim().parse().ok()?).ok()?, key_of(key)?))
             });
             (Instant::now(), keys.collect())
         });
         let (start, keys) = &*SCRIPT;
         let now = start.elapsed();
-        keys.iter()
+        let mut down: Vec<u8> = keys
+            .iter()
             .filter(|&&(at, _)| (at..at + Duration::from_millis(200)).contains(&now))
             .map(|&(_, vk)| vk)
+            .collect();
+        down.extend(live_keys());
+        down
+    }
+
+    /// A key name of `VICTORY_KEYS` / `VICTORY_KEYS_FILE` as a virtual key.
+    #[cfg(feature = "diagnostics")]
+    fn key_of(name: &str) -> Option<u8> {
+        Some(match name.trim() {
+            "Enter" => 0x0D,
+            "Esc" => 0x1B,
+            "Tab" => 0x09,
+            "Back" => 0x08,
+            "Up" => 0x26,
+            "Down" => 0x28,
+            "Left" => 0x25,
+            "Right" => 0x27,
+            k if k.len() == 1 && k.as_bytes()[0].is_ascii_alphanumeric() => k.as_bytes()[0].to_ascii_uppercase(),
+            _ => return None,
+        })
+    }
+
+    /// The `VICTORY_KEYS_FILE` keys down now ([`scripted`]).
+    #[cfg(feature = "diagnostics")]
+    fn live_keys() -> Vec<u8> {
+        use std::sync::Mutex;
+        use std::time::{SystemTime, UNIX_EPOCH};
+        struct Live {
+            checked: Option<Instant>,
+            modified: Option<SystemTime>,
+            keys: Vec<(u64, u8)>,
+        }
+        static PATH: LazyLock<Option<std::path::PathBuf>> =
+            LazyLock::new(|| std::env::var_os("VICTORY_KEYS_FILE").map(Into::into));
+        static LIVE: Mutex<Live> = Mutex::new(Live { checked: None, modified: None, keys: Vec::new() });
+        let Some(path) = PATH.as_ref() else {
+            return Vec::new();
+        };
+        let mut live = LIVE.lock().unwrap_or_else(|e| e.into_inner());
+        if live.checked.is_none_or(|at| at.elapsed() >= Duration::from_millis(100)) {
+            live.checked = Some(Instant::now());
+            let modified = std::fs::metadata(path).and_then(|m| m.modified()).ok();
+            if modified.is_some() && modified != live.modified {
+                live.modified = modified;
+                live.keys = parse_live(&std::fs::read_to_string(path).unwrap_or_default());
+            }
+        }
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64);
+        live.keys.iter().filter(|&&(at, _)| (at..at + 200).contains(&now)).map(|&(_, vk)| vk).collect()
+    }
+
+    /// The lines of a `VICTORY_KEYS_FILE`: `<unix milliseconds>:<key>`.
+    #[cfg(feature = "diagnostics")]
+    fn parse_live(text: &str) -> Vec<(u64, u8)> {
+        text.lines()
+            .filter_map(|line| {
+                let (at, key) = line.split_once(':')?;
+                Some((at.trim().parse().ok()?, key_of(key)?))
+            })
             .collect()
     }
 
