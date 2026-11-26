@@ -63,6 +63,7 @@ pub(super) fn compute(code: Vec<u8>, threads: u32, lds_bytes: u32) -> NativeProg
 }
 
 /// A pixel program with no inputs that exports one float4 render target.
+#[cfg(windows)]
 pub(super) fn pixel(code: Vec<u8>) -> NativeProgram {
     NativeProgram {
         stage: HwStage::Ps,

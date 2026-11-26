@@ -1066,13 +1066,11 @@ impl Module {
     }
 
     /// A constant table no remaining load reads leaves the module (the
-    /// validator refuses an internal declaration nothing uses). Shared
-    /// memory stays declared whether it is read or not.
+    /// validator refuses an internal declaration nothing uses), and so does
+    /// shared memory whose every access was dead (the fuzzer's seed 48: an
+    /// `ds_read_b32` whose result nothing reads).
     fn drop_unused_tables(&mut self) {
-        let mut used: Vec<bool> = self.globals.iter().map(|g| g.init.is_none()).collect();
-        if used.iter().all(|&u| u) {
-            return;
-        }
+        let mut used = vec![false; self.globals.len()];
         for blk in &self.blocks {
             for &i in blk.phis.iter().chain(&blk.body) {
                 for_each_operand(&self.insts[i as usize].op, |v| {

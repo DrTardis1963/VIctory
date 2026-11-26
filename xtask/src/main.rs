@@ -107,6 +107,16 @@ enum Cmd {
         #[arg(long)]
         bless: bool,
     },
+    /// victory-shader's property tests (decoder on random words; random
+    /// programs lowered and validated) with more cases; prints failing seeds.
+    Fuzz {
+        /// Programs per property (the decoder property runs 40 times as many).
+        #[arg(long, default_value_t = 5000)]
+        cases: u64,
+        /// The first seed.
+        #[arg(long, default_value_t = 1)]
+        seed: u64,
+    },
 }
 
 fn main() -> Result<()> {
@@ -146,6 +156,7 @@ fn main() -> Result<()> {
         Cmd::Agility { from, check } => agility::run(&root, from, check),
         Cmd::Opcodes { from, all, json } => opcodes::run(&root, from, all, json),
         Cmd::Snapshots { bless } => shadertest::snapshots(&root, bless),
+        Cmd::Fuzz { cases, seed } => shadertest::fuzz(&root, cases, seed),
     }
 }
 

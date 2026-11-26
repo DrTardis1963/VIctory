@@ -88,6 +88,8 @@ mod coverage;
 mod diff_tests;
 #[cfg(all(test, windows))]
 mod intersect_tests;
+#[cfg(test)]
+mod fuzz_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
 mod lower;
@@ -97,7 +99,7 @@ mod sampler;
 mod shader;
 #[cfg(all(test, windows))]
 mod snapshot_tests;
-#[cfg(all(test, windows))]
+#[cfg(test)]
 mod synth;
 mod threading;
 #[cfg(windows)]

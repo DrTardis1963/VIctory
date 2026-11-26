@@ -1,5 +1,6 @@
-//! `cargo xtask snapshots`: victory-shader's DXIL snapshot test, run alone
-//! with the switch it reads from the environment.
+//! `cargo xtask snapshots` and `cargo xtask fuzz`: victory-shader's DXIL
+//! snapshot test and its property tests, run alone with the switches they
+//! read from the environment.
 
 use std::path::Path;
 use std::process::Command;
@@ -39,4 +40,47 @@ pub fn snapshots(root: &Path, bless: bool) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// The property tests with `cases` programs from `seed` on; prints each
+/// failing seed and its program.
+pub fn fuzz(root: &Path, cases: u64, seed: u64) -> Result<()> {
+    eprintln!("fuzz: {cases} programs per property from seed {seed}");
+    let out = shader_tests(root, "emit::fuzz_tests")
+        .arg("--nocapture")
+        .env("VICTORY_FUZZ_CASES", cases.to_string())
+        .env("VICTORY_FUZZ_SEED", seed.to_string())
+        .output()
+        .context("starting cargo test")?;
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let mut failures = 0;
+    let mut lines = stderr.lines().peekable();
+    while let Some(line) = lines.next() {
+        if line.starts_with("FUZZ FAILURE") {
+            failures += 1;
+            println!("{line}");
+            // The program follows, up to the next failure or test output.
+            let program = |l: &&str| {
+                !["FUZZ FAILURE", "fuzz:", "thread ", "test "]
+                    .iter()
+                    .any(|p| l.starts_with(p))
+                    && !l.is_empty()
+            };
+            while let Some(next) = lines.next_if(program) {
+                println!("    {next}");
+            }
+        } else if line.starts_with("fuzz:") {
+            println!("{line}");
+        }
+    }
+    if out.status.success() {
+        println!("fuzz: no failures");
+        return Ok(());
+    }
+    if failures == 0 {
+        // A build error, or a test that failed some other way.
+        eprintln!("{stderr}");
+        eprintln!("{}", String::from_utf8_lossy(&out.stdout));
+    }
+    bail!("{failures} failing seed(s); replay one with `cargo xtask fuzz --cases 1 --seed <seed>`")
 }

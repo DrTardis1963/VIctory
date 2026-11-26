@@ -167,11 +167,17 @@ fn find(name: &str) -> Option<(Encoding, u16)> {
 
 /// The decoder's view of an instruction with these words (zero-padded).
 fn probe(words: &[u32]) -> Fields {
+    first_instruction(words)
+        .expect("a zeroed instruction decodes")
+        .fields(false)
+}
+
+/// The instruction `words` start with, zero-padded to the longest form and
+/// without following control flow: for tests that try words one at a time.
+pub(crate) fn first_instruction(words: &[u32]) -> Result<Instruction, crate::ShaderError> {
     let mut code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
     code.resize(4 * Instruction::MAX_WORDS + code.len(), 0);
     super::instruction(&code, 0)
-        .expect("a zeroed instruction decodes")
-        .fields(false)
 }
 
 /// Operands split at top-level commas; the words after the last operand
@@ -1164,6 +1170,25 @@ impl Rng {
     }
 }
 
+/// A first dword of a random instruction, spread over the encodings.
+pub(crate) fn random_word(rng: &mut Rng) -> u32 {
+    let r = rng.word();
+    match rng.below(19) {
+        0 | 1 => r & 0x7FFF_FFFF,
+        2 => 0x7E00_0000 | r & 0x01FF_FFFF,
+        3 => 0x7C00_0000 | r & 0x01FF_FFFF,
+        4 => 0x8000_0000 | r & 0x3FFF_FFFF,
+        5 => 0xB000_0000 | r & 0x0FFF_FFFF,
+        6 => 0xBE80_0000 | r & 0x007F_FFFF,
+        7 => 0xBF00_0000 | r & 0x007F_FFFF,
+        8 => 0xBF80_0000 | r & 0x007F_FFFF,
+        k => {
+            let prefix = [0x32, 0x33, 0x35, 0x36, 0x37, 0x38, 0x3A, 0x3C, 0x3D, 0x3E][k - 9];
+            prefix << 26 | r & 0x03FF_FFFF
+        }
+    }
+}
+
 /// `[1,0,1]` as bits, the first lowest.
 fn bit_list(text: &str) -> Result<u32, String> {
     let inner = text
@@ -1590,25 +1615,6 @@ mod tests {
         );
     }
 
-    /// A first dword of a random instruction, spread over the encodings.
-    pub(crate) fn random_word(rng: &mut Rng) -> u32 {
-        let r = rng.word();
-        match rng.below(18) {
-            0 | 1 => r & 0x7FFF_FFFF,
-            2 => 0x7E00_0000 | r & 0x01FF_FFFF,
-            3 => 0x7C00_0000 | r & 0x01FF_FFFF,
-            4 => 0x8000_0000 | r & 0x3FFF_FFFF,
-            5 => 0xB000_0000 | r & 0x0FFF_FFFF,
-            6 => 0xBE80_0000 | r & 0x007F_FFFF,
-            7 => 0xBF00_0000 | r & 0x007F_FFFF,
-            8 => 0xBF80_0000 | r & 0x007F_FFFF,
-            k => {
-                let prefix = [0x32, 0x33, 0x35, 0x36, 0x37, 0x38, 0x3A, 0x3C, 0x3D][k - 9];
-                prefix << 26 | r & 0x03FF_FFFF
-            }
-        }
-    }
-
     /// Printing is a fixed point of assembling: any instruction the printer
     /// writes in a form this assembler takes assembles to words that print
     /// the same. Random words reach every opcode and operand kind, including
@@ -1641,7 +1647,7 @@ mod tests {
                 continue;
             };
             assembled += 1;
-            let back = crate::gfx10::instruction(&bytes(&again), 0)
+            let back = first_instruction(&again)
                 .unwrap_or_else(|e| panic!("{text}: {again:08x?} does not decode: {e}"));
             assert_eq!(
                 back.text(wave64),
