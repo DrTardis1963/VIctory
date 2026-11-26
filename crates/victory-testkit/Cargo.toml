@@ -1,0 +1,14 @@
+[package]
+name = "victory-testkit"
+description = "Synthetic PE32+ x64 images for tests, built in memory (a dev-dependency only)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dev-dependencies]
+victory-pe.workspace = true
+
+[lints]
+workspace = true

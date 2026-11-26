@@ -102,7 +102,7 @@ extern "system" fn unimplemented_import(site: &'static ImportSite, caller: usize
             // ends the process without running the handlers that write it.
             let (dll, symbol) = (&site.dll, &site.symbol);
             let text = format!("VIctory: unimplemented import {dll}!{symbol} called from {at}");
-            crate::log_crash(&text);
+            crate::crash::log_crash_at(&text, Some(caller));
             // SAFETY: plain Win32 calls without preconditions.
             unsafe {
                 if IsDebuggerPresent() != 0 {
@@ -267,9 +267,6 @@ impl ThunkBlock {
 
     /// Emits a stub for `site` and returns its address.
     pub(crate) fn emit(&mut self, site: &'static ImportSite) -> Result<usize> {
-        if self.used + THUNK_SIZE > self.len {
-            bail!("import stub block is full");
-        }
         let mut code = [0xCC_u8; THUNK_SIZE]; // int3 padding
         code[0..4].copy_from_slice(&[0x48, 0x8B, 0x14, 0x24]);
         code[4..6].copy_from_slice(&[0x48, 0xB9]);
@@ -278,6 +275,14 @@ impl ThunkBlock {
         let handler = unimplemented_import as extern "system" fn(&'static ImportSite, usize) -> u64;
         code[16..24].copy_from_slice(&(handler as *const () as u64).to_le_bytes());
         code[24..26].copy_from_slice(&[0xFF, 0xE0]);
+        self.emit_code(&code)
+    }
+
+    /// Emits one stub of code (a traced import's, say); returns its address.
+    pub(crate) fn emit_code(&mut self, code: &[u8; THUNK_SIZE]) -> Result<usize> {
+        if self.used + THUNK_SIZE > self.len {
+            bail!("import stub block is full");
+        }
         // SAFETY: `used + THUNK_SIZE <= len`, and the block is still writable.
         let at = unsafe {
             let at = self.base.add(self.used);

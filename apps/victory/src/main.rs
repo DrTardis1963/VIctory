@@ -8,6 +8,7 @@ mod inspect;
 mod run;
 mod shader;
 mod translate;
+mod triage;
 
 use std::path::PathBuf;
 
@@ -137,6 +138,14 @@ enum Command {
     },
     /// Show the resolved configuration and check it.
     Config,
+    /// Summarise a crash bundle (`crash-*.txt` beside `crashes.log`).
+    Triage {
+        bundle: PathBuf,
+        /// Also decompile the faulting function with headless Ghidra
+        /// (`VICTORY_GHIDRA`, `VICTORY_JDK`); skipped if it is missing.
+        #[arg(long)]
+        decompile: bool,
+    },
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -209,6 +218,7 @@ fn main() -> Result<()> {
             title_args: _,
         } => run::run(&exe, unimplemented, strict, execute, console),
         Command::Config => show_config(),
+        Command::Triage { bundle, decompile } => triage::run(&bundle, decompile),
     }
 }
 

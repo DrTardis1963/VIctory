@@ -6,6 +6,7 @@ mod corpus;
 mod gate;
 mod gpu_view;
 mod harness;
+mod hlestub;
 #[cfg(test)]
 mod hook_tests;
 mod json;
@@ -13,6 +14,7 @@ mod opcodes;
 mod policy;
 mod progress;
 mod todo;
+mod trace;
 mod worktrees;
 
 use std::path::{Path, PathBuf};
@@ -149,6 +151,31 @@ enum Cmd {
         /// The recording's folder, outside the repository.
         dir: PathBuf,
     },
+    /// Read HLE call traces (`VICTORY_HLE_TRACE`): `summary` (where each
+    /// thread stopped) and `diff` (where two runs part).
+    Trace {
+        #[command(subcommand)]
+        cmd: trace::TraceCmd,
+    },
+    /// Scaffold an HLE function for `<dll>!<function>` in the module that
+    /// serves the DLL: a stub handler, its export, a test. Prints the
+    /// patch; --write applies it.
+    HleStub {
+        dll: String,
+        function: String,
+        /// Edit the module file instead of printing the patch.
+        #[arg(long)]
+        write: bool,
+        /// The module file, when several serve the DLL.
+        #[arg(long)]
+        module: Option<PathBuf>,
+        /// The modules folder (default: victory-hle's).
+        #[arg(long)]
+        modules_dir: Option<PathBuf>,
+        /// What the stub returns, as Rust code.
+        #[arg(long, default_value = "0")]
+        returns: String,
+    },
 }
 
 fn main() -> Result<()> {
@@ -212,6 +239,25 @@ fn main() -> Result<()> {
             strict,
         } => corpus::run(&before, &after, all, json, strict),
         Cmd::GpuView { dir } => gpu_view::run(&root, &dir),
+        Cmd::Trace { cmd } => trace::run(cmd),
+        Cmd::HleStub {
+            dll,
+            function,
+            write,
+            module,
+            modules_dir,
+            returns,
+        } => hlestub::run(
+            &root,
+            &hlestub::Options {
+                dll,
+                function,
+                write,
+                module,
+                modules_dir,
+                returns,
+            },
+        ),
     }
 }
 

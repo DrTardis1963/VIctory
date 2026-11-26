@@ -736,6 +736,7 @@ dependencies = [
  "tracing",
  "victory-core",
  "victory-pe",
+ "victory-testkit",
  "windows-sys",
 ]
 
@@ -767,6 +768,13 @@ dependencies = [
  "windows",
  "windows-sys",
  "zlib-rs",
+]
+
+[[package]]
+name = "victory-testkit"
+version = "0.1.0"
+dependencies = [
+ "victory-pe",
 ]
 
 [[package]]

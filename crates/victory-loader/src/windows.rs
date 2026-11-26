@@ -265,6 +265,7 @@ impl LoadedImage {
         let mut report = BindReport::default();
         let mut slots: Vec<(u32, usize)> = Vec::with_capacity(self.info.import_count());
         let mut unresolved: Vec<(u32, &str, &ImportSymbol)> = Vec::new();
+        let mut traced: Vec<(u32, &str, String, usize)> = Vec::new();
 
         // Delay-load slots are bound eagerly too, so the title's own
         // delay-load helper (which would ask the host) never runs.
@@ -280,7 +281,12 @@ impl LoadedImage {
                             Provenance::Host => report.host += 1,
                             Provenance::Title => report.title += 1,
                         }
-                        slots.push((entry.iat_slot_rva, address));
+                        let name = entry.symbol.to_string();
+                        if crate::trace::wanted(provenance, &name) {
+                            traced.push((entry.iat_slot_rva, &module.dll, name, address));
+                        } else {
+                            slots.push((entry.iat_slot_rva, address));
+                        }
                     }
                     Resolution::Missing => {
                         unresolved.push((entry.iat_slot_rva, &module.dll, &entry.symbol));
@@ -301,12 +307,21 @@ impl LoadedImage {
             }
             block.seal()?;
         }
+        if !traced.is_empty() {
+            let mut block = ThunkBlock::new(traced.len())?;
+            for (slot, dll, name, address) in &traced {
+                let stub = crate::trace::stub(dll, name, *address);
+                slots.push((*slot, block.emit_code(&stub)?));
+            }
+            block.seal()?;
+        }
 
         self.write_slots(&slots)?;
         tracing::info!(
             hle = report.hle,
             host = report.host,
             missing = report.missing.len(),
+            traced = traced.len(),
             "imports bound"
         );
         Ok(report)

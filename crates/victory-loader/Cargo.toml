@@ -25,12 +25,14 @@ windows-sys = { workspace = true, features = [
     "Win32_System_LibraryLoader",
     "Win32_System_Memory",
     "Win32_System_Performance",
+    "Win32_System_ProcessStatus",
     "Win32_System_Threading",
 ] }
 
 [dev-dependencies]
 tempfile.workspace = true
 toml.workspace = true
+victory-testkit.workspace = true
 
 [features]
 # Debugging switches (scheduled stack dumps and the like).

@@ -80,6 +80,10 @@ pub fn run(root: &Path, files: Vec<PathBuf>, limit: usize, as_json: bool) -> Res
                     "modules",
                     json::array(r.modules.iter().map(|m| json::string(m))),
                 ),
+                (
+                    "hle_stub",
+                    stub_command(r).map_or("null".into(), |c| json::string(&c)),
+                ),
             ])
         });
         println!(
@@ -119,11 +123,23 @@ pub fn run(root: &Path, files: Vec<PathBuf>, limit: usize, as_json: bool) -> Res
             format!("{}!{}", r.dll, r.symbol),
             r.first_caller
         );
+        if let Some(command) = stub_command(r) {
+            println!("{:>24}{command}", "");
+        }
     }
     if total > ranked.len() {
         println!("  ... {} more (--limit)", total - ranked.len());
     }
     Ok(())
+}
+
+/// The `cargo xtask hle-stub` command that scaffolds `r`, where a module
+/// serves its DLL and its name can be a function's.
+fn stub_command(r: &Ranked) -> Option<String> {
+    let ident = r.symbol.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        && r.symbol.chars().next().is_some_and(|c| !c.is_ascii_digit());
+    (!r.modules.is_empty() && ident)
+        .then(|| format!("cargo xtask hle-stub {} {}", r.dll, r.symbol))
 }
 
 /// `unimplemented.toml` in each title's folder under the configured data
@@ -176,7 +192,7 @@ fn rank(ledgers: &[Vec<Entry>], served: &[(String, String)]) -> Vec<Ranked> {
 /// `(dll pattern, module file)` for every `dlls: &[...]` list in the HLE
 /// modules. Patterns are lower case; a trailing `*` matches a prefix
 /// (`HleModule::serves`).
-fn served_dlls(modules: &Path) -> Result<Vec<(String, String)>> {
+pub(crate) fn served_dlls(modules: &Path) -> Result<Vec<(String, String)>> {
     let mut served = Vec::new();
     for entry in walkdir::WalkDir::new(modules).sort_by_file_name() {
         let entry = entry?;
@@ -216,7 +232,7 @@ fn dll_patterns(source: &str) -> Vec<String> {
     patterns
 }
 
-fn modules_serving(dll: &str, served: &[(String, String)]) -> Vec<String> {
+pub(crate) fn modules_serving(dll: &str, served: &[(String, String)]) -> Vec<String> {
     let dll = dll.to_ascii_lowercase();
     let mut files: Vec<String> = served
         .iter()
@@ -299,6 +315,22 @@ mod tests {
         assert_eq!(ledger.import[0].calls, 2);
         let empty: Ledger = toml::from_str("# nothing called\n").unwrap();
         assert!(empty.import.is_empty());
+    }
+
+    #[test]
+    fn an_import_a_module_serves_gets_its_hle_stub_command() {
+        let ranked = |symbol: &str, modules: &[&str]| Ranked {
+            dll: "a.dll".into(),
+            symbol: symbol.into(),
+            calls: 1,
+            runs: 1,
+            first_caller: String::new(),
+            modules: modules.iter().map(|m| m.to_string()).collect(),
+        };
+        let command = stub_command(&ranked("XOpen", &["modules/a.rs"]));
+        assert_eq!(command.as_deref(), Some("cargo xtask hle-stub a.dll XOpen"));
+        assert_eq!(stub_command(&ranked("XOpen", &[])), None);
+        assert_eq!(stub_command(&ranked("#3", &["modules/a.rs"])), None);
     }
 
     #[test]
