@@ -11,9 +11,9 @@
 //!
 //! `VICTORY_FRAME_INTERVAL_MS=<ms>` ticks at that interval whatever the
 //! title sets (16.667: 60 a second; 0: no wait at all, every wait ends at
-//! once); unset, the title's interval as before. The loader gives the title
-//! the matching frame rate too (`victory_loader::frame_rate`), as the title
-//! would otherwise keep to its 30 with a limiter of its own.
+//! once); unset, the title's interval as before. The title keeps to its own
+//! 30 with a limiter of its own: the fork's code patch that changed that was
+//! left out (it carried bytes of the title's code: asset policy).
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::sync::Mutex;
