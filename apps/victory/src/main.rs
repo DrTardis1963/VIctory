@@ -13,6 +13,7 @@ mod replay;
 mod run;
 mod shader;
 mod translate;
+mod triage;
 #[cfg(windows)]
 mod warm;
 
@@ -156,6 +157,14 @@ enum Command {
     Replay(replay::Replay),
     /// Show the resolved configuration and check it.
     Config,
+    /// Summarise a crash bundle (`crash-*.txt` beside `crashes.log`).
+    Triage {
+        bundle: PathBuf,
+        /// Also decompile the faulting function with headless Ghidra
+        /// (`VICTORY_GHIDRA`, `VICTORY_JDK`); skipped if it is missing.
+        #[arg(long)]
+        decompile: bool,
+    },
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -233,6 +242,7 @@ fn main() -> Result<()> {
         #[cfg(all(windows, feature = "diagnostics"))]
         Command::Replay(options) => replay::run(options),
         Command::Config => show_config(),
+        Command::Triage { bundle, decompile } => triage::run(&bundle, decompile),
     }
 }
 

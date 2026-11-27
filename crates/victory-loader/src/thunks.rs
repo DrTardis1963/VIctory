@@ -102,7 +102,7 @@ extern "system" fn unimplemented_import(site: &'static ImportSite, caller: usize
             // ends the process without running the handlers that write it.
             let (dll, symbol) = (&site.dll, &site.symbol);
             let text = format!("VIctory: unimplemented import {dll}!{symbol} called from {at}");
-            crate::log_crash(&text);
+            crate::crash::log_crash_at(&text, Some(caller));
             // SAFETY: plain Win32 calls without preconditions.
             unsafe {
                 if IsDebuggerPresent() != 0 {
