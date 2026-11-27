@@ -2899,7 +2899,7 @@ impl HostHeap {
         self.put(index);
         self.twin_made(index, kept.is_some() && twinned(view));
         self.write_stride(index, if kept.is_some() { view_stride_word(view) } else { 0 });
-        let address = kept.as_ref().filter(|_| view_stride(view).is_some()).and_then(|_| buffer_range(view));
+        let address = kept.as_ref().filter(|_| view_stride_and_kind(view).0.is_some()).and_then(|_| buffer_range(view));
         self.write_address(index, address.map_or(0, |r| r.0));
         self.keep(index, kept.flatten());
     }

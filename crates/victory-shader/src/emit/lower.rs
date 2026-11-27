@@ -1500,7 +1500,13 @@ impl<'a> Lower<'a> {
                                 }
                             }
                         }
-                        if lds_ok {
+                        // (and room in the host's 32 KiB for the exchange dwords and `wave_base`'s
+                        // counter: the triangle collectors take all of it, and past it the
+                        // validator refuses the program; keeping 64-lane waves lets the other
+                        // forms, the paired one among them, be tried)
+                        // (the exchange dwords, then the counter's one)
+                        let room = s.lds_dwords + 2 * group.div_ceil(64) < 32768 / 4;
+                        if lds_ok && (room || !crosses) {
                             wave = 32;
                             split_lds = s.lds_dwords > 0 && group > 32;
                             if crosses {
