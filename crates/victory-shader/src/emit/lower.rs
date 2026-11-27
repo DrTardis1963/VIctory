@@ -976,6 +976,19 @@ thread_local! {
     static LDS_LOOSE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// See [`with_paired_lanes`].
     static PAIRED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// See [`with_mask_numbers`].
+    static MASK_NUMBERS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `f` with a scalar operation on a register that holds a lane mask on other paths, but
+/// only numbers the lowering has here, taken as a number (the adaptive shadow-ray trace's joined
+/// mask and count). Only the retry of a program refused for a lane mask read as data
+/// (`emit::emit`), so every program that translates without it keeps its translation.
+pub(super) fn with_mask_numbers<R>(f: impl FnOnce() -> R) -> R {
+    let was = MASK_NUMBERS.replace(true);
+    let r = f();
+    MASK_NUMBERS.set(was);
+    r
 }
 
 /// Runs `f` with LDS reads and writes inside one lane-branch region accepted
@@ -6150,7 +6163,9 @@ impl<'a> Lower<'a> {
         let lo = dst_code.and_then(|c| inst.write(Reg::S(c)));
         // (a mask made only of numbers the lowering has, a register that holds a mask on other
         // paths and data here: its number is the operation's, whatever lanes it may name)
-        let numbers = !inst.reads.is_empty()
+        // (`with_mask_numbers` only)
+        let numbers = MASK_NUMBERS.get()
+            && !inst.reads.is_empty()
             && inst.reads.iter().all(|r| {
                 !matches!(r.0, Reg::S(c) if c == EXEC || c == EXEC + 1)
                     && matches!(self.vals.get(&r.1), Some(Val::I32(_) | Val::Bit(_)))

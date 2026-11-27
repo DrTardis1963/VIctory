@@ -683,7 +683,9 @@ fn a_scalar_operation_on_a_mask_joined_with_a_number_is_a_number() {
     ];
     let native = native_of(&words, false, 32);
     let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
-    let shader = lowered(&native, &p, &HashSet::new()).expect("lower");
+    // refused on the first try (no program that translates changes); taken on the retry
+    assert!(lowered(&native, &p, &HashSet::new()).is_err(), "refused without the retry");
+    let shader = lower::with_mask_numbers(|| lowered(&native, &p, &HashSet::new())).expect("lower");
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         let mut copy = shader.dxil.clone();
         v.validate(&mut copy).expect("DXIL validation failed");

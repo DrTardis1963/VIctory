@@ -568,6 +568,28 @@ pub fn emit(
     io: &io::Io,
     res: &resource::Resources,
 ) -> Result<HostShader, ShaderError> {
+    let r = emit_sections(c, native, p, st, io, res);
+    // A program refused for a lane mask read as data: once more with a scalar operation on a
+    // register that is a mask elsewhere but only numbers here taken as a number
+    // ([`lower::with_mask_numbers`]; shadowmask:CS_TraceShadowRays_FullAdaptive). Only then, so
+    // that no program that translated changes. The original's error if that does not translate.
+    if matches!(&r, Err(ShaderError::Unsupported { what, .. }) if *what == lower::MASK_ELSEWHERE || *what == lower::LANE_MASK)
+        && let Ok(shader) = lower::with_mask_numbers(|| emit_sections(c, native, p, st, io, res))
+    {
+        return Ok(shader);
+    }
+    r
+}
+
+/// [`emit`] before its lane-mask retry.
+fn emit_sections(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    st: &structure::Structured,
+    io: &io::Io,
+    res: &resource::Resources,
+) -> Result<HostShader, ShaderError> {
     let r = emit_any(c, native, p, st, io, res);
     // (portB: the retry of a program that translated, soldsawn's, `VICTORY_WHOLE_SECTIONS=1`)
     if r.is_ok() && (!permutes_outside_sections(p) || !base_switch("VICTORY_WHOLE_SECTIONS")) {
