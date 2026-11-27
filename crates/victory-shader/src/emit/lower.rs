@@ -1263,7 +1263,7 @@ fn packed_half(
 /// too, and a later pass copied those over the character's. Not for a
 /// program that exports depth, stencil or coverage (bits 0-2 and 8, or such
 /// an output), which cannot test before it runs. (myokex c3723f3.)
-/// `VICTORY_EARLY_DEPTH=0`: never declared, as before.
+/// Off unless `VICTORY_EARLY_DEPTH=1` ([`early_depth_on`]).
 pub(super) fn early_depth(io: &StageIo, outputs: &[SigElement]) -> bool {
     const DEPTH_BEFORE_SHADER: u32 = 1 << 12;
     const EXPORTS: u32 = 0b111 | 1 << 8;
@@ -1277,10 +1277,13 @@ pub(super) fn early_depth(io: &StageIo, outputs: &[SigElement]) -> bool {
         && !outputs.iter().any(|o| matches!(o.kind, 14 | 17 | 18 | 19 | 20))
 }
 
-/// `VICTORY_EARLY_DEPTH=0`: [`early_depth`] is never declared.
-fn early_depth_on() -> bool {
+/// `VICTORY_EARLY_DEPTH=1`: [`early_depth`] is declared. Off by default here:
+/// on the RTX 3070 (Windows 10, driver 32.0.16.1088) it left a pure white
+/// frame in the prologue and the cell (harness runs 1795740478 vs 1795741715),
+/// as our own early-depth port did (40d2b1b0, reverted).
+pub(super) fn early_depth_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_EARLY_DEPTH").is_none_or(|v| v != "0"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_EARLY_DEPTH").is_some_and(|v| v == "1"))
 }
 
 fn input_packs(io: &StageIo, inputs: &[SigElement]) -> Vec<(u8, Option<u8>)> {

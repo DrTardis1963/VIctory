@@ -1988,9 +1988,14 @@ mod tests {
         };
         let late = emitted(&color, el("SV_Target", 16, 4), 0x50);
         let early = emitted(&color, el("SV_Target", 16, 4), 0x1050);
-        assert_ne!(late, early, "the early-depth flag changed nothing");
+        if !lower::early_depth_on() {
+            // Off by default (`VICTORY_EARLY_DEPTH=1` turns it on): nothing declared.
+            assert_eq!(late, early, "early depth declared while switched off");
+        } else {
+            assert_ne!(late, early, "the early-depth flag changed nothing");
+        }
         #[cfg(windows)]
-        if let Ok(mut v) = super::validator::Validator::load(
+        if lower::early_depth_on() && let Ok(mut v) = super::validator::Validator::load(
             super::validator::Validator::default_path().as_deref(),
         ) {
             v.validate(&mut early.clone()).unwrap();
