@@ -1,183 +1,348 @@
-# VI-BR-PORT: a versão para placas de 8 GB
+# victory-scarlett-3070 (8 GB NVIDIA / RTX 3070 Fork)
 
-Camada de compatibilidade que roda no Windows, de forma nativa, a versão de
-**Xbox Series X|S** (plataforma *Scarlett*, jogos feitos com o **GDK**) de um
-título, a partir dos arquivos do próprio usuário. O código x86-64 do console
-roda sem alteração dentro do nosso processo; por baixo dele ficam as bibliotecas
-do sistema do console reescritas (HLE: XGameRuntime, kernel, memória, armazenamento,
-áudio, entrada) e um back-end Direct3D 12 que recompila os shaders da GPU do
-console (GFX10/RDNA2) para DXIL.
+A fork of [Op-lite/victory-scarlett](https://github.com/Op-lite/victory-scarlett) (itself based on
+[fxceless/victory-fork](https://github.com/fxceless/victory-fork) and [Marvisak/VIctory](https://github.com/Marvisak/VIctory))
+tuned for **8 GB NVIDIA GPUs** (tested on an RTX 3070 8 GB, 32 GB RAM, Windows 11). The upstream
+`victory-scarlett` README follows below.
 
-Este fork tem um alvo só: **placa NVIDIA de 8 GB com ondas de 32 lanes**
-(testado numa RTX 4060 Ti) ligada a um **monitor 1080p**. Nessa máquina as
-árvores de origem enchem a memória da placa, travam conferindo texturas e
-esperam minutos por shaders; aqui está o que foi feito para isso.
+**This repository contains no game files, code, or assets.** You need your own copy of the title.
+It is not affiliated with or endorsed by the title's developer or publisher. Licensed GPL-3.0-or-later.
 
-**Este repositório não contém arquivos, código ou recursos do jogo.** É preciso
-ter a sua própria cópia. Nada aqui tem ligação com o desenvolvedor ou a
-editora do jogo, nem é aprovado por eles.
+## What's Added on Top of `Op-lite/victory-scarlett` (`835ca60`)
 
-Origem: [VIctory](https://github.com/Marvisak/VIctory) → [fxceless/victory-fork](https://github.com/fxceless/victory-fork) → este fork.
-A branch de trabalho é `base/fxceless`; a `main` acompanha ela.
+- **8 GB VRAM & NVIDIA stability:**
+  - `VICTORY_TEXTURE_MIP_DROP=1` (`resource.rs`) — drops top mip levels of large placed textures (~75% less texture VRAM).
+  - Immediate idle VRAM eviction (`fxceless#1269`, `draw.rs`).
+  - NVIDIA 1M descriptor-heap cap fix (`VICTORY_DYNAMIC_SLOTS=524288`, `descriptor/host.rs`).
+  - Prelude allocator cap & recycling (`VICTORY_MAX_PRELUDES=32`, `host.rs`).
+  - Shadow scratch buffer reuse (`fxceless#1350`, `shadow.rs`).
+  - `TITLE_PAGES` working-set reporting (`xmem.rs`).
+- **Visual fixes:**
+  - `R9G9B9E5` -> `R11G11B10_FLOAT` format stand-in (`resource.rs`, fixes purple/violet lighting & vegetation).
+  - Ambient leftover state fix (`ambient.rs`).
+  - Integer render-target unblending (`fxceless#501`, `pipeline.rs`, `pipeline/host.rs`).
+  - `VICTORY_SKIP_PIPELINES='02384a60fda6f2d0,731a39171b568298'` in `scripts/play-3070.ps1` (skips broken water/heat-haze blocks and decal-heap defrag).
+- **Performance & pacing:**
+  - 60 FPS frame-interval unlock (`VICTORY_FRAME_INTERVAL_MS=16.667`, `frame_rate.rs`, `frame.rs`, `run.rs`).
+  - Async stderr logging (`victory-core/src/logging.rs`).
+  - Dedicated RTX 3070 8 GB launcher (`scripts/play-3070.ps1`, preserves default `%LOCALAPPDATA%\victory` saves & cache).
 
-## Estado (25/11/2026)
+## Build and Run
 
-Máquina de teste: Windows 11, Intel i7-13700K, RTX 4060 Ti 8 GB, 32 GB de RAM,
-perfil Series X. As porcentagens são a nossa estimativa de cada etapa, não um
-benchmark.
+```powershell
+cargo build --release --locked -p victory
 
-| Etapa | Situação | Progresso | Observações |
-|-------|:--------:|----------:|-------------|
-| Carrega e inicia | ✅ | 100 % | uns 10 s até o primeiro quadro |
-| Vídeo de abertura e menus | ✅ | 100 % | 30 fps estáveis (o limite do próprio título) |
-| Cutscene de abertura | 🟡 | 70 % | vai até o fim; pele e roupa ainda saem pretas e a passagem para os vídeos pisca verde |
-| Entrada no mundo | ✅ | 100 % | as pipelines vêm da biblioteca salva, sem tela preta |
-| Jogável (controle, HUD, menus) | 🟡 | 50 % | controle, HUD e menu de pausa funcionam, mas devagar |
-| Qualidade da imagem | 🟡 | 50 % | sem a luz por ray tracing (sombras pretas); um nível de mip a menos em placas de 8 GB |
-| Taxa de quadros | 🟡 | 20 % | 4 a 7 fps na cutscene em 1080p (eram 2 a 3 fps a 4K) |
-| Estabilidade | ✅ | 90 % | sessões de uma hora sem travar a placa nem perder o dispositivo |
-| **Geral** | | **72 %** | média das linhas acima |
+# First run (if you don't have a shader cache yet):
+.\scripts\play-3070.ps1 -Game 'C:\path\to\game_scarlett_master.exe' -Prewarm
 
-Tradução dos shaders do console para este host e etapas do jogo
-(gerado por `cargo xtask progress`):
+# Normal runs:
+.\scripts\play-3070.ps1 -Game 'C:\path\to\game_scarlett_master.exe'
+```
 
-<!-- progress:start -->
-![shaders: 99.9%](https://img.shields.io/badge/shaders-99.9%25-brightgreen)
-![shaders Mesh: 100.0%](https://img.shields.io/badge/shaders%20Mesh-100.0%25-brightgreen)
-![shaders Vertex/pixel: 99.9%](https://img.shields.io/badge/shaders%20Vertex%2Fpixel-99.9%25-brightgreen)
-![shaders Compute: 99.7%](https://img.shields.io/badge/shaders%20Compute-99.7%25-brightgreen)
-![medido: 2026-11-25](https://img.shields.io/badge/medido-2026--11--25-blue)
+---
 
-| Parte | Progresso | % | Contagem |
-|---|---|---|---|
-| **Todos os shaders** | `████████████████████` | **99.9%** | 25750 / 25758 |
-| Shaders Mesh | `████████████████████` | 100.0% | 8765 / 8765 |
-| Shaders Vertex/pixel | `████████████████████` | 99.9% | 14258 / 14259 |
-| Shaders Compute | `████████████████████` | 99.7% | 2727 / 2734 |
-| **Etapas do jogo funcionando** | `██████████░░░░░░░░░░` | **50.0%** | 3 / 6 |
+# Scarlett fork (branch `scarlett-fox`), state of 2026-11-26
 
-| Etapa do jogo | Estado | Medição |
+## How to start the game (the short version)
+
+You need your own dump of the game: a folder that has `game_scarlett_master.exe` in it. **This repository contains
+no game files, code or assets.**
+
+1. **Install the tools once:** [Rust](https://rustup.rs) and the Visual Studio C++ build tools with a Windows SDK.
+2. **Build once.** Open PowerShell in this folder and run:
+
+   ```powershell
+   cargo build --profile diag -p victory --features diagnostics --locked
+   ```
+
+3. **Start the game.** Drag your game folder onto **`Play-Scarlett.cmd`**.
+   After the first time, just double-click `Play-Scarlett.cmd`: it remembers the folder.
+
+That is all. `Play-Scarlett.cmd` sets every setting this branch runs with, in Series X mode. The first start
+takes a few extra minutes while it prepares the game's shaders (see below); after that it starts straight away.
+
+Good to know:
+
+- **Shaders are prepared ahead, by itself.** Before the game starts, the launcher translates all of the game's
+  shaders once (`victory.exe shaders <your game folder>\shaders.rpf`). You will see a console window counting
+  for a few minutes. It happens only when it is needed:
+  - on the first start,
+  - after you build a new `victory.exe`,
+  - after you change a setting that changes the shaders (`-RayTracing`, `-NoProbeRays`).
+
+  It is remembered in the cache folder (`scarlett-shaders-ahead.txt`), so every other start skips it. Without
+  this step the game would translate shaders while you play: slow, with objects missing and faces drawn wrong
+  for that session. To run only this step: `.\scripts\play-scarlett.ps1 -OnlyPrecompile`. To skip it:
+  `-NoPrecompile`. To force it again, delete `scarlett-shaders-ahead.txt` from the cache folder
+  (`%LOCALAPPDATA%\victory-scarlett\cache` unless you chose another).
+- **The first session still stutters a little** while the graphics driver builds its own pipelines; later
+  sessions are smoother.
+- **Controls:** an Xbox controller works. On the keyboard: W A S D move, I J K L camera, Enter = A, Backspace = B,
+  X and Y, Z / C = left / right trigger, Q / E = LB / RB, arrows = D-pad, Esc = Menu, Tab = View.
+- **Do not use `Play-VIctory.cmd`** for this: that is the base's launcher, with Series S and other settings.
+- **Ray tracing** is off by default (the game's own, much slower). To turn it on, start it from PowerShell:
+
+  ```powershell
+  .\scripts\play-scarlett.ps1 -RayTracing
+  ```
+
+- **The violet glow on bushes, trees and palms** that the base shows with ray tracing off is gone by default
+  (`-NoProbeRays` brings the base's picture back). The first start after this update re-translates shaders.
+- **More speed:** `.\scripts\play-scarlett.ps1 -Hooks` turns the memory hooks on (about 10-15 ms a frame less in
+  the opening scenes). They are off by default: they can show a few small textures with old contents for a moment.
+- More options are listed at the top of `scripts\play-scarlett.ps1` (other cache or save folders, a release build,
+  automatic start-screen presses, any single setting through `-More`).
+
+## What this is
+
+This branch is codec-d/cool_fox at `f4b48ad` (itself avatarmanz/VIctory-7900XTX `0a43566` plus six commits) with the
+work of a local fork ("Scarlett") ported onto it. Target PC: Ryzen 7 9800X3D, 32 GB RAM, RTX 4080 SUPER 16 GB,
+2560x1440, Series X mode. Goal: a stable 30 frames a second with no loss of picture. It is not there yet.
+
+## Measured (6-minute opening route, diagnostics build, ray tracing off, with `-Hooks`)
+
+| | cool_fox as it was (floor) | this branch, current settings |
 |---|---|---|
-| Carrega e inicia | ✅ | uns 10 s até o primeiro quadro |
-| Vídeo de abertura e menus | ✅ | 30 fps |
-| Cutscene de abertura | ⚠️ | vai até o fim; rostos, cabelo e roupa com textura, mas a cena fica escura sem a luz por ray tracing; 1-5 fps |
-| Entrada no mundo | ✅ | alcançada, pipelines vindas da biblioteca salva |
-| Jogável | ⚠️ | controle, HUD e pausa funcionam, mas a 4-7 fps em 1080p |
-| Luz por ray tracing | ❌ | ainda não roda; tudo na sombra fica preto |
+| ms per frame, 1,000-2,500 draws | 50-55 | 35 |
+| ms per frame, 2,500-4,000 draws | 50-53 | 44 |
+| ms per frame, over 4,000 draws | 59-66 | 56 |
+| frames over 1.5x the usual | 7-8 % | 2.3 % |
+| 5-second periods with a frame over 500 ms | 18-21 | 10 |
+| frames drawn in the 6 minutes | 4,400-5,900 | 8,385 |
+| texture copies made again in the first 4 minutes | about 6.4 GB | 14 MB |
+| memory commit, peak | 37 GB | 33 GB |
 
-*Medido em 2026-11-25 em NVIDIA GeForce RTX 4060 Ti 8 GB, Intel Core i7-13700K, Windows 11 (`719e3b15`). As contagens de shaders são os shaders de console do dump do Xbox Series 1.0.2.1 que são traduzidos para este host (`victory translate`); as etapas do jogo são o que uma execução alcançou. Regenere com `cargo xtask progress` depois de editar `docs/progress/progress.json`.*
-<!-- progress:end -->
+Heavier hand-played scenes (a prison yard at 5,500-8,600 draws, the open world) run at about 48-62 ms a frame
+(16-21 fps). Identical runs on the test PC differ by 13-18 ms a frame at the same draw count, so single-run frame
+times prove little; the memory, re-upload and freeze figures and each switch's own counter line are what is solid.
 
-## O que este fork acrescenta
+Where the time goes now (ray tracing off): the graphics card is mostly idle. One thread of the layer, the one that
+hands each frame's work to the card, is busy for the whole frame (32-44 ms: buffer refreshes 12-14, copies in the
+card's memory 7-8, other list steps about 6, write-watch asks about 4).
 
-Memória (placas de 8 GB):
-- O modo de tela informado ao título pode ser o do monitor
-  (`VICTORY_DISPLAY_MODE=1920x1080`). No modo 4K padrão, só os render targets
-  ocupavam 3,4 GB de um orçamento de 6,6 GB, e as texturas eram descartadas.
-- Um nível de mip a menos nas texturas grandes em placas de até 8 GB (piso 2048).
-- Render targets ociosos cuja memória o título desmapeou são liberados; os que
-  ficam no mesmo endereço com a mesma descrição dividem uma cópia só.
-- Texturas lidas por índice (bindless) saem da placa as mais antigas primeiro
-  quando ela enche, e voltam quando o título as cita de novo.
-- Uma linha do log mostra a memória da placa por tipo.
+## The settings `Play-Scarlett.cmd` uses
 
-Velocidade:
-- O tradutor de shaders ficou cerca de 2,7 vezes mais rápido a frio, com a mesma saída.
-- A conferência de texturas segura só as faixas que lê enquanto o runtime
-  remapeia a memória, sem esperar nada (`VICTORY_TEXTURE_NO_WAIT`); um orçamento
-  por quadro (`VICTORY_TEXTURE_BUDGET_MS`, 10 por padrão) passa o resto adiante.
-- O desfazimento do tiling (swizzle) das texturas do console roda em faixas paralelas.
-- A cópia de volta das cópias na placa usa uma fila de cópia própria; a placa
-  compara os pedaços com grupos largos.
-- Quadros da cutscene que esperavam 1,6 a 7,9 s por envio de texturas agora levam 5 a 67 ms.
-- Workers extras de pipeline durante o carregamento.
+All settings are environment variables read at start; `scripts\play-scarlett.ps1` holds the list, in groups:
 
-Correção:
-- Programas escritos para ondas de 64 lanes rodam como várias ondas de 32 com
-  barreiras de grupo (22 dos 24 programas de cabelo agora são criados).
-- Texturas enviadas no prelúdio de uma lista não piscam mais na abertura.
-- Um crash nas leituras protegidas do DirectStorage foi corrigido.
-- Dispatches de compute que passam do orçamento do quadro são descartados em
-  vez de travar o quadro.
+- cool_fox's launcher set, **without** Series S, `VICTORY_THIN` and the stand-in ambient light, and with the
+  keep-the-card-busy loop off (`VICTORY_CARD_AWAKE=0`: it held the card at 97-99 % in menus for no gain).
+- `VICTORY_LEVELS_ON_DEMAND=0`: textures keep only the levels their views show. cool_fox's launcher set it to 1,
+  which made every texture keep its whole chain on the card. Off: re-uploads near zero, about 4 GB less commit,
+  fewer freezes. This was the largest single gain.
+- The memory hooks, only with `-Hooks` (see above).
+- `VICTORY_POOL_DISCARD=1`, `VICTORY_FILL_TITLE=1`, `VICTORY_PARTIAL_DELTA=1`, `VICTORY_BAKE_DELTA=1`,
+  `VICTORY_MAP_LOCK_FINE=1`, `VICTORY_POOL_CAP=1`: unused pool pages given back under low RAM, no read waits for
+  fills, unchanged texture levels not uploaded again, the mapping lock taken per range, the texture pool capped.
+- `VICTORY_TABLE_MEMO=1`: a descriptor-table entry made ready earlier in a command list is not made ready again
+  (81 % of about 54,000 entries a frame; verified against the full path). `VICTORY_LIST_ALIAS_EXACT=1`: a texture
+  read through a view in another format follows its source's writes within a list (the base read a stale copy once
+  a frame in the title's lighting filter). `VICTORY_LIST_HOLD=1`: a view copied into a new table is held once
+  per list, not once per slot.
+- Picture waits: `VICTORY_BAKE_TEXTURES_MS=10000` (the title's character bake waits up to 10 s for its textures;
+  1.5 s by default: faces and skin came out wrong in some runs) and `VICTORY_PIPELINE_WAIT_MS=500` (a draw waits
+  for a pipeline still being made instead of being dropped after 20 ms).
 
-Também reúne o trabalho do fxceless e dos forks que ele junta (texturas de pele
-e cabelo conferidas de novo depois do envio, limite do heap de views, instruções
-f64, liberação de ociosos sob pressão de memória) e mais de cinquenta pull
-requests do VIctory (lanes auxiliares no `v_readfirstlane`, índices de mesh com
-9 bits, leituras d16, `v_mad_f32` com a soma separada, limites da LDS e outros).
+## What was added to cool_fox
 
-## Como compilar e rodar
+Always on:
+- Unattended runs: `VICTORY_AUTO_INPUT` (a script of pad presses keyed on draws per frame, to pass the start
+  screens), a window caption with fps, ms and draws, `VICTORY_FRAME_LOG` (per-frame breakdown by thread, long frames
+  listed with their cause), `VICTORY_HANG_WATCH_S`, `VICTORY_PRESENT_SKIP` for runs with the display off.
+- Picture: 16-bit float values moved through unsigned-integer views (`VICTORY_HALF_VIEWS`, `VICTORY_D16_BITS`; fixes
+  frozen facial animation and a blurred disc in cutscenes), a NaN guard on colour exports (`VICTORY_NAN_GUARD`),
+  early depth, pipelines made for the render-target formats actually bound (`VICTORY_TARGET_VARIANTS`), an alias copy
+  after an upload earlier in the same list, views keep the title's minimum LOD. 26 compute programs the base refused
+  now translate (hair shadow masks, water volumetrics, particle emits, decals).
+- Meters (diagnostics builds): uploads by cause, read waits by reason, mapping-lock readers, memory housekeeping,
+  texture detail, the game's chunk pool, page kinds by the title's own table, per-pass GPU times
+  (`VICTORY_PASS_TIMES=1`, `=2` serial), list calls and draw set-up by part (`VICTORY_LIST_CALLS=1`).
 
-Requisitos: Windows 10/11 x64, CPU com AVX2, GPU Direct3D 12 com shader model
-6.6 e mesh shaders, Rust (versão fixada em `rust-toolchain.toml`). O título
-precisa de vários GiB de memória virtual livre ao iniciar; se o `crashes.log`
-mostrar o erro 1455 do Windows, aumente o arquivo de paginação.
+Switches, off by default (the base's behaviour is kept unless a run showed a gain); the ones in the launcher are
+described above. Others:
+- `VICTORY_PAGE_POOL=1`: textures on pages of reserved resources (about 1.2 GB less texture memory, no frame cost).
+  Its page mover `VICTORY_PAGE_MIGRATE` loses the device on the test card and must stay off (`tools/docs/fox-port-V.md`).
+- `VICTORY_STAGING_REST_MS`, `VICTORY_STAGING_PACK`, `VICTORY_SEND_SPARE_MB`, `VICTORY_WINDOW_KB`,
+  `VICTORY_WINDOW_TAILS`, `VICTORY_HOLDERS`: memory trims; about 1-2 GB less commit, not in the launcher.
+- `VICTORY_CLEAN_STAMP`, `VICTORY_ASK_KEPT_EARLY`, `VICTORY_FILL_FROM_PLACED`, `VICTORY_SIGNATURE_LOCAL`,
+  `VICTORY_BIND_SAME`, `VICTORY_LIST_BATCH`, `VICTORY_FAULT_NOTE_ONCE`, `VICTORY_BASE_REUSE`, `VICTORY_MAP_DEFER`,
+  `VICTORY_REMAP_SAME`, `VICTORY_CHUNK_FINAL`, `VICTORY_BIND_FILTER`, `VICTORY_HOIST_LOADS` and more: built, exact,
+  no gain shown (or a loss: `VICTORY_LIST_BATCH`), or untested. `tools/docs` says which.
+- Tried and rejected on this base: `VICTORY_THIN=1` (no gain here, twice the long frames), `VICTORY_WINDOWS_BAR_MB`
+  (game memory in VRAM through Resizable BAR: no gain while the card is idle, 1.4 GB of VRAM), a release build
+  without diagnostics (no faster), `VICTORY_DISPLAY_MODE=2560x1440` (the title still builds its 4K targets),
+  `VICTORY_SHADER_LOOP_LIMIT=1024` (black faces), `VICTORY_BVH_COUNT32` (breaks ray tracing), `VICTORY_UNMAP_EXACT`,
+  `VICTORY_TEXTURE_RAM_CAPS=0`, `VICTORY_VRAM_RAW_PCT`.
+
+## Known problems
+
+- Fixed by default: the violet glow on bushes, trees and palms and the bright blue awnings with ray tracing off.
+  The base leaves out the title's probe-activation program, and the light probes then keep whatever their
+  memory held. `VICTORY_PROBE_RAYS=1` (set by the launcher) runs it and answers every ray test as for an empty
+  structure, so each ray ends with the title's own miss result; no cost measured.
+- Purple patches can linger for a few seconds in some scenes; magenta or blue streaks, shiny skin or a dark band
+  across the eyes appear on characters in some runs. Candidates and evidence: `tools/docs/shading-gaps-audit.md`
+  (a material-class depth plane was read before it was current, once a frame: fixed by `VICTORY_PLANE_NOW=1`,
+  set by the launcher; two compute passes make NaNs: ambient occlusion and a far-depth downsample, being traced).
+- Freezes of about a second at scene loads: the title's page-mapping copies cost one map and one unmap system
+  call per 64 KiB page, and those calls get 50 times slower when free RAM falls under about 3 GB (the title
+  and the layer commit 31-34 GB). `VICTORY_POOL_DISCARD=1` (in the launcher) prevents most of them: without
+  it a 6-minute run had 39 freezes instead of 7. Close other programs before playing on a 32 GB PC.
+  `tools/docs/freeze-analysis.md`.
+- The memory hooks (`-Hooks`) can draw a few small textures with old contents until their own check catches it
+  (7 in a 6-minute run). Off by default until fixed.
+- Heavy scenes sit at 16-21 fps, and driving in the open world drops lower (50-90 ms a frame at 9-12 thousand
+  draws): there the title's five recording threads are the limit, each bind costing about 22 us in the layer.
+  On lighter scenes the layer's submitting thread is the limit (`VICTORY_REFRESH_STALE=1` is verified exact but
+  gains no time yet).
+- Meshes can stretch for a second or two in busy scenes (cause not found).
+- Ray tracing (`-RayTracing`) is off by default: sharper and better lit, but the card then needs about 84 ms a
+  frame (`tools/docs/rt-parked-T.md`).
+- Texture pop-in remains, less than before; the card reaches 14-15 GB of 16 in long sessions.
+- Started without the launcher (or with `-NoPrecompile`) on an empty shader cache, a first run can show missing
+  or black faces; the launcher's prepare-ahead step avoids that.
+- In Series X mode the title always renders at 2560x1440 and upscales to 3840x2160 itself.
+- Two pipeline creation methods are not implemented (the title falls back to ordinary containers).
+- Fixed since the last state: a crash (a use after free in a meter thread that runs with the hooks).
+
+## Where things are
+
+- `Play-Scarlett.cmd`, `scripts/play-scarlett.ps1`: the launcher.
+- `tools/docs/picture-settings-checklist.md`: every picture setting against another cool_fox build's.
+- `tools/`: the measuring scripts (`run-auto-coolfox.sh`: hands-off run with watchdog; `run-compare.sh`,
+  `run-freezes.sh`, `run-focus.sh`), notes (`tools/docs`: what was measured, tried and rejected; `fox-port-*.md` list
+  every ported switch; `cool-fox-willy-review.md` and `left-out-audit.md`: a settings audit and what the layer
+  leaves out or approximates), `tools/baseline-coolfox/README.md` (the floor and how to compare against it).
+- The older Scarlett tree (soldsawn/victory-nvidia-8gb base) is on branch `scarlett`.
+
+The base's own README follows.
+
+---
+
+# VIctory on an RX 7900 XTX
+
+## Run the codec_d Windows build
+
+Download and extract the Windows x64 ZIP from the [private releases](https://github.com/codec-d/cool_fox/releases/latest). Open PowerShell in the extracted folder and point the launcher at your own complete Xbox dump.
 
 ```powershell
-cargo test -p victory-gpu -p victory-shader          # não precisa de dados do jogo
-cargo build --profile diag -p victory --features diagnostics
+$env:VICTORY_GAME_DIR = 'D:\Games\MyDump'
+.\Play-VIctory.cmd pareto-residency
 ```
 
-Chaves recomendadas para uma placa de 8 GB:
+The launcher selects Series S and the RTX-tested residency settings. It builds its shader cache locally under `%LOCALAPPDATA%\VIctory\cache-pareto`. Set `VICTORY_CACHE_DIR` to reuse an existing cache outside the checkout. Windows x64, an AVX2 CPU, and a Direct3D 12 GPU with shader model 6.6 and mesh shader support are required.
+
+To build from this checkout, install the pinned Rust toolchain and the MSVC C++ build tools with a Windows SDK, then run `cargo build --release --locked -p victory`. The same launcher finds `target\release\victory.exe`. The sections below describe the upstream AMD fork and its separate launcher.
+
+A fork of [VIctory](https://github.com/Marvisak/VIctory), a compatibility layer
+that runs an Xbox Series title natively on Windows from files the user supplies.
+This one is about **speed on AMD RDNA 3**: the world at 30 frames a second on
+one PC, without giving up the picture. It is not there yet.
+
+**This repository contains no game files, code or assets.** You need your own
+copy of the game. It is not affiliated with or endorsed by the game's developer
+or publisher.
+
+## Where it stands (2026-11-25)
+
+Tested on one machine only: Windows 11, Intel i9-12900K, 64 GB RAM, Radeon
+RX 7900 XTX, 1440p, the Series X profile.
+
+| | |
+|---|---|
+| Menus, videos, loading screens | 30 fps |
+| Prologue, indoors | 50-75 ms a frame (13-20 fps) |
+| First mission with the boat | 46-53 ms (19-22 fps) |
+| Street chase with many cars and people | 100-165 ms (6-10 fps), single frames far longer |
+| Outdoors on foot, the camp | 60-90 ms |
+| Flying | 42-57 ms |
+| Longest session so far | 41 minutes, no crash |
+| Memory | 40-46 GB of private memory: **64 GB of RAM recommended** |
+
+It started at 280 ms a frame in the same scenes two days earlier.
+
+What is known to be wrong:
+
+- Trees, plants and far buildings flicker outdoors in some places.
+- Rooms with little direct light are too dark without `-RayTracing`.
+- Textures of what just came into view appear late while the title streams.
+- The first run with a new driver or a new build stutters while the driver makes
+  pipelines (`victory warm` makes them ahead).
+- Recording a frame in the world makes the title's own watchdog end it.
+
+## How to run it
+
+You need Windows 10/11 x64, a CPU with AVX2, a Direct3D 12 GPU with shader
+model 6.6 and mesh shaders, Rust (the toolchain is pinned), the MSVC build
+tools, and your own dump of the title.
 
 ```powershell
-$env:VICTORY_RELAY = '1'                  # 2 mostra defeitos em placas de 8 GB
-$env:VICTORY_WIDE_BACK = '1'
-$env:VICTORY_WIDE_REFRESH = '1'
-$env:VICTORY_DISPLAY_MODE = '1920x1080'   # o tamanho do seu monitor
-$env:VICTORY_NO_WATCHDOG = '1'            # os primeiros quadros do mundo são lentos
-target\diag\victory.exe run <pasta do jogo>\<executável do título> --execute
+git clone https://github.com/avatarmanz/VIctory-7900XTX
+cd VIctory-7900XTX
+copy victory.example.toml victory.toml      # then set your paths, outside this folder
+cargo build --locked --profile diag -p victory --features diagnostics
+scripts\play.ps1 -Exe <path of your copy's executable>
 ```
 
-Antes da primeira execução de um build novo, traduza os shaders que o título usa:
+`scripts\play.ps1 -Safe` leaves out the newest, faster ways; try it first when
+something is wrong. `-RayTracing` turns the title's ray-traced indirect light on.
+
+Before the first run, ahead of time (both can be stopped and go on later):
 
 ```powershell
-target\diag\victory.exe translate <arquivos de shader do título> --write-cache --used-only
+target\diag\victory.exe shaders <the shader archives>   # every shader translated, minutes
+target\diag\victory.exe warm --used                     # pipelines earlier runs drew with, for a new driver or build
 ```
 
-A primeira execução depois que o tradutor muda refaz a biblioteca de pipelines:
-a cutscene de abertura fica quase toda preta por alguns minutos enquanto umas
-3.000 pipelines são montadas. As execuções seguintes já as carregam.
+Commands, debugging switches and upstream's own description:
+[docs/README-fxceless.md](docs/README-fxceless.md). Every `VICTORY_...` switch is
+described in a comment where it is read.
 
-Controle: pads XInput. Sem nenhum conectado, o teclado vira um pad enquanto a
-janela do título tem o foco (W A S D e I J K L para os analógicos, setas para o
-direcional, Enter/Backspace/X/Y para A/B/X/Y, Esc e Tab para Menu e View).
+## What is different here
 
-Saves, configurações e o `crashes.log` ficam em `%LOCALAPPDATA%\victory\data`.
+In short; the reasons and the measurements are in [docs/findings.md](docs/findings.md).
 
-## Depuração
+- **List calls are written down, not carried out, on the title's threads**
+  (`VICTORY_THIN`): eight threads of ours translate them.
+- **Submissions are prepared by a thread of ours and joined**
+  (`VICTORY_ASYNC_SUBMIT`, `VICTORY_JOIN_PARTS`), with what can be spread over
+  threads spread: refreshes, compares (AVX2), descriptor records, landings.
+- **What shaders wrote comes back beside the write guards**, by the dwords that
+  changed, on a thread of its own (`VICTORY_RELAY`, `VICTORY_LAND`).
+- **Buffer fills that need bytes still on the card are done on the card**
+  (`VICTORY_CARD_STEPS`) instead of waiting for it.
+- **The title's writes are caught more cheaply**: one view opened at a fault,
+  blocks that rest, places in the title's code that look before they write.
+- **Textures go up on a copy queue of their own** and a slot shows one only after
+  its upload ran, which also ended a device loss that came every 15 minutes or so.
+- **Boats float**: textures that shaders write and the title's CPU reads go back
+  to title memory (from fxceless and Geckomacabre, on by default here).
+- **Frame record and replay** with per-pass times and shader variants compared
+  turn by turn ([docs/replay.md](docs/replay.md)).
 
-| Variável | Efeito |
-|----------|--------|
-| `VICTORY_LOG=info` | o log com a linha de fps e o tempo de cada parte do quadro |
-| `VICTORY_CAPTURE=<pasta>` | salva quadros apresentados como PNG |
-| `VICTORY_SKIP_PIPELINES=<hash>,...` | omite desenhos e dispatches cujos shaders tenham esses hashes |
-| `VICTORY_D3D12_DRED=1` | numa falha da GPU, a alocação atingida e os comandos em voo |
-| `VICTORY_D3D12_WARP=1` | usa o adaptador de software (lento, mas não reinicia o driver) |
+## Credits
 
-Cada chave é explicada num comentário onde é lida no código.
+This is a tree of other people's work with more on top. The history is kept, and
+commits taken from elsewhere name the commit and its author.
 
-## Problemas conhecidos
+- **[VIctory](https://github.com/Marvisak/VIctory)** by Marvisak and its
+  contributors: the loader, the runtime services, the Direct3D 12 back end and
+  the shader recompiler.
+- **[fxceless/victory-fork](https://github.com/fxceless/victory-fork)**: the fork
+  this one started from, and the people whose pull requests it carries.
+- **[DexNom/VIctory](https://github.com/DexNom/VIctory)**: ray tracing fixes,
+  cube gradients, sparse textures.
+- **[Belobug/VIctory-Belobug-AMD](https://github.com/Belobug/VIctory-Belobug-AMD)**:
+  the ambient light idea, pipeline workers, and work by romainhedouin.
+- **[FQY55kai/ZJOU-VICTORY](https://github.com/FQY55kai/ZJOU-VICTORY)**.
+- **[myokex/victory-amd](https://github.com/myokex/victory-amd)**: the guard over
+  every view of a page (with Spexivus, joroyt and tightfall), and Joshua Odom's
+  reads into title memory.
+- **Geckomacabre** and **cxy0072019-sketch**: the texture read-back.
+- **[XCL](https://github.com/ivall/xcl)** (GPL-2.0-only) was read for how the same
+  title behaves under another layer; no code of it is here.
+- This fork's changes were made with [Claude Code](https://claude.com/claude-code).
 
-- Tudo que está na sombra fica preto: a luz por ray tracing do título ainda não roda.
-- Pele e roupa dos personagens saem pretas e a passagem para os vídeos pisca verde.
-- Faixas de cor na gradação da cutscene.
-- Dois programas de 64 lanes (coleta de triângulos e meshlets) ainda não cabem em
-  ondas de 32 e são recusados.
-- Uns 24 GB de memória do sistema em uso durante o jogo.
+## License
 
-## Créditos
-
-- **[VIctory](https://github.com/Marvisak/VIctory)**, de Marvisak e colaboradores:
-  o carregador, os serviços do runtime, o back-end Direct3D 12 e o recompilador
-  de shaders. Licença GPL-3.0-or-later, a mesma deste fork.
-- **[fxceless/victory-fork](https://github.com/fxceless/victory-fork)** e os forks
-  que ele reúne (asdaasdsaddf, triippywhale e outros): a renderização do mundo, o
-  relay e o trabalho de memória de onde este fork parte.
-- **[XCL](https://github.com/ivall/xcl)** (GPL-2.0-only) serviu só de referência
-  de como o título se comporta em outra camada; nenhum código foi copiado.
-- As mudanças deste fork foram feitas com o [Claude Code](https://claude.com/claude-code).
-
-## Licença
-
-GPL-3.0-or-later. Veja [LICENSE](LICENSE).
+GPL-3.0-or-later, as VIctory. See [LICENSE](LICENSE); the one file that is not
+covered is named in [docs/asset-policy.md](docs/asset-policy.md).

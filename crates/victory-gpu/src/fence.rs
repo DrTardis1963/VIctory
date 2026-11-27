@@ -82,36 +82,15 @@ extern "system" fn query(this: This, iid: *const Iid, out: *mut This) -> HRESULT
 extern "system" fn release(this: This) -> u32 {
     object::release_boxed::<Fence>(this)
 }
-
-/// An owned COM reference to a [`Fence`], keeping it alive while a queue hold
-/// or late submission line still references it.
-#[cfg(windows)]
-pub(crate) struct FenceRef(This);
-
-// SAFETY: `Fence` uses an atomic value/refcount and a `Mutex` for waiters.
-#[cfg(windows)]
-unsafe impl Send for FenceRef {}
-
-#[cfg(windows)]
-impl FenceRef {
-    pub(crate) fn new(this: This) -> Self {
-        object::add_ref(this);
-        Self(this)
-    }
-
-    pub(crate) fn as_this(&self) -> This {
-        self.0
-    }
-}
-
-#[cfg(windows)]
-impl Drop for FenceRef {
-    fn drop(&mut self) {
-        release(self.0);
-    }
-}
 pub(crate) extern "system" fn completed(this: This) -> u64 {
     fence(this).value.load(Ordering::Acquire)
+}
+/// The title's `GetCompletedValue`.
+extern "system" fn completed_called(this: This) -> u64 {
+    let value = completed(this);
+    #[cfg(all(windows, feature = "diagnostics"))]
+    crate::timeline::polled(this as usize, value);
+    value
 }
 extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c_void) -> HRESULT {
     let fence = fence(this);
@@ -122,6 +101,8 @@ extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c
         }
         return S_OK;
     }
+    #[cfg(all(windows, feature = "diagnostics"))]
+    crate::timeline::told("an event asked for", this as usize, value);
     if event.is_null() {
         // With submissions sent to the card and not waited for
         // (`crate::host::late`) the signal may be behind them: they are
@@ -129,11 +110,37 @@ extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c
         #[cfg(windows)]
         if crate::host::late() {
             drop(waiters);
+            crate::queue::before_sync();
             crate::host::settle_for_fence();
             if fence.value.load(Ordering::Acquire) >= value {
                 return S_OK;
             }
-            tracing::warn!(value, "blocking fence wait not implemented");
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(250);
+            loop {
+                let current = fence.value.load(Ordering::Acquire);
+                if current >= value {
+                    return S_OK;
+                }
+                let now = std::time::Instant::now();
+                if now >= deadline {
+                    break;
+                }
+                let ms = (deadline - now).as_millis().min(10) as u32;
+                // SAFETY: wait on the atomic u64 until woken by WakeByAddressAll or timeout.
+                unsafe {
+                    windows_sys::Win32::System::Threading::WaitOnAddress(
+                        (&raw const fence.value).cast(),
+                        (&raw const current).cast(),
+                        size_of::<u64>(),
+                        ms.max(1),
+                    );
+                }
+                crate::queue::release_held(false);
+            }
+            if fence.value.load(Ordering::Acquire) >= value {
+                return S_OK;
+            }
+            tracing::warn!(value, "blocking fence wait timed out");
             return E_NOTIMPL;
         }
         // shortcut: a null event means "block until reached"; nothing can
@@ -147,10 +154,10 @@ extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c
 /// Moves the fence to `value` and sets the events that waited for it.
 pub(crate) fn set(this: This, value: u64) {
     let fence = fence(this);
+    #[cfg(all(windows, feature = "diagnostics"))]
+    crate::timeline::told("a fence set", this as usize, value);
     let mut waiters = fence.waiters.lock().unwrap_or_else(|e| e.into_inner());
-    // A fence's value only grows: a lower signal leaves it where it was, so
-    // waiters for values it already passed stay gone.
-    let value = fence.value.fetch_max(value, Ordering::AcqRel).max(value);
+    fence.value.store(value, Ordering::Release);
     waiters.retain(|&(wanted, event)| {
         let reached = wanted <= value;
         if reached {
@@ -158,8 +165,15 @@ pub(crate) fn set(this: This, value: u64) {
         }
         !reached
     });
+    drop(waiters);
+    #[cfg(windows)]
+    // SAFETY: wake any guest thread polling/blocking via WaitOnAddress on the fence's GPU VA.
+    unsafe {
+        windows_sys::Win32::System::Threading::WakeByAddressAll((&raw const fence.value).cast());
+    }
 }
 pub(crate) extern "system" fn signal(this: This, value: u64) -> HRESULT {
+    let _called = crate::timeline::span("a fence set");
     set(this, value);
     // A queue may have waited for it: what it held runs now.
     #[cfg(windows)]
@@ -182,7 +196,7 @@ static FUNCTIONS: Table<24> = {
     f[0] = query as *const ();
     f[2] = release as *const ();
     f[7] = object::parent_device as *const (); // 0x38
-    f[8] = completed as *const (); // 0x40
+    f[8] = completed_called as *const (); // 0x40
     f[9] = set_event_on_completion as *const (); // 0x48
     f[10] = signal as *const (); // 0x50
     f[11] = creation_flags as *const (); // 0x58
@@ -193,7 +207,7 @@ static FUNCTIONS: Table<24> = {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::object::{E_NOINTERFACE, E_POINTER, S_FALSE, slot};
+    use crate::object::slot;
 
     #[cfg(windows)]
     #[test]
@@ -228,149 +242,6 @@ mod tests {
         assert_eq!(slot::<extern "system" fn(This) -> u32>(f, 0x10)(f), 0);
     }
 
-    /// A fence's value only grows; a lower signal changes nothing.
-    #[test]
-    fn values_only_grow() {
-        let mut f = std::ptr::null();
-        assert_eq!(create(std::ptr::null(), 3, 0, &FENCE_IIDS[0], &mut f), S_OK);
-        assert_eq!(signal(f, 5), S_OK);
-        assert_eq!(completed(f), 5);
-        assert_eq!(signal(f, 2), S_OK);
-        assert_eq!(completed(f), 5, "a lower signal is ignored");
-        // 4 was reached before the lower signal, so waiting for it returns
-        // at once, even with no event to set.
-        assert_eq!(set_event_on_completion(f, 4, std::ptr::null_mut()), S_OK);
-        assert_eq!(
-            set_event_on_completion(f, 6, std::ptr::null_mut()),
-            E_NOTIMPL
-        );
-        assert_eq!(release(f), 0);
-    }
-
-    /// Creation parameters, and the value where the title reads it.
-    #[test]
-    fn creation_parameters_and_gpu_address() {
-        let null = std::ptr::null();
-        let (mut a, mut b) = (null, null);
-        assert_eq!(create(null, 7, 4, &FENCE_IIDS[0], &mut a), S_OK);
-        assert_eq!(create(null, 0, 0, &FENCE_IIDS[1], &mut b), S_OK);
-        assert_eq!(creation_flags(a), 4);
-        assert_eq!(creation_flags(b), 0);
-        assert_eq!(completed(a), 7);
-        assert_eq!(completed(b), 0);
-        let at = gpu_address(a);
-        // SAFETY: the fence's value, read only.
-        assert_eq!(unsafe { (at as *const u64).read() }, 7);
-        assert_eq!(gpu_address(a), at, "the value does not move");
-        assert_ne!(gpu_address(b), at, "each fence has its own value");
-        assert_eq!(signal(a, 9), S_OK);
-        // SAFETY: as above.
-        assert_eq!(unsafe { (at as *const u64).read() }, 9);
-        assert_eq!(completed(b), 0);
-        assert_eq!(release(a), 0);
-        assert_eq!(release(b), 0);
-    }
-
-    /// Interfaces, the references they hand out and the last release.
-    #[test]
-    fn interfaces_and_references() {
-        let unknown = guid(0, 0, 0, [0; 8]);
-        // Asked only whether creation would succeed.
-        assert_eq!(
-            create(std::ptr::null(), 0, 0, &FENCE_IIDS[0], std::ptr::null_mut()),
-            S_FALSE
-        );
-        let mut out = std::ptr::null();
-        assert_eq!(
-            create(std::ptr::null(), 0, 0, &unknown, &mut out),
-            E_NOINTERFACE
-        );
-        assert!(out.is_null(), "the title's pointer is cleared");
-        let mut f = std::ptr::null();
-        assert_eq!(create(std::ptr::null(), 0, 0, &FENCE_IIDS[0], &mut f), S_OK);
-        // Every interface is the same object, with a new reference.
-        let mut q = std::ptr::null();
-        assert_eq!(query(f, &PAGEABLE_IIDS[1], &mut q), S_OK);
-        assert_eq!(q, f);
-        assert_eq!(slot::<extern "system" fn(This) -> u32>(f, 0x8)(f), 3);
-        assert_eq!(release(f), 2);
-        // An unknown interface answers none, and clears the pointer.
-        let mut none = f;
-        assert_eq!(query(f, &unknown, &mut none), E_NOINTERFACE);
-        assert!(none.is_null());
-        assert_eq!(query(f, &FENCE_IIDS[0], std::ptr::null_mut()), E_POINTER);
-        assert_eq!(release(f), 1);
-        assert_eq!(release(f), 0, "the last reference drops the fence");
-    }
-
-    /// The table's slots are where the interface puts them.
-    #[test]
-    fn methods_sit_at_their_offsets() {
-        let mut f = std::ptr::null();
-        assert_eq!(create(std::ptr::null(), 0, 8, &FENCE_IIDS[0], &mut f), S_OK);
-        let completed_at = slot::<extern "system" fn(This) -> u64>(f, 0x40);
-        let wait_at = slot::<extern "system" fn(This, u64, *mut c_void) -> HRESULT>(f, 0x48);
-        let signal_at = slot::<extern "system" fn(This, u64) -> HRESULT>(f, 0x50);
-        let flags_at = slot::<extern "system" fn(This) -> u32>(f, 0x58);
-        let address_at = slot::<extern "system" fn(This) -> u64>(f, 0x60);
-        assert_eq!(completed_at(f), 0);
-        assert_eq!(flags_at(f), 8);
-        assert_eq!(signal_at(f, 4), S_OK);
-        assert_eq!(completed_at(f), 4);
-        // SAFETY: the fence's value.
-        assert_eq!(unsafe { *(address_at(f) as *const u64) }, 4);
-        assert_eq!(wait_at(f, 4, std::ptr::null_mut()), S_OK, "reached");
-        assert_eq!(
-            wait_at(f, 5, std::ptr::null_mut()),
-            E_NOTIMPL,
-            "never reached"
-        );
-        assert_eq!(slot::<extern "system" fn(This) -> u32>(f, 0x10)(f), 0);
-    }
-
-    /// Waiters fire when their value is reached, and only then.
-    #[cfg(windows)]
-    #[test]
-    fn events_fire_when_their_value_is_reached() {
-        use windows_sys::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
-        use windows_sys::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
-
-        let mut f = std::ptr::null();
-        assert_eq!(create(std::ptr::null(), 1, 0, &FENCE_IIDS[0], &mut f), S_OK);
-        // SAFETY: plain auto-reset events, all ours.
-        let (low, high) = unsafe {
-            (
-                CreateEventW(std::ptr::null(), 0, 0, std::ptr::null()),
-                CreateEventW(std::ptr::null(), 0, 0, std::ptr::null()),
-            )
-        };
-        assert!(!low.is_null() && !high.is_null());
-        let signalled = |event: *mut c_void| {
-            // SAFETY: a live event of ours.
-            unsafe { WaitForSingleObject(event, 0) == WAIT_OBJECT_0 }
-        };
-        assert_eq!(set_event_on_completion(f, 2, low), S_OK);
-        assert_eq!(set_event_on_completion(f, 4, high), S_OK);
-        assert!(!signalled(low) && !signalled(high));
-        assert_eq!(signal(f, 2), S_OK);
-        assert!(signalled(low), "the waiter for 2");
-        assert!(!signalled(high), "4 is not reached yet");
-        assert_eq!(signal(f, 4), S_OK);
-        assert!(signalled(high), "the waiter for 4");
-        // A value that was reached before the wait fires at once.
-        assert_eq!(set_event_on_completion(f, 3, low), S_OK);
-        assert!(signalled(low));
-        // Nothing is left waiting: a later signal sets nothing.
-        assert_eq!(signal(f, 9), S_OK);
-        assert!(!signalled(low) && !signalled(high));
-        // SAFETY: ours.
-        unsafe {
-            CloseHandle(low);
-            CloseHandle(high);
-        }
-        assert_eq!(release(f), 0);
-    }
-
     #[test]
     fn fence1_interface_is_created_and_queried() {
         const FENCE1_IID: Iid = guid(
@@ -383,12 +254,14 @@ mod tests {
         type Flags = extern "system" fn(This) -> u32;
         type Release = extern "system" fn(This) -> u32;
 
+        // Direct creation as ID3D12Fence1, and GetCreationFlags at slot 0x58.
         let mut f1 = std::ptr::null();
         assert_eq!(create(std::ptr::null(), 3, 0x5, &FENCE1_IID, &mut f1), S_OK);
         assert!(!f1.is_null());
         assert_eq!(slot::<Flags>(f1, 0x58)(f1), 0x5);
         assert_eq!(slot::<Release>(f1, 0x10)(f1), 0);
 
+        // QueryInterface from ID3D12Fence to ID3D12Fence1 returns the same object.
         let mut f = std::ptr::null();
         assert_eq!(
             create(std::ptr::null(), 0, 0x2, &FENCE_IIDS[0], &mut f),

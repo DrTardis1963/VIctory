@@ -4,7 +4,6 @@
 //! size. Only in builds with diagnostics.
 
 use std::path::PathBuf;
-use std::sync::{Mutex, OnceLock, mpsc};
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
@@ -179,6 +178,27 @@ fn save_as(name: &str, width: u32, height: u32, pitch: usize, bgra: bool, rows: 
             }
         }
     }
+    let png = encode(w, h, &raw);
+    let path = folder.join(format!("{name}.png"));
+    match std::fs::write(&path, png) {
+        Ok(()) => tracing::info!(path = %path.display(), "frame saved"),
+        Err(e) => tracing::warn!(error = %e, path = %path.display(), "frame not saved"),
+    }
+}
+
+/// A PNG of `width * height` pixels of 8-bit RGB.
+pub(crate) fn png(width: u32, height: u32, rgb: &[u8]) -> Vec<u8> {
+    let row = width as usize * 3;
+    let mut raw = Vec::with_capacity((row + 1) * height as usize);
+    for line in rgb.chunks_exact(row.max(1)) {
+        raw.push(0);
+        raw.extend_from_slice(line);
+    }
+    encode(width, height, &raw)
+}
+
+/// A PNG of rows of RGB, each behind its filter byte.
+fn encode(w: u32, h: u32, raw: &[u8]) -> Vec<u8> {
     let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
     let mut header = Vec::new();
     header.extend(w.to_be_bytes());
@@ -186,15 +206,11 @@ fn save_as(name: &str, width: u32, height: u32, pitch: usize, bgra: bool, rows: 
     header.extend([8, 2, 0, 0, 0]); // 8-bit RGB
     chunk(&mut png, b"IHDR", &header);
     let mut compressed = vec![0u8; zlib_rs::compress_bound(raw.len())];
-    let (idat, rc) = zlib_rs::compress_slice(&mut compressed, &raw, zlib_rs::DeflateConfig::new(3));
+    let (idat, rc) = zlib_rs::compress_slice(&mut compressed, raw, zlib_rs::DeflateConfig::new(3));
     debug_assert_eq!(rc, zlib_rs::ReturnCode::Ok);
     chunk(&mut png, b"IDAT", idat);
     chunk(&mut png, b"IEND", &[]);
-    let path = folder.join(format!("{name}.png"));
-    match std::fs::write(&path, png) {
-        Ok(()) => tracing::info!(path = %path.display(), "frame saved"),
-        Err(e) => tracing::warn!(error = %e, path = %path.display(), "frame not saved"),
-    }
+    png
 }
 
 fn chunk(png: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
@@ -301,73 +317,20 @@ fn read_back_of(
     }
 }
 
-type Frame = (u64, ID3D12Resource, D3D12_PLACED_SUBRESOURCE_FOOTPRINT);
-
-struct Encoder {
-    frames: mpsc::SyncSender<Frame>,
-    finished: mpsc::Receiver<()>,
-}
-
-static ENCODER: OnceLock<Mutex<Option<Encoder>>> = OnceLock::new();
-
-fn encoder() -> Option<Encoder> {
-    if std::env::var_os("VICTORY_CAPTURE_SYNC").is_some() {
-        return None;
-    }
-    let (frames, incoming) = mpsc::sync_channel::<Frame>(2);
-    let (done, finished) = mpsc::channel();
-    std::thread::Builder::new().name("frame PNG encoder".into()).spawn(move || {
-        for (frame, buffer, footprint) in incoming {
-            save_read_back(frame, &buffer, &footprint);
-        }
-        let _ = done.send(());
-    }).ok()?;
-    unsafe extern "C" {
-        fn atexit(callback: extern "C" fn()) -> i32;
-    }
-    // SAFETY: the callback takes no arguments and lives for the whole process.
-    // Registered on first capture, it drains before the loader detaches title threads.
-    if unsafe { atexit(finish_encoding) } != 0 {
-        return None;
-    }
-    Some(Encoder { frames, finished })
-}
-
-extern "C" fn finish_encoding() {
-    if let Some(state) = ENCODER.get() {
-        let worker = state.lock().unwrap_or_else(|e| e.into_inner()).take();
-        if let Some(worker) = worker {
-            drop(worker.frames);
-            let _ = worker.finished.recv();
-        }
-    }
-}
-
-/// Queues a completed GPU readback. Backpressure keeps at most two frames waiting.
-pub(crate) fn finish_frame(frame: u64, buffer: ID3D12Resource, footprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT) {
-    let state = ENCODER.get_or_init(|| Mutex::new(encoder()));
-    let (frame, buffer, footprint) = match state.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
-        Some(worker) => match worker.frames.send((frame, buffer, footprint)) {
-            Ok(()) => return,
-            Err(error) => error.0,
-        },
-        None => (frame, buffer, footprint),
-    };
-    save_read_back(frame, &buffer, &footprint);
-}
-
-/// Saves a frame read back by [`read_back`]: 8-bit color as is, other
-/// formats (a 10-bit swap chain) converted as dumped targets are.
-fn save_read_back(
+/// Saves a frame read back by [`read_back`] (8-bit color only).
+pub(crate) fn save_read_back(
     frame: u64,
     buffer: &ID3D12Resource,
     footprint: &D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
 ) {
     let f = footprint.Footprint;
     let bgra = match f.Format {
-        DXGI_FORMAT_R8G8B8A8_UNORM | DXGI_FORMAT_R8G8B8A8_UNORM_SRGB => Some(false),
-        DXGI_FORMAT_B8G8R8A8_UNORM | DXGI_FORMAT_B8G8R8A8_UNORM_SRGB => Some(true),
-        _ => None,
+        DXGI_FORMAT_R8G8B8A8_UNORM | DXGI_FORMAT_R8G8B8A8_UNORM_SRGB => false,
+        DXGI_FORMAT_B8G8R8A8_UNORM | DXGI_FORMAT_B8G8R8A8_UNORM_SRGB => true,
+        other => {
+            tracing::warn!(format = other.0, "frame not saved: not 8-bit color");
+            return;
+        }
     };
     let mut data = std::ptr::null_mut();
     // SAFETY: the copy finished (every submission is waited for); the
@@ -378,14 +341,7 @@ fn save_read_back(
         }
         let len = f.RowPitch as usize * f.Height as usize;
         let rows = std::slice::from_raw_parts(data.cast::<u8>(), len);
-        let (w, h, pitch) = (f.Width as usize, f.Height as usize, f.RowPitch as usize);
-        match bgra {
-            Some(bgra) => save(frame, f.Width, f.Height, pitch, bgra, rows),
-            None => match to_rgba(f.Format.0 as u32, w, h, pitch, rows) {
-                Some(rgba) => save(frame, f.Width, f.Height, 4 * w, false, &rgba),
-                None => tracing::warn!(format = f.Format.0, "frame not saved: format not handled"),
-            },
-        }
+        save(frame, f.Width, f.Height, f.RowPitch as usize, bgra, rows);
         buffer.Unmap(0, None);
     }
 }
@@ -405,101 +361,8 @@ fn dump_on() -> bool {
     *ON.get_or_init(|| folder().is_some() && crate::switch::on("VICTORY_DUMP_TARGETS"))
 }
 
-/// `VICTORY_SHOW_TARGET=<w>x<h>-f<format>` (e.g. `2560x1440-f28`): the size and format of
-/// the render target to show in place of the title's frame.
-fn show_spec() -> Option<(u64, u32, i32)> {
-    static SPEC: std::sync::OnceLock<Option<(u64, u32, i32)>> = std::sync::OnceLock::new();
-    *SPEC.get_or_init(|| parse_show_spec(&std::env::var("VICTORY_SHOW_TARGET").ok()?))
-}
-
-/// `<w>x<h>-f<format>` as (width, height, DXGI format); `None` if malformed.
-fn parse_show_spec(v: &str) -> Option<(u64, u32, i32)> {
-    let (size, format) = v.trim().split_once("-f")?;
-    let (w, h) = size.split_once('x')?;
-    Some((w.parse().ok()?, h.parse().ok()?, format.parse().ok()?))
-}
-
-#[cfg(test)]
-mod show_tests {
-    #[test]
-    fn show_spec_reads_size_and_format() {
-        assert_eq!(
-            super::parse_show_spec(" 2560x1440-f28 "),
-            Some((2560, 1440, 28))
-        );
-        assert_eq!(super::parse_show_spec("2560x1440"), None);
-        assert_eq!(super::parse_show_spec("2560-f28"), None);
-        assert_eq!(super::parse_show_spec("ax1440-f28"), None);
-    }
-}
-
-/// The last render target bound that matches [`show_spec`].
-static SHOWN: std::sync::Mutex<Option<std::sync::Arc<crate::resource::HostTexture>>> =
-    std::sync::Mutex::new(None);
-
-/// Records, into `list`, a copy of the [`SHOWN`] target to the top left of
-/// `back` (in the copy-destination state); false (nothing recorded) without
-/// one or when the formats differ.
-/// shortcut: copies 1:1 without scaling or conversion; a blit shader would fit any target.
-pub(crate) fn show(list: &ID3D12GraphicsCommandList, back: &ID3D12Resource) -> bool {
-    let Some(shown) = SHOWN.lock().unwrap_or_else(|e| e.into_inner()).clone() else {
-        return false;
-    };
-    let texture = &shown.texture;
-    // SAFETY: live resources.
-    let (d, b) = unsafe { (texture.GetDesc(), back.GetDesc()) };
-    if d.Format != b.Format {
-        return false;
-    }
-    let state = D3D12_RESOURCE_STATES(crate::host::legal_state(
-        texture,
-        shown.state.load(std::sync::atomic::Ordering::Relaxed),
-    ) as i32);
-    let copy = D3D12_RESOURCE_STATE_COPY_SOURCE;
-    let area = D3D12_BOX {
-        right: d.Width.min(b.Width) as u32,
-        bottom: d.Height.min(b.Height),
-        back: 1,
-        ..Default::default()
-    };
-    // SAFETY: an open list of ours; both live, `back` already a copy destination.
-    unsafe {
-        if state != copy {
-            list.ResourceBarrier(&[crate::host::transition(texture, state, copy)]);
-        }
-        let dst = D3D12_TEXTURE_COPY_LOCATION {
-            pResource: std::mem::transmute_copy(back),
-            Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
-            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-                SubresourceIndex: 0,
-            },
-        };
-        let src = D3D12_TEXTURE_COPY_LOCATION {
-            pResource: std::mem::transmute_copy(texture),
-            Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
-            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-                SubresourceIndex: 0,
-            },
-        };
-        list.CopyTextureRegion(&dst, 0, 0, 0, &src, Some(&area));
-        if state != copy {
-            list.ResourceBarrier(&[crate::host::transition(texture, copy, state)]);
-        }
-    }
-    true
-}
-
 /// Notes a title texture the frame being built renders to or writes.
 pub(crate) fn note_target(resource: crate::object::This) {
-    if let Some((w, h, f)) = show_spec()
-        && let Some(copy) = crate::resource::host_copy(resource)
-    {
-        // SAFETY: a live resource.
-        let d = unsafe { copy.texture.GetDesc() };
-        if (d.Width, d.Height, d.Format.0) == (w, h, f) {
-            *SHOWN.lock().unwrap_or_else(|e| e.into_inner()) = Some(copy);
-        }
-    }
     if resource.is_null() || !dump_on() || !listed(crate::queue::presented() + 1) {
         return;
     }
@@ -980,69 +843,6 @@ pub(crate) fn recent_levels() -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn queued_frames_are_saved_at_title_exit() {
-        use super::*;
-        const CHILD: &str = "VICTORY_TEST_CAPTURE_EXIT";
-        const NO_ADAPTER: i32 = 77;
-        if std::env::var_os(CHILD).is_none() {
-            let dir = tempfile::tempdir().unwrap();
-            let child = std::process::Command::new(std::env::current_exe().unwrap())
-                .args(["--exact", "capture::tests::queued_frames_are_saved_at_title_exit"])
-                .env(CHILD, "1")
-                .env("VICTORY_CAPTURE", dir.path())
-                .env_remove("VICTORY_CAPTURE_SYNC")
-                .output().unwrap();
-            if child.status.code() == Some(NO_ADAPTER) {
-                eprintln!("no D3D12 adapter available for the PNG readback test");
-                return;
-            }
-            assert!(child.status.success(), "{}", String::from_utf8_lossy(&child.stderr));
-            let reference = std::fs::read(dir.path().join("frame-0.png")).unwrap();
-            for frame in 1..=4 {
-                assert_eq!(std::fs::read(dir.path().join(format!("frame-{frame}.png"))).unwrap(), reference);
-            }
-            return;
-        }
-
-        let Some(host) = crate::host::host() else { std::process::exit(NO_ADAPTER) };
-        let (width, height, pitch) = (514usize, 256usize, 2304usize);
-        let mut rows = vec![0x66; pitch * height];
-        for y in 0..height {
-            for x in 0..width {
-                let i = y * pitch + x * 4;
-                rows[i..i + 4].copy_from_slice(&[(x as u8).wrapping_mul(25), (y as u8).wrapping_mul(40), 201, 255]);
-            }
-        }
-        save(0, width as u32, height as u32, pitch, true, &rows);
-        let (upload, ptr) = host.upload_buffer(rows.len() as u64).unwrap();
-        let buffer = host.read_back_buffer(rows.len() as u64).unwrap();
-        let list = host.new_list().unwrap();
-        // SAFETY: each buffer has room for all the padded rows; execute waits for the copy.
-        unsafe {
-            std::ptr::copy_nonoverlapping(rows.as_ptr(), ptr, rows.len());
-            list.list.CopyBufferRegion(&buffer, 0, &upload, 0, rows.len() as u64);
-        }
-        list.close();
-        host.execute(&[&list]);
-        let footprint = D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
-            Offset: 0,
-            Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
-                Format: DXGI_FORMAT_B8G8R8A8_UNORM, Width: width as u32, Height: height as u32,
-                Depth: 1, RowPitch: pitch as u32,
-            },
-        };
-        for frame in 1..=4 {
-            finish_frame(frame, buffer.clone(), footprint);
-        }
-        assert!(ENCODER.get().unwrap().lock().unwrap().is_some());
-        unsafe extern "C" {
-            #[link_name = "exit"] fn crt_exit(code: i32) -> !;
-        }
-        // SAFETY: this child is finished. Titles use the same CRT exit path.
-        unsafe { crt_exit(0) }
-    }
-
     #[test]
     fn crc_matches_the_png_check_value() {
         assert_eq!(super::crc32(b"IEND"), 0xae42_6082);

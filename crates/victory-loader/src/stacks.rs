@@ -66,10 +66,8 @@ struct BasicInfo {
 #[repr(C, align(16))]
 struct Aligned(CONTEXT);
 
-/// Prints every other thread's stack to stderr. Each thread is suspended
-/// only while its context is read and unwound into a buffer allocated
-/// beforehand (it may hold the heap lock).
-pub fn dump_stacks() {
+/// The ids of this process's threads but the caller's.
+pub(crate) fn other_threads() -> Vec<u32> {
     // SAFETY: plain queries and a snapshot of this process's threads.
     let (me, process, snapshot) = unsafe {
         (
@@ -79,7 +77,7 @@ pub fn dump_stacks() {
         )
     };
     if snapshot == INVALID_HANDLE_VALUE {
-        return;
+        return Vec::new();
     }
     let mut ids = Vec::new();
     // SAFETY: zeroed is a valid THREADENTRY32; its size is set before use.
@@ -96,6 +94,23 @@ pub fn dump_stacks() {
     }
     // SAFETY: we opened it.
     unsafe { CloseHandle(snapshot) };
+    ids
+}
+
+/// Names an address of ours (function, inlined calls, source line), for
+/// [`dump_stacks`]: set by a crate that reads symbols (the GPU layer's).
+static SYMBOLS: std::sync::OnceLock<fn(usize) -> Option<String>> = std::sync::OnceLock::new();
+
+/// Registers [`SYMBOLS`] (once).
+pub fn set_symbolizer(f: fn(usize) -> Option<String>) {
+    let _ = SYMBOLS.set(f);
+}
+
+/// Prints every other thread's stack to stderr. Each thread is suspended
+/// only while its context is read and unwound into a buffer allocated
+/// beforehand (it may hold the heap lock).
+pub fn dump_stacks() {
+    let ids = other_threads();
     eprintln!("VIctory: stacks of {} threads", ids.len());
     for id in ids {
         // SAFETY: opens a thread of our own process.
@@ -109,14 +124,45 @@ pub fn dump_stacks() {
         if thread.is_null() {
             continue;
         }
-        let (frames, (priority, base)) = frames_of(thread);
+        let (frames, (priority, base, affinity)) = frames_of(thread);
         eprintln!(
-            "  thread {id} \"{}\" start {} priority {priority} (base {base})",
+            "  thread {id} \"{}\" start {} priority {priority} (base {base}) affinity {affinity:#x}",
             name_of(thread),
             locate(start_of(thread))
         );
+        let symbols = SYMBOLS.get();
+        // (Hang watch) Our innermost frame named, and the outermost frame
+        // of ours the thread entered from other code (a title thread: the
+        // entry point it is inside).
+        let (mut innermost, mut entry) = (None, None);
         for (i, pc) in frames.into_iter().enumerate() {
-            eprintln!("    #{i:<2} {}", locate(pc as usize));
+            let at = locate(pc as usize);
+            // Return addresses: the call is the byte before.
+            let name = symbols.and_then(|s| s(if i == 0 { pc as usize } else { (pc as usize).saturating_sub(1) }));
+            if let Some(n) = &name
+                && at.starts_with("victory.exe+")
+            {
+                // The frame's functions, outermost first (inlined calls).
+                let chain: Vec<&str> = n.split(" (").next().unwrap_or(n).split(" > ").collect();
+                let runtime = |s: &&str| ["std::", "core::", "alloc::"].iter().any(|p| s.starts_with(p));
+                if innermost.is_none()
+                    && let Some(ours) = chain.iter().rev().find(|s| !runtime(s))
+                {
+                    // Our innermost function, its line, and the runtime
+                    // call it is in (a lock, a wait), if any.
+                    let line = n.find(" (").map_or("", |i| &n[i..]);
+                    let inner = chain.last().filter(|s| runtime(s)).map_or(String::new(), |s| format!(" in {s}"));
+                    innermost = Some(format!("{ours}{line}{inner}"));
+                }
+                entry = Some(chain[0].to_string());
+            }
+            match name {
+                Some(n) => eprintln!("    #{i:<2} {at}  {n}"),
+                None => eprintln!("    #{i:<2} {at}"),
+            }
+        }
+        if let (Some(inner), Some(entry)) = (innermost, entry) {
+            eprintln!("    = in {inner}, entered at {entry}");
         }
         // SAFETY: we opened it.
         unsafe { CloseHandle(thread) };
@@ -124,7 +170,7 @@ pub fn dump_stacks() {
 }
 
 /// The thread's frames and its current and base scheduling priority (0-31).
-fn frames_of(thread: HANDLE) -> (Vec<u64>, (i32, i32)) {
+pub(crate) fn frames_of(thread: HANDLE) -> (Vec<u64>, (i32, i32, usize)) {
     let mut frames = Vec::with_capacity(MAX_FRAMES);
     let mut info: BasicInfo = BasicInfo {
         exit_status: 0,
@@ -138,7 +184,7 @@ fn frames_of(thread: HANDLE) -> (Vec<u64>, (i32, i32)) {
     // the query and the read below.
     // SAFETY: a thread of this process that is not this one.
     if unsafe { SuspendThread(thread) } == u32::MAX {
-        return (frames, (0, 0));
+        return (frames, (0, 0, 0));
     }
     // SAFETY: writes `info`, whose layout and size are the system's.
     let status = unsafe {
@@ -153,7 +199,7 @@ fn frames_of(thread: HANDLE) -> (Vec<u64>, (i32, i32)) {
     if status != 0 || info.teb.is_null() {
         // SAFETY: suspended above.
         unsafe { ResumeThread(thread) };
-        return (frames, (0, 0));
+        return (frames, (0, 0, 0));
     }
     // SAFETY: the TEB of a suspended thread of this process: its NT_TIB
     // holds the stack base at +8 and the stack limit at +0x10.
@@ -170,10 +216,10 @@ fn frames_of(thread: HANDLE) -> (Vec<u64>, (i32, i32)) {
         }
         ResumeThread(thread);
     }
-    (frames, (info.priority, info.base_priority))
+    (frames, (info.priority, info.base_priority, info.affinity))
 }
 
-fn start_of(thread: HANDLE) -> usize {
+pub(crate) fn start_of(thread: HANDLE) -> usize {
     let mut start = 0usize;
     // SAFETY: writes one pointer-sized start address.
     unsafe {
@@ -188,7 +234,7 @@ fn start_of(thread: HANDLE) -> usize {
     start
 }
 
-fn name_of(thread: HANDLE) -> String {
+pub(crate) fn name_of(thread: HANDLE) -> String {
     let mut name = std::ptr::null_mut();
     // SAFETY: the system allocates the string; we free it with LocalFree.
     unsafe {

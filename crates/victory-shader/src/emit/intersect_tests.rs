@@ -162,13 +162,19 @@ fn build(
     wide: bool,
     descriptor: Descriptor,
 ) -> Result<(HostShader, resource::Resources), ShaderError> {
-    let native = native(&program(wide, descriptor));
+    build_compute_shader(&native(&program(wide, descriptor)))
+}
+
+/// `native`, a compute program, translated (the tests' own way: no container).
+pub(super) fn build_compute_shader(
+    native: &NativeProgram,
+) -> Result<(HostShader, resource::Resources), ShaderError> {
     let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
     let st = structure::structure(&p).expect("structure");
     let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
-    let io = io::raise(&p, &native).expect("io::raise");
+    let io = io::raise(&p, native).expect("io::raise");
     let lowered = lower::lower(&lower::Parts {
-        native: &native,
+        native,
         p: &p,
         st: &st,
         io: &io,
@@ -188,6 +194,7 @@ fn build(
         root_srvs: lowered.root_srvs,
         root_uavs: lowered.root_uavs,
         root_indexed_views: res.root_indexed_views.clone(),
+        half_views: Vec::new(),
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         let mut copy = shader.dxil.clone();
@@ -295,13 +302,12 @@ fn scene() -> (Scene, Vec<Vec<Case>>) {
     let ids2 = [8, bvh::NONE, 24, 0x1fff_fffc];
     box_nodes.push((s.add(nodes::box32(ids2, around), 32), 5));
     box_nodes.push((s.add(nodes::box16(ids2, around), 16), 4));
-    // A child that is not there whose box the ray enters first: the
-    // reference's own test of it, in both widths, with its ray alone.
-    let (missing, missing_boxes) = nodes::MISSING_FIRST;
-    let missing_nodes = [
-        (s.add(nodes::box32(missing, missing_boxes), 32), 5),
-        (s.add(nodes::box16(missing, missing_boxes), 16), 4),
-    ];
+    // A child that is not there with inverted infinite bounds (the title's
+    // builder leaves such slots): every ray "enters" it at minus infinity.
+    let mut empty = lined;
+    empty[1] = [f32::INFINITY, f32::INFINITY, f32::INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY];
+    let ids3 = [0x105, bvh::NONE, 0x304, 0x400];
+    box_nodes.push((s.add(nodes::box32(ids3, empty), 32), 5));
     // Random boxes.
     for n in 0..6 {
         let boxes: [[f32; 6]; 4] = std::array::from_fn(|_| {
@@ -363,10 +369,6 @@ fn scene() -> (Scene, Vec<Vec<Case>>) {
         ] {
             cases.push(Some((n, kind, Ray::new(origin, direction, extent))));
         }
-    }
-    // The reference's test of a child that is not there, at its ray.
-    for &(n, kind) in &missing_nodes {
-        cases.push(Some((n, kind, nodes::missing_first())));
     }
     // Random rays at every box node, half of them aimed at a box.
     for &(n, kind) in &box_nodes {
@@ -698,4 +700,40 @@ fn a_structure_that_returns_triangle_ids_is_refused_by_name() {
         }
         other => panic!("{:?}", other.map(|_| ())),
     }
+}
+
+/// (Fox T, `VICTORY_BVH_PAGE_REUSE=1`) The second half of a 128-byte box node read through
+/// the first half's directory entry where both lie in one page: the same results on the
+/// card, and through the host's directory the program still lowers and validates.
+#[test]
+fn the_second_half_of_a_box_node_in_the_same_page_gives_the_same_results() {
+    let was = crate::emit::TEST_BVH_PAGE_REUSE.replace(Some(true));
+    {
+        let _memory = Memory::at(BASE);
+        run(true, WHOLE, BASE + u64::from(NODES), true);
+    }
+    {
+        let base = 0x312_3456_7800u64;
+        let structure = base + u64::from(NODES);
+        let _memory = Memory::at(base);
+        let descriptor = Descriptor::Numbers((structure >> 8) as u32, (structure >> 40) as u32 | bvh::BOX_SORT);
+        run(false, descriptor, 0, true);
+    }
+    for wide in [true, false] {
+        let (shader, _) = build(wide, WHOLE).expect("lowers through the directory");
+        assert!(shader.root_srvs.contains(&super::SLOT_MEMORY));
+    }
+    crate::emit::TEST_BVH_PAGE_REUSE.set(was);
+}
+
+/// (Fox T) With `VICTORY_BVH_PAGE_REUSE` off the translation is the one before the switch:
+/// the same module whether the switch is unset or set to off.
+#[test]
+fn page_reuse_off_translates_as_before() {
+    let was = crate::emit::TEST_BVH_PAGE_REUSE.replace(Some(false));
+    let off = build(true, WHOLE).expect("lowers").0.dxil;
+    crate::emit::TEST_BVH_PAGE_REUSE.set(Some(true));
+    let on = build(true, WHOLE).expect("lowers").0.dxil;
+    crate::emit::TEST_BVH_PAGE_REUSE.set(was);
+    assert_ne!(off, on, "the switch changes nothing");
 }

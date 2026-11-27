@@ -123,42 +123,6 @@ impl Host {
         }
     }
 
-    /// Tells the translator what a run on this GPU tells it (victory-gpu's device setup and
-    /// `probe_view_limit`): its widest wave and whether it caps view heaps at 1 000 000, so
-    /// offline translations are the ones a run makes.
-    pub fn set_translation_limits(&self) {
-        const PORTABLE_VIEWS: u32 = 1_000_000;
-        // SAFETY: a feature query with a valid out pointer, and a heap released at once.
-        unsafe {
-            let mut o1 = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
-            if self
-                .device
-                .CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS1, (&raw mut o1).cast(), size_of_val(&o1) as u32)
-                .is_ok()
-            {
-                super::set_host_max_wave(o1.WaveLaneCountMax);
-            }
-            let mut o0 = D3D12_FEATURE_DATA_D3D12_OPTIONS::default();
-            if self
-                .device
-                .CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, (&raw mut o0).cast(), size_of_val(&o0) as u32)
-                .is_ok()
-            {
-                super::set_host_rovs(o0.ROVsSupported.as_bool());
-            }
-            let made: windows::core::Result<ID3D12DescriptorHeap> =
-                self.device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
-                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-                    NumDescriptors: PORTABLE_VIEWS + 1,
-                    Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
-                    NodeMask: 0,
-                });
-            if made.is_err() {
-                super::set_view_heap_limit(PORTABLE_VIEWS - 1);
-            }
-        }
-    }
-
     /// The root signature translated shaders expect: user data per stage
     /// at `b0`, immediate samplers per stage at `s<n>`, heaps directly
     /// indexed.
@@ -648,6 +612,7 @@ fn stub(pixel: bool, outputs: Vec<SigElement>) -> HostShader {
         root_srvs: Vec::new(),
         root_uavs: Vec::new(),
         root_indexed_views: Vec::new(),
+        half_views: Vec::new(),
     }
 }
 
@@ -1030,8 +995,8 @@ fn transition(
 pub enum View<'a> {
     /// An RGBA32F texture SRV (width, height, texels).
     Texture(u32, u32, &'a [[f32; 4]]),
-    /// An RGBA32F cube SRV (face size, texels of faces +x -x +y -y +z -z).
-    Cube(u32, &'a [[f32; 4]]),
+    /// An RGBA32F cube SRV (face size, mip count, texels in D3D subresource order).
+    Cube(u32, u16, &'a [[f32; 4]]),
     /// A raw buffer UAV of this many dwords, zeroed.
     RawUav(u32),
     /// An RGBA32F texture UAV (width, height), zeroed.
@@ -1040,6 +1005,12 @@ pub enum View<'a> {
     UintTextureUav(u32, u32),
     /// A typed RGBA16F buffer UAV of this many elements, zeroed.
     HalfUav(u32),
+    /// A typed buffer UAV pre-filled with `data` (`format`, bytes per element).
+    TypedUav {
+        data: &'a [u32],
+        format: DXGI_FORMAT,
+        elem_bytes: u32,
+    },
     /// A constant buffer of these dwords.
     Cbv(&'a [u32]),
     /// A buffer SRV over these dwords.
@@ -1206,20 +1177,23 @@ impl Host {
                 at.ptr += i * view_size;
                 match *v {
                     View::Texture(..) | View::Cube(..) => {
-                        let (w, h, texels, faces) = match *v {
-                            View::Texture(w, h, t) => (w, h, t, 1),
-                            View::Cube(n, t) => (n, n, t, 6),
+                        let (w, h, mut texels, faces, mips) = match *v {
+                            View::Texture(w, h, t) => (w, h, t, 1, 1),
+                            View::Cube(n, mips, t) => (n, n, t, 6, mips),
                             _ => unreachable!(),
                         };
                         let mut desc = texture(w, h, D3D12_RESOURCE_FLAG_NONE);
                         desc.DepthOrArraySize = faces as u16;
+                        desc.MipLevels = mips;
                         let tex = make(
                             D3D12_HEAP_TYPE_DEFAULT,
                             &desc,
                             D3D12_RESOURCE_STATE_COPY_DEST,
                         )?;
-                        let pitch = (w as usize * 16).next_multiple_of(256);
-                        for face in 0..faces as usize {
+                        for sub in 0..u32::from(mips) * faces {
+                            let mip = sub % u32::from(mips);
+                            let (w, h) = ((w >> mip).max(1), (h >> mip).max(1));
+                            let pitch = (w as usize * 16).next_multiple_of(256);
                             let upload = make(
                                 D3D12_HEAP_TYPE_UPLOAD,
                                 &buffer((pitch * h as usize) as u64, D3D12_RESOURCE_FLAG_NONE),
@@ -1227,9 +1201,10 @@ impl Host {
                             )?;
                             let mut p = std::ptr::null_mut();
                             upload.Map(0, None, Some(&mut p)).map_err(err)?;
-                            let texels = &texels[face * (w * h) as usize..];
+                            let (level, rest) = texels.split_at((w * h) as usize);
+                            texels = rest;
                             for y in 0..h as usize {
-                                let row = &texels[y * w as usize..(y + 1) * w as usize];
+                                let row = &level[y * w as usize..(y + 1) * w as usize];
                                 std::ptr::copy_nonoverlapping(
                                     row.as_ptr().cast::<u8>(),
                                     p.cast::<u8>().add(y * pitch),
@@ -1238,7 +1213,7 @@ impl Host {
                             }
                             upload.Unmap(0, None);
                             let mut at_face = subresource(&tex);
-                            at_face.Anonymous.SubresourceIndex = face as u32;
+                            at_face.Anonymous.SubresourceIndex = sub;
                             list.CopyTextureRegion(
                                 &at_face,
                                 0,
@@ -1260,7 +1235,7 @@ impl Host {
                             Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
                             Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
                                 TextureCube: D3D12_TEXCUBE_SRV {
-                                    MipLevels: 1,
+                                    MipLevels: u32::from(mips),
                                     ..Default::default()
                                 },
                             },
@@ -1299,6 +1274,46 @@ impl Host {
                                 Buffer: D3D12_BUFFER_UAV {
                                     NumElements: elements,
                                     Flags: flags,
+                                    ..Default::default()
+                                },
+                            },
+                        };
+                        dev.CreateUnorderedAccessView(&b, None, Some(&desc), at);
+                        let rb = make(
+                            D3D12_HEAP_TYPE_READBACK,
+                            &buffer(bytes, D3D12_RESOURCE_FLAG_NONE),
+                            D3D12_RESOURCE_STATE_COPY_DEST,
+                        )?;
+                        uavs.push((b, None, n, rb));
+                    }
+                    View::TypedUav {
+                        data,
+                        format,
+                        elem_bytes,
+                    } => {
+                        let n = data.len() as u32;
+                        let bytes = u64::from(n) * 4;
+                        let elements = (bytes / u64::from(elem_bytes)) as u32;
+                        let b = make(
+                            D3D12_HEAP_TYPE_DEFAULT,
+                            &buffer(bytes, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS),
+                            D3D12_RESOURCE_STATE_COPY_DEST,
+                        )?;
+                        let up = upload(data)?;
+                        list.CopyBufferRegion(&b, 0, &up, 0, bytes);
+                        list.ResourceBarrier(&[transition(
+                            &b,
+                            D3D12_RESOURCE_STATE_COPY_DEST,
+                            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                        )]);
+                        keep.push(up);
+                        let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                            Format: format,
+                            ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+                            Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                                Buffer: D3D12_BUFFER_UAV {
+                                    NumElements: elements,
+                                    Flags: D3D12_BUFFER_UAV_FLAG_NONE,
                                     ..Default::default()
                                 },
                             },

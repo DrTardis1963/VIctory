@@ -83,11 +83,6 @@ pub fn load(prepared: &PreparedImage, dir: &Path) -> Result<LoadedImage> {
         // SAFETY: just mapped, and no title code has run.
         unsafe { crate::tls::redirect(loaded.base(), &loaded.info) }?;
     }
-    if std::env::var_os(crate::hooks::NO_WATCHDOG_ENV).is_some() {
-        // SAFETY: just mapped, and no title code has run.
-        let applied = unsafe { crate::hooks::disarm_watchdog(loaded.base(), &prepared.original_hash) };
-        tracing::info!(applied, "title watchdog hooks ({})", crate::hooks::NO_WATCHDOG_ENV);
-    }
     tracing::info!(
         base = format_args!("{:#x}", loaded.base()),
         preferred = format_args!("{:#x}", loaded.info.image_base),
@@ -150,46 +145,17 @@ fn map_dll(
     seen: &mut HashSet<String>,
     loaded: &mut Vec<(String, LoadedImage)>,
 ) -> Result<()> {
-    let key = name.to_ascii_lowercase();
-    if !seen.insert(key.clone()) || !wanted(&key) {
+    let name = name.to_ascii_lowercase();
+    let path = dirs.0.join(&name);
+    if !seen.insert(name.clone()) || !wanted(&name) || !path.is_file() {
         return Ok(());
     }
-    let Some(path) = file_in(dirs.0, name) else {
-        return Ok(());
-    };
     let original = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
     let prepared = prepare(&original).with_context(|| format!("preparing {}", path.display()))?;
     let image = load(&prepared, dirs.1).with_context(|| format!("loading {}", path.display()))?;
     map_imports(&image.info, dirs, wanted, seen, loaded)?;
-    loaded.push((key, image));
+    loaded.push((name, image));
     Ok(())
-}
-
-/// The file `name` in `dir`, its case ignored as the Windows loader ignores
-/// it. A folder can be case-sensitive (WSL makes the folders it creates
-/// so), where joining the name finds only that exact spelling.
-fn file_in(dir: &Path, name: &str) -> Option<PathBuf> {
-    if name.is_empty()
-        || name == "."
-        || name == ".."
-        || name.contains(['/', '\\', ':'])
-    {
-        return None;
-    }
-    let exact = dir.join(name);
-    if exact.is_file() {
-        return Some(exact);
-    }
-    std::fs::read_dir(dir)
-        .ok()?
-        .filter_map(Result::ok)
-        .find(|e| {
-            e.file_name()
-                .to_str()
-                .is_some_and(|n| n.eq_ignore_ascii_case(name))
-        })
-        .map(|e| e.path())
-        .filter(|p| p.is_file())
 }
 
 /// Resolves through `inner`, then through the exports of the title's DLLs.
@@ -216,13 +182,8 @@ impl ImportResolver for WithTitleDlls<'_> {
 }
 
 fn write_if_changed(path: &Path, bytes: &[u8]) -> Result<()> {
-    if std::fs::read(path).is_ok_and(|existing| existing == bytes) {
-        return Ok(());
-    }
-    let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, bytes).with_context(|| format!("writing {}", tmp.display()))?;
-    std::fs::rename(&tmp, path).with_context(|| format!("renaming to {}", path.display()))?;
-    Ok(())
+    crate::publish::write_if_changed(path, bytes)
+        .with_context(|| format!("publishing {}", path.display()))
 }
 
 impl LoadedImage {

@@ -27,12 +27,22 @@
 //!   store may fall between any two reads or before both: the title's code
 //!   cannot tell which).
 //!
+//! - [`HOIST`] (`VICTORY_HOIST_LOADS=1`, not in [`DEFAULT`]): a read no store
+//!   of the module can change (through a shader resource view, or any read in
+//!   a module that writes no memory at all: no store or atomic to a view,
+//!   title memory or group-shared memory) is a value of its operands like
+//!   arithmetic: [`REUSE`] then takes a read that every path to it has
+//!   already made, in any block above it; and an instruction of a loop
+//!   whose operands all come from outside the loop is computed once, before
+//!   the loop (in its preheader). Not hoisted: samples, derivatives and
+//!   level-of-detail queries (they depend on the other lanes of the quad
+//!   where they run), wave and quad operations, divisions (by zero in a
+//!   loop that never ran), anything with an effect.
+//!
 //! Which passes run is `emit::shader_opt()` (`VICTORY_SHADER_OPT`), part of
 //! the translation and so of the shader cache's key.
 
-// (the tables below are looked up by key only, never walked: their order is
-// no part of the result)
-use crate::structure::Map;
+use std::collections::HashMap;
 
 use super::{
     Attr, Bin, Cast, Const, Func, MdDef, Module, Op, Term, Ty, TypeDef, V, for_each_operand, pred,
@@ -54,10 +64,26 @@ pub const LOADS: u32 = 16;
 /// half has a lane where every lane is in EXEC (`lower.rs`,
 /// `v_readfirstlane_b32`).
 pub const FIRST: u32 = 32;
+/// Not a pass over the module either: the lowering reads the dwords of one
+/// console load (`s_buffer_load_dwordx2` to `x16` from an SRV, a
+/// `global_load_dwordx2` to `x4`) by one call for every four of them, not
+/// by a call each (`lower.rs`, `raw_dwords`). The same bytes are read.
+/// From fxceless/victory-fork c36971b2. On an RX 7900 XTX it is worth nothing:
+/// the yard's frame replayed turn by turn, dispatches and draws 18.47 -> 18.45
+/// ms (12 loops) and 18.23 -> 18.16 (5 loops): the driver joins the loads.
+pub const WIDE: u32 = 64;
+/// Reads reused across blocks and loop-invariant instructions computed
+/// before their loop, in modules that write no memory (see the module's
+/// notes). Not in [`DEFAULT`]: `VICTORY_HOIST_LOADS=1` adds it.
+pub const HOIST: u32 = 128;
 /// The passes over the module.
-pub const MODULE: u32 = DEAD | FOLD | REUSE | FACTS | LOADS;
+pub const MODULE: u32 = DEAD | FOLD | REUSE | FACTS | LOADS | HOIST;
 /// Every pass.
-pub const ALL: u32 = MODULE | FIRST;
+pub const ALL: u32 = MODULE | FIRST | WIDE;
+/// The passes that run when nothing says which: every one but [`WIDE`],
+/// which no card has shown a gain for yet (`VICTORY_SHADER_OPT=127` asks
+/// for it).
+pub const DEFAULT: u32 = ALL & !WIDE & !HOIST;
 
 /// What the instructions a module writes use, of the features a shader
 /// declares by flag (the validator's "flags must match usage").
@@ -65,8 +91,8 @@ pub const ALL: u32 = MODULE | FIRST;
 pub(crate) struct Usage {
     /// A wave or quad operation.
     pub wave_ops: bool,
-    /// `dx.op.attributeAtVertex.*` (shader barycentrics).
-    pub barycentrics: bool,
+    /// A rasterizer ordered view.
+    pub rovs: bool,
     /// A 64-bit integer, as a result or an operand.
     pub int64: bool,
     /// A typed load of several components from a UAV.
@@ -77,7 +103,12 @@ pub(crate) struct Usage {
     pub heap_samplers: bool,
     /// A 64-bit atomic.
     pub atomic64: bool,
+    /// A 64-bit float, as a result or an operand.
+    pub doubles: bool,
 }
+
+/// [`HOIST`]: instructions moved before their loop, since the start.
+pub static HOISTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// What makes two instructions without an effect the same value.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -123,8 +154,8 @@ fn opposite(p: u8) -> u8 {
 /// and comparisons (by their operands) with a known outcome.
 #[derive(Default)]
 struct Facts {
-    bits: Map<V, bool>,
-    compares: Map<(u8, V, V), bool>,
+    bits: HashMap<V, bool>,
+    compares: HashMap<(u8, V, V), bool>,
 }
 
 /// The facts a block added, to forget when its part of the tree is done.
@@ -200,12 +231,6 @@ pub(super) enum Effect {
 pub(super) fn effect(f: &Func) -> Effect {
     let name = f.name.strip_prefix("dx.op.").unwrap_or(&f.name);
     match f.attr {
-        // Reusing `annotateHandle` across basic blocks crashes AMD's DXIL
-        // compiler (`amdxc64.dll`, access violation) on compute programs
-        // that use a heap handle in several blocks. Treating it as
-        // block-local (`Lanes`) keeps same-block load reuse and dead-code
-        // removal while letting each block keep its own handle annotation.
-        Some(Attr::ReadNone) if name == "annotateHandle" => Effect::Lanes,
         Some(Attr::ReadNone) => Effect::Pure,
         // A shader cannot write a constant buffer or resize a resource.
         Some(Attr::ReadOnly)
@@ -239,9 +264,188 @@ impl Module {
                 }
             }
         }
+        if passes & HOIST != 0 {
+            let quiet = !self.writes_memory();
+            for _ in 0..4 {
+                if !self.hoist(quiet) {
+                    break;
+                }
+            }
+            if passes & REUSE != 0 {
+                self.merge(passes);
+            }
+        }
         if passes & DEAD != 0 {
             self.drop_dead();
         }
+    }
+
+    /// [`HOIST`]: whether any reached instruction writes memory (a view, title
+    /// memory, group-shared memory): stores, atomics, compare-exchanges.
+    fn writes_memory(&self) -> bool {
+        let reached = self.reached();
+        self.blocks.iter().enumerate().filter(|(b, _)| reached[*b]).any(|(_, blk)| {
+            blk.body.iter().any(|&i| match &self.insts[i as usize].op {
+                Op::Store(..) | Op::AtomicRmw(..) | Op::CmpXchg(..) => true,
+                Op::Call(f, _) => {
+                    let func = &self.funcs[*f as usize];
+                    let name = func.name.strip_prefix("dx.op.").unwrap_or(&func.name);
+                    effect(func) == Effect::Writes
+                        && (name.contains("tomic")
+                            || name.contains("Exchange")
+                            || name.starts_with("rawBufferStore")
+                            || name.starts_with("bufferStore")
+                            || name.starts_with("textureStore")
+                            || name.contains("Feedback"))
+                }
+                _ => false,
+            })
+        })
+    }
+
+    /// [`HOIST`]: whether instruction `i` may be computed earlier than where it
+    /// stands, and once for every iteration of a loop (the module writes no
+    /// memory).
+    /// `quiet`: the module writes no memory; otherwise only reads through
+    /// shader resource views (no UAV bit in the handle's annotation, which no
+    /// store of the module can go through) count as values of their operands.
+    fn hoistable(&self, i: u32, quiet: bool) -> bool {
+        match &self.insts[i as usize].op {
+            Op::Bin(b, ..) => !matches!(b, Bin::UDiv | Bin::SDiv | Bin::URem),
+            Op::Cast(..) | Op::Cmp(..) | Op::Select(..) | Op::Extract(..) | Op::Gep(..) => true,
+            Op::Load(..) => quiet,
+            Op::Call(f, args) => {
+                let func = &self.funcs[*f as usize];
+                let name = func.name.strip_prefix("dx.op.").unwrap_or(&func.name);
+                let ok = match effect(func) {
+                    Effect::Pure => true,
+                    Effect::Reads => quiet || args.get(1).is_some_and(|&h| self.srv_handle(h)),
+                    _ => false,
+                };
+                ok && !name.starts_with("sample")
+                    && !name.starts_with("calculateLOD")
+                    && !name.starts_with("deriv")
+                    && !name.starts_with("textureGather")
+                    && !name.contains("Helper")
+            }
+            _ => false,
+        }
+    }
+
+    /// [`HOIST`]: whether `h` is a handle annotated as a shader resource view
+    /// (kind without the UAV bit 0x1000).
+    fn srv_handle(&self, h: V) -> bool {
+        let V::Inst(a) = h else { return false };
+        let Op::Call(f, args) = &self.insts[a as usize].op else {
+            return false;
+        };
+        if self.funcs[*f as usize].name != "dx.op.annotateHandle" {
+            return false;
+        }
+        let Some(&V::Const(props)) = args.get(2) else {
+            return false;
+        };
+        let Const::Aggregate(fields) = &self.consts[props as usize].1 else {
+            return false;
+        };
+        matches!(&self.consts[fields[0] as usize].1, Const::Int(kind) if kind & 0x1000 == 0)
+    }
+
+    /// [`HOIST`]: one round over the loops (a back edge to a block that
+    /// dominates its source; the loop's blocks reach the source without the
+    /// header): the hoistable instructions whose operands all come from
+    /// outside the loop move to the end of the preheader (the header's one
+    /// way in from outside, a block that only goes to the header). Returns
+    /// whether one moved.
+    fn hoist(&mut self, quiet: bool) -> bool {
+        if self.blocks.is_empty() {
+            return false;
+        }
+        let tree = self.dominator_tree();
+        let n = self.blocks.len();
+        let mut idom = vec![usize::MAX; n];
+        for (b, kids) in tree.children.iter().enumerate() {
+            for &k in kids {
+                idom[k] = b;
+            }
+        }
+        let dominates = |a: usize, mut b: usize| loop {
+            if a == b {
+                return true;
+            }
+            if b == 0 || idom[b] == usize::MAX {
+                return false;
+            }
+            b = idom[b];
+        };
+        let mut def = vec![usize::MAX; self.insts.len()];
+        for (b, blk) in self.blocks.iter().enumerate() {
+            for &i in blk.phis.iter().chain(&blk.body) {
+                def[i as usize] = b;
+            }
+        }
+        // Loops, smallest first (inner loops before the loops around them).
+        let mut loops: Vec<(usize, Vec<bool>)> = Vec::new();
+        for &b in &tree.order {
+            for &h in successors(self.blocks[b].term).iter() {
+                if !dominates(h, b) {
+                    continue;
+                }
+                let mut inside = vec![false; n];
+                inside[h] = true;
+                let mut work = vec![b];
+                while let Some(x) = work.pop() {
+                    if inside[x] {
+                        continue;
+                    }
+                    inside[x] = true;
+                    work.extend(tree.preds[x].iter().copied());
+                }
+                match loops.iter_mut().find(|(hh, _)| *hh == h) {
+                    Some((_, l)) => l.iter_mut().zip(&inside).for_each(|(a, b)| *a |= *b),
+                    None => loops.push((h, inside)),
+                }
+            }
+        }
+        loops.sort_by_key(|(_, l)| l.iter().filter(|x| **x).count());
+        let mut moved = false;
+        for (h, inside) in &loops {
+            let outside: Vec<usize> = tree.preds[*h].iter().copied().filter(|&p| !inside[p]).collect();
+            let [pre] = outside[..] else { continue };
+            if !matches!(self.blocks[pre].term, Some(Term::Br(t)) if t == *h) {
+                continue;
+            }
+            for &b in &tree.order {
+                if !inside[b] {
+                    continue;
+                }
+                let body = std::mem::take(&mut self.blocks[b].body);
+                let mut kept = Vec::with_capacity(body.len());
+                for i in body {
+                    let mut invariant = self.hoistable(i, quiet);
+                    if invariant {
+                        for_each_operand(&self.insts[i as usize].op, |v| {
+                            if let V::Inst(j) = v
+                                && def[j as usize] != usize::MAX
+                                && inside[def[j as usize]]
+                            {
+                                invariant = false;
+                            }
+                        });
+                    }
+                    if invariant {
+                        self.blocks[pre].body.push(i);
+                        def[i as usize] = pre;
+                        moved = true;
+                        HOISTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    } else {
+                        kept.push(i);
+                    }
+                }
+                self.blocks[b].body = kept;
+            }
+        }
+        moved
     }
 
     /// Per function: what a call of it does.
@@ -398,13 +602,89 @@ impl Module {
     }
 
     /// An integer constant's width and value (the bits of that width).
-    fn int_k(&self, v: V) -> Option<(u32, u64)> {
+    pub(crate) fn int_k(&self, v: V) -> Option<(u32, u64)> {
         let V::Const(i) = v else { return None };
         let (ty, Const::Int(x)) = &self.consts[i as usize] else {
             return None;
         };
         let bits = self.int_bits(*ty)?;
         Some((bits, *x as u64 & mask(bits)))
+    }
+
+    /// The bits of a 32-bit float that is a constant, given as one or as a
+    /// cast of an integer constant.
+    pub(crate) fn float_k(&self, v: V) -> Option<f32> {
+        let (v, cast) = match v {
+            V::Inst(i) => match self.insts[i as usize].op {
+                Op::Cast(Cast::Bitcast, x) => (x, true),
+                _ => return None,
+            },
+            _ => (v, false),
+        };
+        let V::Const(i) = v else { return None };
+        match &self.consts[i as usize].1 {
+            Const::Float(bits) if !cast => Some(f32::from_bits(*bits)),
+            Const::Int(_) if cast => {
+                let (bits, x) = self.int_k(v)?;
+                (bits == 32).then_some(f32::from_bits(x as u32))
+            }
+            _ => None,
+        }
+    }
+
+    /// For a float that is a number and not an infinity whatever the program
+    /// reads: a power of two its magnitude does not pass.
+    pub(crate) fn bounded(&self, v: V, depth: u32) -> Option<f32> {
+        if let Some(k) = self.float_k(v) {
+            return k.is_finite().then(|| k.abs().max(1e-30).log2().ceil());
+        }
+        let V::Inst(i) = v else { return None };
+        let depth = depth.checked_sub(1)?;
+        let of = |v: V| self.bounded(v, depth);
+        // (A power that overflows, or might with rounding, is no bound.)
+        let held = |b: f32| (b < 126.0).then_some(b);
+        match &self.insts[i as usize].op {
+            Op::Cast(Cast::UiToFp | Cast::SiToFp, _) => Some(32.0),
+            Op::Cast(Cast::Bitcast, x) => match *x {
+                V::Inst(j) => match self.insts[j as usize].op {
+                    Op::Cast(Cast::Bitcast, y) if self.type_of(y) == self.type_of(v) => of(y),
+                    _ => None,
+                },
+                _ => None,
+            },
+            Op::Bin(Bin::Mul, a, b) => held(of(*a)? + of(*b)?),
+            Op::Bin(Bin::Add | Bin::Sub, a, b) => held(of(*a)?.max(of(*b)?) + 1.0),
+            Op::Select(_, a, b) => Some(of(*a)?.max(of(*b)?)),
+            Op::Call(_, args) => {
+                let (_, code) = self.int_k(*args.first()?)?;
+                match (code, &args[1..]) {
+                    // Saturated, a fraction, a cosine or sine (of a number).
+                    (7, [_]) => Some(0.0),
+                    (6, [x]) => of(*x),
+                    (22 | 12 | 13, [x]) => of(*x).map(|_| 0.0),
+                    (26..=29, [x]) => held(of(*x)? + 1.0),
+                    // Of two numbers; or one of them the other way round: the
+                    // minimum (36) of a constant and a maximum of another.
+                    (35 | 36, [a, b]) => match (of(*a), of(*b)) {
+                        (Some(x), Some(y)) => Some(x.max(y)),
+                        _ => {
+                            let other = if code == 35 { 36 } else { 35 };
+                            let (inner, k) = if self.float_k(*b).is_some() { (*a, *b) } else { (*b, *a) };
+                            let k = self.float_k(k).and_then(|_| of(k))?;
+                            let V::Inst(j) = inner else { return None };
+                            let Op::Call(_, inner) = &self.insts[j as usize].op else { return None };
+                            let (_, code) = self.int_k(*inner.first()?)?;
+                            let low = inner[1..].iter().find(|x| self.float_k(**x).is_some())?;
+                            (code == other).then_some(())?;
+                            Some(k.max(of(*low)?))
+                        }
+                    },
+                    (46, [a, b, c]) => held((of(*a)? + of(*b)?).max(of(*c)?) + 1.0),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
     }
 
     /// The constant `x` of the integer type `ty`, kept sign-extended as
@@ -677,6 +957,10 @@ impl Module {
             return false;
         }
         let effects = self.effects();
+        // ([`HOIST`]) A read nothing can write (the module writes no memory, or
+        // the read goes through a shader resource view) is a value of its operands.
+        let hoist = passes & HOIST != 0;
+        let quiet = hoist && !self.writes_memory();
         let tree = self.dominator_tree();
         let mut repl: Vec<Option<V>> = vec![None; self.insts.len()];
         let mut changed = false;
@@ -718,9 +1002,9 @@ impl Module {
         }
         // The values every path to the block being walked has computed
         // (those of the blocks above it in the tree, and its own so far).
-        let mut known: Map<Key, V> = Map::default();
+        let mut known: HashMap<Key, V> = HashMap::new();
         // The reads of the block being walked since its last store.
-        let mut read: Map<Key, V> = Map::default();
+        let mut read: HashMap<Key, V> = HashMap::new();
         let mut facts = Facts::default();
         let (yes, no) = (self.bool(true), self.bool(false));
         enum Step {
@@ -763,7 +1047,7 @@ impl Module {
             read.clear();
             // Two joins of the same values from the same blocks are one.
             if passes & REUSE != 0 && self.blocks[b].phis.len() > 1 {
-                let mut joins: Map<Vec<(usize, V)>, V> = Map::default();
+                let mut joins: HashMap<Vec<(usize, V)>, V> = HashMap::new();
                 for &p in &self.blocks[b].phis {
                     if repl[p as usize].is_some() {
                         continue;
@@ -814,7 +1098,10 @@ impl Module {
                     changed = true;
                     continue;
                 }
-                let class = self.class(&effects, i);
+                let mut class = self.class(&effects, i);
+                if hoist && class == Effect::Reads && self.hoistable(i, quiet) {
+                    class = Effect::Pure;
+                }
                 if passes & REUSE != 0
                     && class == Effect::Pure
                     && let Some(key) = self.key(i)
@@ -978,6 +1265,7 @@ impl Module {
         let mut u = Usage::default();
         let reached = self.reached();
         let wide = |ty: Ty| self.types[ty.0 as usize] == TypeDef::Int(64);
+        let double = |ty: Ty| self.types[ty.0 as usize] == TypeDef::Double;
         // The first field of a handle's annotation: its kind, with the UAV
         // bit; the second: the component type and count.
         let annotation = |h: V| -> Option<(i64, i64)> {
@@ -1006,7 +1294,11 @@ impl Module {
             for &i in blk.phis.iter().chain(&blk.body) {
                 let inst = &self.insts[i as usize];
                 u.int64 |= wide(inst.ty);
-                for_each_operand(&inst.op, |v| u.int64 |= wide(self.type_of(v)));
+                u.doubles |= double(inst.ty);
+                for_each_operand(&inst.op, |v| {
+                    u.int64 |= wide(self.type_of(v));
+                    u.doubles |= double(self.type_of(v));
+                });
                 let Op::Call(f, args) = &inst.op else {
                     continue;
                 };
@@ -1019,10 +1311,10 @@ impl Module {
                         Some((_, 0)) => u.heap_views = true,
                         _ => u.heap_samplers = true,
                     }
+                } else if name == "annotateHandle" {
+                    u.rovs |= annotation(V::Inst(i)).is_some_and(|(kind, _)| kind & 0x2000 != 0);
                 } else if name.starts_with("atomic") && name.ends_with(".i64") {
                     u.atomic64 = true;
-                } else if name.starts_with("attributeAtVertex") {
-                    u.barycentrics = true;
                 } else if name.starts_with("textureLoad") || name.starts_with("bufferLoad") {
                     u.typed_uav_loads |= args.get(1).and_then(|&h| annotation(h)).is_none_or(
                         |(kind, components)| kind & 0x1000 != 0 && components >> 8 & 0xff > 1,
@@ -1033,44 +1325,14 @@ impl Module {
         u
     }
 
-    /// Per input signature element: bitmask of columns actually read by
-    /// reachable `dx.op.loadInput.*` or `dx.op.attributeAtVertex.*` calls.
-    pub(crate) fn input_usage(&self, count: usize) -> Vec<u8> {
-        let mut masks = vec![0u8; count];
-        let reached = self.reached();
-        for (_, blk) in self.blocks.iter().enumerate().filter(|(b, _)| reached[*b]) {
-            for &i in &blk.body {
-                let Op::Call(f, args) = &self.insts[i as usize].op else {
-                    continue;
-                };
-                let name = self.funcs[*f as usize].name.as_str();
-                let name = name.strip_prefix("dx.op.").unwrap_or(name);
-                if !(name.starts_with("loadInput.") || name.starts_with("attributeAtVertex.")) {
-                    continue;
-                }
-                let Some((_, id)) = args.get(1).and_then(|&v| self.int_k(v)) else {
-                    continue;
-                };
-                let Some((_, col)) = args.get(3).and_then(|&v| self.int_k(v)) else {
-                    continue;
-                };
-                if let Ok(id) = usize::try_from(id)
-                    && id < count
-                    && (0..4).contains(&col)
-                {
-                    masks[id] |= 1u8 << col;
-                }
-            }
-        }
-        masks
-    }
-
     /// A constant table no remaining load reads leaves the module (the
-    /// validator refuses an internal declaration nothing uses), and so does
-    /// shared memory whose every access was dead (the fuzzer's seed 48: an
-    /// `ds_read_b32` whose result nothing reads).
+    /// validator refuses an internal declaration nothing uses). Shared
+    /// memory stays declared whether it is read or not.
     fn drop_unused_tables(&mut self) {
-        let mut used = vec![false; self.globals.len()];
+        let mut used: Vec<bool> = self.globals.iter().map(|g| g.init.is_none()).collect();
+        if used.iter().all(|&u| u) {
+            return;
+        }
         for blk in &self.blocks {
             for &i in blk.phis.iter().chain(&blk.body) {
                 for_each_operand(&self.insts[i as usize].op, |v| {
@@ -1575,6 +1837,48 @@ mod tests {
         m.write();
     }
 
+    /// (portB, `VICTORY_HOIST_LOADS`) A loop's read whose operands come from
+    /// outside it is made once, before the loop, and read again below it is
+    /// the same read, in a module that writes no memory; with a store to a
+    /// view anywhere in the module neither happens.
+    #[test]
+    fn invariant_reads_leave_their_loop_only_where_nothing_writes_memory() {
+        for store in [false, true] {
+            let Kit { mut m, b, reads, writes, .. } = kit();
+            let i32t = m.int(32);
+            let void = m.void();
+            let oty = m.func_ty(void, vec![i32t, i32t]);
+            m.ptr(oty);
+            let out = m.function("dx.op.storeOutput.i32", oty, Some(Attr::NoUnwind), false);
+            let (head, exit) = (m.new_block(), m.new_block());
+            let (zero, one, four) = (m.i32(0), m.i32(1), m.i32(4));
+            m.terminate(b, Term::Br(head));
+            let i = m.phi(head, i32t);
+            let x = m.call(head, reads, vec![one, one]);
+            let s = m.bin(head, Bin::Add, x, i);
+            m.call(head, out, vec![s, i]);
+            let next = m.bin(head, Bin::Add, i, one);
+            m.set_phi(i, vec![(zero, b), (next, head)]);
+            let more = m.cmp(head, pred::IULT, next, four);
+            m.terminate(head, Term::CondBr(more, head, exit));
+            let y = m.call(exit, reads, vec![one, one]);
+            m.call(exit, out, vec![y, y]);
+            if store {
+                m.call(exit, writes, vec![y, y]);
+            }
+            m.terminate(exit, Term::Ret);
+            m.optimise(ALL);
+            let V::Inst(xi) = x else { panic!() };
+            let in_entry = m.blocks[b].body.contains(&xi);
+            assert_eq!(in_entry, !store, "store {store}: the read before the loop");
+            let used = |m: &Module, blk: usize| {
+                m.blocks[blk].body.iter().any(|&k| matches!(&m.insts[k as usize].op, Op::Call(_, a) if a.contains(&x)))
+            };
+            assert_eq!(used(&m, exit), !store, "store {store}: the read below is the first one");
+            m.write();
+        }
+    }
+
     #[test]
     fn a_read_is_reused_within_its_block_until_a_store() {
         let Diamond {
@@ -1628,35 +1932,6 @@ mod tests {
             super::tests::stores(&m, then),
             [vec![below, below], vec![top, top]]
         );
-        m.write();
-    }
-
-    #[test]
-    fn an_annotated_handle_is_not_reused_across_blocks() {
-        let Diamond {
-            k: Kit { mut m, b, writes, .. },
-            then,
-            ..
-        } = diamond();
-        let i32t = m.int(32);
-        let one = m.i32(1);
-        let two = m.i32(2);
-        let afty = m.func_ty(i32t, vec![i32t, i32t]);
-        let ann = m.function("dx.op.annotateHandle", afty, Some(Attr::ReadNone), false);
-        let first = m.call(b, ann, vec![one, two]);
-        let same_block = m.call(b, ann, vec![one, two]);
-        let unused = m.call(b, ann, vec![two, two]);
-        m.call(b, writes, vec![first, same_block]);
-        let below = m.call(then, ann, vec![one, two]);
-        m.call(then, writes, vec![below, below]);
-        m.optimise(DEAD | REUSE | LOADS);
-        // Same block: reused before any write; unused call dropped.
-        assert_eq!(stores(&m, b)[0], [first, first]);
-        assert!(m.blocks[b].body.iter().all(|&i| V::Inst(i) != unused));
-        // Dominated block: keeps its own annotateHandle (reusing across blocks
-        // crashes AMD's DXIL compiler on multi-block heap-handle shaders).
-        assert_eq!(stores(&m, then)[0], [below, below]);
-        assert_ne!(below, first);
         m.write();
     }
 

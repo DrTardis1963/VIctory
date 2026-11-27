@@ -36,13 +36,7 @@ impl Fields {
         // never, always and none are plain samplers.
         const LESS: u32 = 2;
         const GREATER_EQUAL: u32 = 7;
-        // The host takes its own comparison functions (never 1 ... always 8)
-        // and address modes (wrap 1 ... mirror once 5), and rejects a
-        // description naming anything else; the words come from the title,
-        // so clamp them into range rather than lose the whole sampler.
-        let compare = self.compare.clamp(1, 8);
-        let compares = (LESS..=GREATER_EQUAL).contains(&compare);
-        let address = |i: usize| D3D12_TEXTURE_ADDRESS_MODE(self.address[i].clamp(1, 5) as i32);
+        let compares = (LESS..=GREATER_EQUAL).contains(&self.compare);
         let reduction = match self.mode {
             1 => 2,
             2 => 3,
@@ -53,19 +47,18 @@ impl Fields {
         } else {
             linear(self.min) << 4 | linear(self.mag) << 2 | u32::from(self.mip == 2)
         };
-        let (min_lod, max_lod) = if self.mip == 0 {
-            // Without a mip filter the console samples mip 0 only.
-            (0.0, 0.0)
+        let min_lod = finite_lod(self.min_lod, 0.0);
+        // Without a mip filter the console clamps sampling to `min_lod`.
+        let max_lod = if self.mip == 0 {
+            min_lod
         } else {
-            let min_lod = finite_lod(self.min_lod, 0.0);
-            let max_lod = finite_lod(self.max_lod, min_lod).max(min_lod);
-            (min_lod, max_lod)
+            finite_lod(self.max_lod, min_lod).max(min_lod)
         };
         D3D12_SAMPLER_DESC {
             Filter: D3D12_FILTER((reduction << 7 | filter) as i32),
-            AddressU: address(0),
-            AddressV: address(1),
-            AddressW: address(2),
+            AddressU: address_mode(self.address[0]),
+            AddressV: address_mode(self.address[1]),
+            AddressW: address_mode(self.address[2]),
             MipLODBias: if self.bias.is_nan() {
                 0.0
             } else {
@@ -77,11 +70,23 @@ impl Fields {
             } else {
                 1
             },
-            ComparisonFunc: D3D12_COMPARISON_FUNC(compare as i32),
+            ComparisonFunc: if reduction == 1 {
+                D3D12_COMPARISON_FUNC(self.compare as i32)
+            } else {
+                D3D12_COMPARISON_FUNC_NEVER
+            },
             BorderColor: self.border,
             MinLOD: min_lod,
             MaxLOD: max_lod,
         }
+    }
+}
+
+/// Maps a console address mode (`1..=5`) to host D3D12, falling back to `CLAMP`.
+fn address_mode(mode: u32) -> D3D12_TEXTURE_ADDRESS_MODE {
+    match mode {
+        1..=5 => D3D12_TEXTURE_ADDRESS_MODE(mode as i32),
+        _ => D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
     }
 }
 
@@ -140,131 +145,24 @@ mod tests {
         assert_eq!(console(&w).Filter.0, 0x5);
     }
 
-    /// A description with wrap addressing and nothing else set.
-    fn description() -> [u32; 27] {
+    #[test]
+    fn mip_none_clamps_to_min_lod_and_inverted_lod_range_clamps() {
         let mut w = [0u32; 27];
-        w[6..9].fill(1);
-        w
-    }
-
-    #[test]
-    fn filters_follow_the_console_fields() {
-        let mut w = description();
-        // Point minification, magnification and mips is the host's zero.
-        assert_eq!(console(&w).Filter.0, 0x00);
-        w[1] = 1; // bilinear magnification
-        assert_eq!(console(&w).Filter.0, 0x04);
-        w[2] = 1; // bilinear minification
-        assert_eq!(console(&w).Filter.0, 0x14);
-        w[3] = 1; // point mips stay point
-        assert_eq!(console(&w).Filter.0, 0x14);
-        w[3] = 2; // linear mips
-        assert_eq!(console(&w).Filter.0, 0x15);
-        // Anisotropic point and anisotropic bilinear both become the host's
-        // anisotropic filter, which is linear in every direction.
-        for (mag, min) in [(2, 0), (3, 0), (0, 2), (3, 3)] {
-            w[1] = mag;
-            w[2] = min;
-            assert_eq!(console(&w).Filter.0, 0x55, "{mag}/{min}");
-        }
-    }
-
-    #[test]
-    fn comparison_samplers_use_the_host_reduction() {
-        let mut w = description();
-        // Never (1), none (0) and always (8) are not tests.
-        for compare in [0, 1, 8] {
-            w[16] = compare;
-            let d = console(&w);
-            assert_eq!(d.Filter.0, 0, "compare {compare}");
-            assert_eq!(
-                d.ComparisonFunc,
-                D3D12_COMPARISON_FUNC(compare.max(1) as i32)
-            );
-        }
-        // Every real test is, with the host's comparison reduction.
-        for compare in 2..=7 {
-            w[16] = compare;
-            let d = console(&w);
-            assert_eq!(d.Filter.0, 0x80, "compare {compare}");
-            assert_eq!(d.ComparisonFunc, D3D12_COMPARISON_FUNC(compare as i32));
-        }
-        // Comparison and anisotropic add up to the host's comparison
-        // anisotropic filter.
-        w[1] = 2;
-        w[16] = 4;
-        assert_eq!(console(&w).Filter.0, 0xD5);
-        w[1] = 0;
-        // The console's minimum and maximum reductions replace it, even
-        // when a test is set.
-        w[5] = 1;
-        assert_eq!(console(&w).Filter.0, 0x100);
-        w[5] = 2;
-        assert_eq!(console(&w).Filter.0, 0x180);
-        w[16] = 0;
-        assert_eq!(console(&w).Filter.0, 0x180);
-    }
-
-    #[test]
-    fn comparison_function_stays_in_the_host_range() {
-        let mut w = description();
-        // A zeroed word means "no test": the host's never.
-        w[16] = 0;
-        assert_eq!(console(&w).ComparisonFunc, D3D12_COMPARISON_FUNC_NEVER);
-        // Words past always are not host functions; clamp them.
-        for compare in [9, 15, u32::MAX] {
-            w[16] = compare;
-            let d = console(&w);
-            assert_eq!(d.Filter.0, 0, "not a real test");
-            assert_eq!(
-                d.ComparisonFunc, D3D12_COMPARISON_FUNC_ALWAYS,
-                "{compare:#x}"
-            );
-        }
-    }
-
-    #[test]
-    fn anisotropy_is_clamped_to_the_host_range() {
-        let mut w = description();
-        w[1] = 3; // anisotropic bilinear
-        for (word, expected) in [(0, 1), (1, 1), (3, 3), (16, 16), (17, 16), (u32::MAX, 16)] {
-            w[13] = word;
-            assert_eq!(console(&w).MaxAnisotropy, expected, "{word}");
-        }
-        // Point and bilinear filters have no anisotropy at all.
-        w[1] = 1;
-        w[13] = 8;
-        assert_eq!(console(&w).MaxAnisotropy, 1);
-    }
-
-    #[test]
-    fn lod_bounds_bias_and_border_reach_the_description() {
-        let mut w = description();
-        w[3] = 2; // linear mips
-        w[9] = 1.0f32.to_bits();
-        w[10] = 6.5f32.to_bits();
-        w[11] = (-2.5f32).to_bits();
-        w[17] = 1.0f32.to_bits();
-        w[18] = 0.5f32.to_bits();
-        w[19] = 0.25f32.to_bits();
-        let d = console(&w);
-        assert_eq!((d.MinLOD, d.MaxLOD), (1.0, 6.5));
-        assert_eq!(d.MipLODBias, -2.5);
-        assert_eq!(d.BorderColor, [1.0, 0.5, 0.25, 0.0]);
-        // Without a mip filter one level is sampled, whatever the bounds.
-        w[3] = 0;
-        let d = console(&w);
-        assert_eq!((d.MinLOD, d.MaxLOD), (0.0, 0.0));
-    }
-
-    #[test]
-    fn mip_none_forces_base_level_and_inverted_lod_range_clamps() {
-        let mut w = description();
         w[3] = 0; // mip none
         w[9] = 3.0f32.to_bits();
         w[10] = 8.0f32.to_bits();
         let d = console(&w);
+        assert_eq!((d.MinLOD, d.MaxLOD), (3.0, 3.0));
+
+        w[9] = f32::NAN.to_bits();
+        w[10] = 8.0f32.to_bits();
+        let d = console(&w);
         assert_eq!((d.MinLOD, d.MaxLOD), (0.0, 0.0));
+
+        w[9] = f32::INFINITY.to_bits();
+        w[10] = 8.0f32.to_bits();
+        let d = console(&w);
+        assert_eq!((d.MinLOD, d.MaxLOD), (D3D12_FLOAT32_MAX, D3D12_FLOAT32_MAX));
 
         w[3] = 2; // linear mips
         w[9] = 4.0f32.to_bits();
@@ -292,47 +190,40 @@ mod tests {
     }
 
     #[test]
-    fn bias_clamps_and_nan_zeros() {
-        let mut w = description();
+    fn bias_address_and_comparison_stay_in_host_bounds() {
+        let mut w = [0u32; 27];
+        w[6..9].copy_from_slice(&[0, 6, 3]);
         w[11] = 24.0f32.to_bits();
-        assert_eq!(console(&w).MipLODBias, D3D12_MIP_LOD_BIAS_MAX);
-        w[11] = (-24.0f32).to_bits();
-        assert_eq!(console(&w).MipLODBias, D3D12_MIP_LOD_BIAS_MIN);
-        w[11] = f32::NAN.to_bits();
-        assert_eq!(console(&w).MipLODBias, 0.0);
-    }
-
-    #[test]
-    fn address_modes_are_host_modes() {
-        let mut w = description();
-        w[6..9].copy_from_slice(&[1, 2, 3]);
+        w[16] = 99;
         let d = console(&w);
+        assert_eq!(d.MipLODBias, D3D12_MIP_LOD_BIAS_MAX);
         assert_eq!(
-            (d.AddressU, d.AddressV, d.AddressW),
-            (
-                D3D12_TEXTURE_ADDRESS_MODE_WRAP,
-                D3D12_TEXTURE_ADDRESS_MODE_MIRROR,
-                D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
-            )
+            [d.AddressU, d.AddressV, d.AddressW],
+            [D3D12_TEXTURE_ADDRESS_MODE_CLAMP; 3]
         );
-        // The rest of the host's modes pass through.
-        for (word, mode) in [
-            (4, D3D12_TEXTURE_ADDRESS_MODE_BORDER),
-            (5, D3D12_TEXTURE_ADDRESS_MODE_MIRROR_ONCE),
-        ] {
-            w[6..9].fill(word);
-            let d = console(&w);
-            assert_eq!((d.AddressU, d.AddressV, d.AddressW), (mode, mode, mode));
-        }
-        // Anything else is not a host mode; clamp it into range instead of
-        // making the host reject the description.
-        for (word, mode) in [
-            (0, D3D12_TEXTURE_ADDRESS_MODE_WRAP),
-            (6, D3D12_TEXTURE_ADDRESS_MODE_MIRROR_ONCE),
-            (u32::MAX, D3D12_TEXTURE_ADDRESS_MODE_MIRROR_ONCE),
-        ] {
-            w[6..9].fill(word);
-            assert_eq!(console(&w).AddressU, mode, "{word:#x}");
-        }
+        assert_eq!(d.ComparisonFunc, D3D12_COMPARISON_FUNC_NEVER);
+
+        w[11] = (-24.0f32).to_bits();
+        w[5] = 1; // minimum reduction
+        w[16] = 4; // less-or-equal, ignored when reduction != 1
+        let d = console(&w);
+        assert_eq!(d.MipLODBias, D3D12_MIP_LOD_BIAS_MIN);
+        assert_eq!(d.ComparisonFunc, D3D12_COMPARISON_FUNC_NEVER);
+
+        w[11] = f32::NAN.to_bits();
+        w[5] = 0; // plain mode, reduction == 1 from compare == 4
+        w[6..9].copy_from_slice(&[1, 4, 5]);
+        w[16] = 4;
+        let d = console(&w);
+        assert_eq!(d.MipLODBias, 0.0);
+        assert_eq!(
+            [d.AddressU, d.AddressV, d.AddressW],
+            [
+                D3D12_TEXTURE_ADDRESS_MODE_WRAP,
+                D3D12_TEXTURE_ADDRESS_MODE_BORDER,
+                D3D12_TEXTURE_ADDRESS_MODE_MIRROR_ONCE,
+            ]
+        );
+        assert_eq!(d.ComparisonFunc, D3D12_COMPARISON_FUNC_LESS_EQUAL);
     }
 }

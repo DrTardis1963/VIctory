@@ -1,60 +1,49 @@
 # CLAUDE.md
 
-This file guides Claude Code and other AI coding agents working in this repository.
+Guide for Claude Code and other agents in this repository.
 
-## Required Reading (Read Before Any Edit)
-1. [AGENTS.md](AGENTS.md) — Hard clean-room rules (`docs/asset-policy.md`), multi-agent concurrency protocol, host setup, and mandatory verification gates.
-2. [docs/STATUS.md](docs/STATUS.md) — Current phase, active agent claims/worktrees, latest test results, and next unclaimed tasks.
-3. [docs/UPSTREAM_FEED.md](docs/UPSTREAM_FEED.md) — Synced upstream remotes (`backup/*` on `unified`), newly harvested commits, and community tracker status (prevents duplicating already-solved work).
+## Read first
+1. `AGENTS.md` (local, beside the root checkout): clean-room rules (`docs/asset-policy.md`), host setup, the verification gate.
+2. `F:\VIctory_Testing\loop\STATE.md`: the test loop's living state (builds under test, findings, runs still needed).
+3. The bulletin board: `board list` before editing, `board post "<what>" --files <area>` when you start, `board done <id> "<outcome>"` when you stop.
 
-## Quick Rules for Concurrent Sessions
-- **Work in your own git worktree** (`.worktrees/claude-<task>`). Never modify `.worktrees/unified`, `.worktrees/agy`, or the root checkout's uncommitted files unless you own that worktree.
-- **Claim your task** in `docs/STATUS.md` before editing code, and update it when finished.
-- **Keep game data & Agility SDK DLLs out of git**:
-  - External config: `$env:VICTORY_CONFIG = "F:\VIctory_Testing\victory.toml"`
-  - Agility SDK DLLs live at `F:\VIctory_Testing\D3D12\` (copy to gitignored `target/.../D3D12/` only): `cargo xtask agility --from F:\VIctory_Testing\D3D12` checks the version matches `D3D12SDKVersion` and copies it into every build folder (the folder is remembered; `--check` only reports).
-  - Never touch `F:\Quarantine\...`.
-  - `.claude/hooks/asset_guard.py` (a PreToolUse hook in `.claude/settings.json`) refuses Write/Bash/PowerShell calls that would put files the asset policy bars into a checkout, ignored folders included. A refusal is the policy, not a bug: write outside the repository.
-- **Agent tools** (`cargo xtask <cmd> --help`):
-  - `cargo xtask gate [--changed] [--json]` — the verification gate below in one command; prints only what failed (logs in `target/xtask-gate/`) and installs the Agility runtime first.
-  - `cargo xtask todo [--json]` — ranks the unimplemented imports titles called, from the `unimplemented.toml` that `victory run --execute` writes beside `crashes.log`, and names the HLE module file per DLL.
-  - `cargo xtask opcodes [--all] [--json]` — GFX10 coverage: per encoding, the opcodes the decoder knows, the shader unit tests lower, and the lowering only names (runs victory-shader's tests, about 5 minutes; `--from <list>` reuses a run).
-  - `victory translate --validate [--pipelines] --json <file outside repo>` then `cargo xtask corpus-diff <before.json> <after.json> [--all] [--json] [--strict]` — the shader scoreboard: "fixes N, breaks M", ok programs by stage and failure reasons before → after. Programs match by `#<hash> ~<code> <stage>`, the same on every machine.
-  - `cargo xtask bench [--save main] [--against main] [--strict]` — runs the `#[ignore = "benchmark"]` `*_throughput` tests in release (BCPack, texture tile/detile, XMA) and compares with a saved run (`target/xtask-bench/`). Expect ±10-30 % noise while other builds run.
-  - `cargo xtask worktrees new <name> | status | land <name>... [--push]` — one worktree per parallel agent (`.worktrees/claude-<name>`, branch `claude/<name>`); `status` shows each one's distance from `unified/main` and last gate (`target/xtask-gate/summary.json`, stamped with the HEAD it checked); `land` merges only branches whose full gate passed on their clean HEAD, gates the result, and with `--push` fast-forwards `unified/main`.
-  - Shader correctness:
-    - `cargo xtask diff-test [--cases N] [--seed S] [--ignored]`: synthetic GFX10 programs run on a reference interpreter (`emit/interp.rs`) and, translated, on the GPU, then compared.
-      - Known miscompiles are `#[ignore]` tests; `--ignored` runs them.
-    - `cargo xtask fuzz [--cases N] [--seed S]`: the decoder on random words, and random programs lowered and validated; prints failing seeds.
-    - `cargo xtask snapshots [--bless]`: `dxc -dumpbin` text of synthetic shaders, compared with `crates/victory-shader/tests/snapshots/`.
-    - Tests can write GFX10 as text with `gfx10::asm::asm("v_add_f32 v0, v1, s2")`, a test-only assembler that reads what `sp3.rs` prints.
-  - Crashes and hangs:
-    - A crash writes `crash-<unix>-<pid>.txt` beside `crashes.log`: the report, the module map, the last HLE calls, and the unimplemented imports.
-    - `victory triage <bundle> [--decompile]` summarises it. `--decompile` needs Ghidra 12.2 with JDK 25 or newer.
-    - `VICTORY_HLE_TRACE=<file outside repo>|ring` traces HLE calls as ndjson; `VICTORY_HLE_TRACE_HOST=1` also traces host waits and events.
-    - `cargo xtask trace summary <file>` shows where each thread stopped; `cargo xtask trace diff <a> <b>` shows where two runs part.
-  - `cargo xtask hle-stub <dll> <fn> [--write]`: scaffolds a stub handler, its export and a test in the module serving the DLL. `xtask todo` prints the command for each ranked import.
-  - `crates/victory-testkit`: builds synthetic PE32+ images (imports, exports, TLS, `.pdata`, relocations) for loader tests.
-  - GPU:
-    - A `cache:` line every 5 s and an exit summary give shader cache hits and misses, translation time, and pipeline creation by kind with total and max ms. `xtask harness analyze` puts these under `"cache"`.
-    - `VICTORY_GPU_RECORD=<dir outside repo>` (with `VICTORY_GPU_RECORD_FRAMES`, `VICTORY_GPU_RECORD_AT`) records the D3D12.X calls of a few world frames; `cargo xtask gpu-view <dir>` writes `view.html`.
-  - `crates/victory-formats/tests/round_trip.rs` — random layouts in every swizzle mode tile and detile back exactly (`VICTORY_TILE_CASES`, `VICTORY_TILE_SEED`).
-  - Project agents in `.claude/agents/` (`hle-implementer`, `shader-op-implementer`, `policy-reviewer`) and the `victory-run` skill in `.claude/skills/` (how to run the title: screenshots, no auto-close timers, results under `F:\VIctory_Testing\`).
-- **Use the Clean-Room Diagnostic Harness** (`cargo xtask harness --help`):
-  - `cargo xtask harness analyze <log> --out <external-dir>` — parses frame waterfall, GPU/CPU/settle waits, 8 GB VRAM/PCIe spill, and dropped shaders.
-  - `cargo xtask harness compare <a/report.json> <b/report.json>` — side-by-side A/B delta table.
-  - `cargo xtask harness prepare --profile tuned-8gb ...` — generates isolated launcher + `run_meta.json` outside the repo.
-  - `cargo xtask harness shader <hash> --config <toml>` — diagnoses a single refused/dropped shader container.
-- **Power-Loss Durability, Shared Credentials & Dual Backups**:
-  - `.git/config` enforces `core.fsync = all`, `core.fsyncMethod = fsync`, `fetch.fsckObjects = true`, and `transfer.fsckObjects = true` so git metadata survives sudden power loss.
-  - Private-repo authentication (`DrTardis1963/victory-unified`, `DrTardis1963/VIctory`) uses the shared system `credential.helper = manager` (Git Credential Manager); never embed tokens or passwords in `.git/config`, URLs, or CLI commands.
-  - Every synthesis milestone is backed up in two places: `unified` remote `refs/heads/backup/*` branches and offline local git bundles + `.git/config` backup in `%LOCALAPPDATA%\victory-backups\`.
-- **Always run before committing** (`cargo xtask gate` runs all of these, plus clippy with `--all-features`):
-  ```powershell
-  $env:PATH = "$env:USERPROFILE\.cargo\bin;$env:PATH"
-  cargo xtask policy
-  cargo clippy --workspace --all-targets --locked -- -D warnings
-  cargo test --workspace --locked --exclude victory-gpu --exclude victory-shader
-  cargo test -p victory-shader --lib --locked
-  cargo test -p victory-gpu --lib --locked -- --test-threads=1
-  ```
+## Trunk
+This line (`unified/main`, built on `checkpoint/scarlett-3070`: Yaekai's RTX 3070 fork plus our fixes) is the one trunk since 2026-11-28. The older synthesis spine is kept as the first parent of the merge that made it the trunk, and as `refs/archive/2026-11-28/*` branches in the root checkout.
+
+## Quick rules
+- Work in your own worktree (`cargo xtask worktrees new <name>` makes `.worktrees/claude-<name>` on branch `claude/<name>`). Never edit another worktree's uncommitted files.
+- Keep game data and Agility SDK DLLs out of git:
+  - Config: `$env:VICTORY_CONFIG = "F:\VIctory_Testing\victory.toml"`.
+  - Agility SDK: `cargo xtask agility --from F:\VIctory_Testing\D3D12` checks the version against `D3D12SDKVersion` and copies it beside every build (the folder is remembered; `--check` only reports).
+  - `.claude/hooks/asset_guard.py` (PreToolUse, `.claude/settings.json`) refuses writes that would put barred files into a checkout. A refusal is the policy: write outside the repository.
+- Code from other forks is untrusted: `repo-intake` / `fork-vet` first (`~/.claude/security/fork-vetting.md`).
+
+## Agent tools (`cargo xtask <cmd> --help`)
+- `cargo xtask gate [--changed] [--json]`: the whole pre-commit check in one command; prints only what failed (logs in `target/xtask-gate/`).
+- `cargo xtask todo [--json]`: ranks the unimplemented imports titles called, from the `unimplemented.toml` that `victory run --execute` writes beside `crashes.log`, and names the HLE module per DLL. `cargo xtask hle-stub <dll> <fn> [--write]` scaffolds a stub, its export and a test.
+- Shader scoreboard: `victory translate --validate [--pipelines] --json <file outside repo>`, then `cargo xtask corpus-diff <before.json> <after.json> [--all] [--json] [--strict]` ("fixes N, breaks M"). Score with `VICTORY_HOST_MAX_WAVE=32` on the 3070.
+- `cargo xtask opcodes [--all] [--json]`: GFX10 opcodes the lowering names but no shader test lowers.
+- `cargo xtask bench [--save main] [--against main]`: BCPack and texture tile/detile throughput against a saved run.
+- `cargo xtask worktrees new <name> | status | land <name>... [--push]`: one worktree per agent; `land` merges only branches whose full gate passed and fast-forwards `unified/main` with `--push`.
+- Crashes and hangs:
+  - A crash writes `crash-<unix>-<pid>.txt` beside `crashes.log`; `victory triage <bundle> [--decompile]` summarises it (`--decompile` needs Ghidra 12.2 with JDK 25+).
+  - `VICTORY_HLE_TRACE=<file outside repo>|ring` (+ `VICTORY_HLE_TRACE_HOST=1`) traces HLE calls; `cargo xtask trace summary <file>` / `trace diff <a> <b>`.
+- `crates/victory-testkit`: synthetic PE32+ images for loader tests.
+- Harness: `cargo xtask harness analyze <log> --out <dir>`, `compare <a> <b>`, `prepare --profile tuned-8gb ...`, `shader <hash> --config <toml>`.
+- Project agents in `.claude/agents/` and the `victory-run` skill in `.claude/skills/`.
+
+### Not on this line yet
+These xtask commands exist but the code they read or drive is still only on the old spine (it touches `crates/victory-gpu` and `crates/victory-shader`, which the picture-fix work holds):
+- `cargo xtask gpu-view` (needs the `VICTORY_GPU_RECORD` recorder) and the harness `"cache"` section (needs the `cache:` log lines).
+- `cargo xtask diff-test`, `fuzz`, `snapshots` (need the reference interpreter, fuzzer, synthetic shaders and the GFX10 test assembler).
+
+## Before every commit
+`cargo xtask gate`, or by hand:
+```powershell
+$env:PATH = "$env:USERPROFILE\.cargo\bin;$env:PATH"
+cargo xtask policy
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo test --workspace --locked --exclude victory-gpu --exclude victory-shader
+cargo test -p victory-shader --lib --locked
+cargo test -p victory-gpu --lib --locked -- --test-threads=1
+```

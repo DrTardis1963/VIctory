@@ -62,6 +62,11 @@ pub fn use_pipeline_cache(dir: PathBuf) {
     let _ = DIR.set(dir);
 }
 
+/// The folder the library is kept in.
+pub(super) fn folder() -> Option<PathBuf> {
+    DIR.get().cloned()
+}
+
 /// Host pipelines created, loaded from the library, and title pipelines
 /// started at creation, since the start.
 pub(crate) static MADE: AtomicU64 = AtomicU64::new(0);
@@ -435,7 +440,7 @@ const LIBRARY_FILE: &str = "host-pipelines.bin";
 const NEXT_FILE: &str = "host-pipelines.next";
 const EARLY_FILE: &str = "early-pipelines.txt";
 /// Title pipelines listed for an early start, at most.
-const EARLY_MAX: usize = 8192;
+const EARLY_MAX: usize = 100_000;
 
 fn library() -> Option<&'static Library> {
     static LIBRARY: OnceLock<Option<Library>> = OnceLock::new();
@@ -479,11 +484,7 @@ fn open(device: &ID3D12Device1, blob: Blob) -> Option<Library> {
                     saving: RwLock::new(()),
                 });
             }
-            Err(e) => tracing::warn!(
-                error = %e,
-                why = rejected_why(e.code()),
-                "host pipeline library rejected; starting an empty one (the early list still starts its pipelines during loading)"
-            ),
+            Err(e) => tracing::info!(error = %e, "host pipeline library rejected; starting an empty one"),
         }
     } else {
         tracing::info!("no host pipeline library yet; starting an empty one");
@@ -498,17 +499,6 @@ fn open(device: &ID3D12Device1, blob: Blob) -> Option<Library> {
         added: AtomicU64::new(0),
         saving: RwLock::new(()),
     })
-}
-
-/// Why the host refused a saved library, for the log: a driver update (the
-/// usual case) or another adapter makes every saved pipeline unusable.
-fn rejected_why(code: windows::core::HRESULT) -> &'static str {
-    use windows::Win32::Foundation::{D3D12_ERROR_ADAPTER_NOT_FOUND, D3D12_ERROR_DRIVER_VERSION_MISMATCH};
-    match code {
-        D3D12_ERROR_DRIVER_VERSION_MISMATCH => "saved by another driver version",
-        D3D12_ERROR_ADAPTER_NOT_FOUND => "saved on another adapter",
-        _ => "damaged or not a library",
-    }
 }
 
 /// A pipeline's name in the library: the hash of what its host
@@ -544,7 +534,6 @@ pub(crate) fn pipeline(
     // The load read the library's file (see `trim`).
     LOADED_AT.store(crate::host::now_ms(), Ordering::Relaxed);
     TRIMMED.store(false, Ordering::Relaxed);
-    crate::stats::library_lookup(loaded.is_ok());
     let refused = match loaded {
         Ok(pso) => {
             LOADED.fetch_add(1, Ordering::Relaxed);
@@ -580,17 +569,87 @@ pub(crate) fn pipeline(
     Ok(pso)
 }
 
-/// Writes the library and the early list if pipelines were added since the
-/// last save and `SAVE_EVERY` has passed (or `now`). The early list is
-/// written even without a host library, or when serialising it fails, so
-/// the next run still starts this run's pipelines early.
-pub(crate) fn save(now: bool) {
+/// When [`save`] last wrote (or looked at writing) the library.
+static LAST_SAVE: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+
+/// A save running on [`save_due`]'s thread.
+static SAVING_NOW: AtomicBool = AtomicBool::new(false);
+
+/// (Fox port C, from victory-dev; `VICTORY_LIBRARY_SAVE_S`, default 0 =
+/// cool_fox's behaviour; ours ran 10; A/B candidate) Called once a second by the host's sweep: a library with
+/// pipelines not yet written is saved on a thread of its own once that many
+/// seconds passed since the last save. Without it a save came only from a
+/// pipeline worker after a make, at most every 20 s, and at a clean exit:
+/// pipelines made in the last 20 s before the watchdog ends a run were never
+/// written (run-49: 18 made at 355 s, last save 341 s, run ended at 360 s;
+/// the next run made them again, 3.7 s of waits in one frame).
+pub(crate) fn save_due() {
+    static S: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let secs = *S.get_or_init(|| {
+        let s = std::env::var("VICTORY_LIBRARY_SAVE_S").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0u64);
+        tracing::info!(
+            "host pipeline library: written {} (VICTORY_LIBRARY_SAVE_S={s})",
+            if s == 0 { "by the workers at most every 20 s and at exit, as before" } else { "when pipelines wait to be written and the last save is that many seconds old" }
+        );
+        s
+    });
+    let pending = library().map_or(0, |l| l.added.load(Ordering::Relaxed));
+    if secs == 0 || pending == 0 && !USED_CHANGED.load(Ordering::Relaxed) {
+        return;
+    }
+    if LAST_SAVE.lock().unwrap_or_else(|e| e.into_inner()).is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(secs)) {
+        return;
+    }
+    if SAVING_NOW.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    let work = || {
+        save(true);
+        SAVING_NOW.store(false, Ordering::Relaxed);
+    };
+    if std::thread::Builder::new().name("victory-library-save".into()).spawn(work).is_err() {
+        SAVING_NOW.store(false, Ordering::Relaxed);
+    }
+}
+
+/// A save asked for by a worker while others still wait: at most every
+/// `VICTORY_LIBRARY_BUSY_SAVE_S` seconds (default 300), counted from the first
+/// ask. Each save serialises the whole library under its write lock, which
+/// holds up every store: with a 2.1 GB library on an 8-thread PC, saves every
+/// 20 s wrote ~34 GB in 7 min and the workers made ~3 pipelines a second
+/// while ~3,000 waited and ~1,200 draws a frame were dropped. The workers
+/// running out of work, and the title's end, still save at once.
+pub(crate) fn save_while_busy() {
     static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
-    const SAVE_EVERY: std::time::Duration = std::time::Duration::from_secs(20);
-    let Some(dir) = DIR.get() else { return };
-    let library = library();
+    static EVERY: OnceLock<std::time::Duration> = OnceLock::new();
+    let every = *EVERY.get_or_init(|| {
+        let secs = std::env::var("VICTORY_LIBRARY_BUSY_SAVE_S")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(300);
+        std::time::Duration::from_secs(secs)
+    });
     {
         let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+        match *last {
+            Some(t) if t.elapsed() < every => return,
+            None => {
+                *last = Some(std::time::Instant::now());
+                return;
+            }
+            _ => *last = Some(std::time::Instant::now()),
+        }
+    }
+    save(false);
+}
+
+/// Writes the library and the early list if pipelines were added since the
+/// last save and `SAVE_EVERY` has passed (or `now`).
+pub(crate) fn save(now: bool) {
+    const SAVE_EVERY: std::time::Duration = std::time::Duration::from_secs(20);
+    let (Some(dir), Some(library)) = (DIR.get(), library()) else { return };
+    {
+        let mut last = LAST_SAVE.lock().unwrap_or_else(|e| e.into_inner());
         if !now && last.is_some_and(|t| t.elapsed() < SAVE_EVERY) {
             return;
         }
@@ -605,13 +664,12 @@ pub(crate) fn save(now: bool) {
     // added: the library on disk is then what it was, and only the early
     // list is written (a title pipeline first drawn with wrote all 1,352 MB
     // of the library again: run 60's second save).
-    let bytes = if let Some(library) = library {
+    let bytes = {
         let _all = one_call();
         // No store between asking the size and writing; loads go on.
         let _alone = library.saving.write().unwrap_or_else(|e| e.into_inner());
         let added = library.added.load(Ordering::Relaxed);
-        let listed = USED_CHANGED.swap(false, Ordering::Relaxed);
-        if !listed && added == 0 {
+        if !USED_CHANGED.swap(false, Ordering::Relaxed) && added == 0 {
             return;
         }
         if added == 0 {
@@ -623,24 +681,15 @@ pub(crate) fn save(now: bool) {
             if let Err(e) = serialise(&library.library, &tmp, size) {
                 tracing::warn!(error = %e, "host pipeline library not serialised");
                 let _ = std::fs::remove_file(&tmp);
-                if !listed {
-                    return;
-                }
-                0
-            } else {
-                library.added.store(0, Ordering::Relaxed);
-                SAVED.store(size as u64, Ordering::Relaxed);
-                size
+                return;
             }
+            library.added.store(0, Ordering::Relaxed);
+            SAVED.store(size as u64, Ordering::Relaxed);
+            size
         }
-    } else if USED_CHANGED.swap(false, Ordering::Relaxed) {
-        0
-    } else {
-        return;
     };
-    // With what earlier runs listed: a run that asks for no title pipeline
-    // (`victory warm`) wrote an empty list over theirs, and the next world
-    // began with every pipeline still to be asked for.
+    // Through `used`: a process that asked for none yet (`victory shaders`)
+    // must not write the earlier runs' list over with nothing.
     let used: Vec<String> = used().iter().flatten().cloned().collect();
     let library_written = if bytes > 0 { replace_library(dir, &tmp) } else { Ok(()) };
     if bytes > 0 && library_written.is_ok() {
@@ -657,7 +706,9 @@ pub(crate) fn save(now: bool) {
             )
         });
     }
+    let slow: Vec<String> = slow_ones().iter().flatten().map(|(key, ms)| format!("{key} {ms}")).collect();
     let written = library_written
+        .and_then(|()| write_atomically(&dir.join(SLOW_FILE), slow.join("\n").as_bytes()))
         .and_then(|()| write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes()));
     match written {
         Ok(()) => tracing::info!(
@@ -720,6 +771,48 @@ fn write_atomically(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()>
     res
 }
 
+/// How long each title pipeline that took long to make took, in ms (beside
+/// the early list; a key may be there more than once).
+const SLOW_FILE: &str = "slow-pipelines.txt";
+/// A pipeline that takes this long is one ([`slow`]).
+pub(crate) const SLOW_MS: u64 = 1000;
+static SLOW: Mutex<Option<std::collections::HashMap<String, u64>>> = Mutex::new(None);
+
+fn slow_ones() -> std::sync::MutexGuard<'static, Option<std::collections::HashMap<String, u64>>> {
+    let mut slow = SLOW.lock().unwrap_or_else(|e| e.into_inner());
+    if slow.is_none() {
+        let listed = DIR.get().and_then(|d| std::fs::read_to_string(d.join(SLOW_FILE)).ok()).unwrap_or_default();
+        *slow = Some(
+            listed
+                .lines()
+                .filter_map(|l| l.split_once(' '))
+                .filter_map(|(key, ms)| Some((key.to_owned(), ms.parse().ok()?)))
+                .collect(),
+        );
+    }
+    slow
+}
+
+/// Whether making the title pipeline with `key` took [`SLOW_MS`] in this or
+/// an earlier run.
+pub(crate) fn slow(key: &str) -> bool {
+    slow_ones().as_ref().is_some_and(|s| s.contains_key(key))
+}
+
+/// The title pipeline with `key` took `ms` to make.
+pub(crate) fn note_time(key: &str, ms: u64) {
+    if ms < SLOW_MS {
+        return;
+    }
+    let mut slow = slow_ones();
+    let known = slow.get_or_insert_default().entry(key.to_owned()).or_insert(0);
+    if ms > *known {
+        *known = ms;
+        // With the next save of the early list.
+        USED_CHANGED.store(true, Ordering::Relaxed);
+    }
+}
+
 /// Title pipeline keys requested by draws or dispatches (this run and the last).
 static USED: Mutex<Option<HashSet<String>>> = Mutex::new(None);
 static USED_CHANGED: AtomicBool = AtomicBool::new(false);
@@ -739,7 +832,15 @@ fn used() -> std::sync::MutexGuard<'static, Option<HashSet<String>>> {
 }
 
 /// Whether the title pipeline with `key` was requested in this or an earlier run.
+///
+/// `VICTORY_EARLY_ALL=1`: every title pipeline is started at creation,
+/// requested before or not, so that the driver's own cache holds it for
+/// later runs.
 pub(crate) fn wanted_early(key: &str) -> bool {
+    static ALL: OnceLock<bool> = OnceLock::new();
+    if *ALL.get_or_init(|| std::env::var_os("VICTORY_EARLY_ALL").is_some_and(|v| v == "1")) {
+        return true;
+    }
     used().as_ref().is_some_and(|s| s.contains(key))
 }
 

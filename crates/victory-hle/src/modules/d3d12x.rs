@@ -10,7 +10,8 @@ use victory_gpu::object::{HRESULT, Iid, Object};
 use crate::{HleExport, HleModule};
 
 /// Device creation; first hands the device the title's general allocator
-/// (`XMemAlloc`, which honours the title's hooks) for resource memory.
+/// (`XMemAlloc`, which honours the title's hooks) for resource memory, and
+/// the title's folder (its manifest names the window's icons and caption).
 extern "system" fn create_device(
     adapter: *const c_void,
     parameters: *const u32,
@@ -19,8 +20,19 @@ extern "system" fn create_device(
 ) -> HRESULT {
     victory_gpu::resource::use_allocator(super::xmem::XMemAlloc, super::xmem::XMemFree);
     victory_gpu::resource::use_page_mapper(super::xmem::map_alias);
+    victory_gpu::resource::use_many_page_mapper(super::xmem::map_aliases);
     #[cfg(windows)]
     victory_gpu::on_failure(host_gpu_failed);
+    #[cfg(windows)]
+    if let Some(dir) = crate::runtime::main_image()
+        .and_then(crate::runtime::image_path)
+        .and_then(|exe| exe.parent().map(std::path::Path::to_owned))
+    {
+        victory_gpu::shell::use_title_dir(dir);
+    }
+    // (Hang watch, VICTORY_HANG_WATCH_S) every thread's stack after its report.
+    #[cfg(all(windows, feature = "diagnostics"))]
+    victory_gpu::hangwatch::set_stacks(victory_loader::dump_stacks);
     device::create(adapter, parameters, iid, out)
 }
 
@@ -36,6 +48,34 @@ fn host_gpu_failed(what: &str) -> ! {
     unreachable!("the process has ended")
 }
 
+/// Translates `container` into the cache ([`use_shader_cache`]) ahead of
+/// any run: whether it was there already, or why it does not translate.
+pub fn precompile(container: &[u8]) -> Result<bool, String> {
+    #[cfg(windows)]
+    {
+        victory_gpu::shader_cache::precompile(container)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = container;
+        Err("no host".into())
+    }
+}
+
+/// The fork's offline warm-up (`victory translate --warm`), by
+/// [`precompile`]: whether it was translated now.
+pub fn warm_shader(container: &[u8]) -> Result<bool, String> {
+    #[cfg(windows)]
+    {
+        victory_gpu::shader_cache::precompile(container).map(|was_there| !was_there)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = container;
+        Err("no shader cache on this host".into())
+    }
+}
+
 /// Keeps the host's translations of the title's shaders in `dir` (a
 /// folder of the cache) across runs, and its compiled pipelines beside it
 /// (`pipelines`).
@@ -48,9 +88,6 @@ pub fn use_shader_cache(dir: std::path::PathBuf) {
     #[cfg(not(windows))]
     let _ = dir;
 }
-
-#[cfg(windows)]
-pub use victory_gpu::pipeline::{save_pipeline_cache, warm};
 
 pub(crate) fn module() -> HleModule {
     HleModule {

@@ -141,8 +141,13 @@ fn parse_tables(text: &str) -> Vec<(String, String)> {
     let mut out = Vec::new();
     let mut encoding = None;
     for line in text.lines().map(str::trim) {
-        if let Some(rest) = line.strip_prefix("const ")
-            && let Some((name, _)) = rest.split_once("_ENTRIES:")
+        // `const SOP2_ENTRIES: ...` or `pub(super) const SOP2: &[(u16, &str)] = &[`.
+        let decl = line.strip_prefix("pub(super) ").unwrap_or(line);
+        if let Some(rest) = decl.strip_prefix("const ")
+            && let Some(name) = rest
+                .split_once("_ENTRIES:")
+                .or_else(|| rest.split_once(": &[(u16, &str)]"))
+                .map(|(name, _)| name)
         {
             encoding = Some(name.to_owned());
             continue;

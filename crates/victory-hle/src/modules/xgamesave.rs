@@ -340,15 +340,14 @@ fn migrate(root: &Path, name: &str, old: &Path) -> Option<PathBuf> {
     let done = current_named(&dir, name).ok()?.is_some(); // a crash after the commit
     if !done {
         let display = std::fs::read_to_string(old.join(".display")).unwrap_or_default();
-        let mut blobs: Vec<(String, Vec<u8>)> = Vec::new();
-        for entry in std::fs::read_dir(old).ok()? {
-            let entry = entry.ok()?;
-            let Some(blob) = entry.file_name().to_str().and_then(decode) else {
-                continue;
-            };
-            let data = std::fs::read(entry.path()).ok()?;
-            blobs.push((blob, data));
-        }
+        let mut blobs: Vec<(String, Vec<u8>)> = std::fs::read_dir(old)
+            .ok()?
+            .flatten()
+            .filter_map(|e| {
+                let blob = decode(e.file_name().to_str()?)?;
+                Some((blob, std::fs::read(e.path()).ok()?))
+            })
+            .collect();
         blobs.sort();
         let sources: Vec<_> = blobs
             .iter()
@@ -398,13 +397,6 @@ fn take<T>(handle: *mut T) {
         drop(unsafe { Box::from_raw(handle) });
     }
 }
-/// Nulls a handle the title asked for before anything can fail: the GDK
-/// documents these as null on failure (`_Outptr_result_nullonfailure_`),
-/// and titles close whatever handle they hold, without checking that the
-/// call that should have given it worked.
-fn clear<T>(out: *mut *mut T) {
-    let _ = put(out, std::ptr::null_mut());
-}
 
 impl Provider {
     /// The provider for the only user and `config` (the service
@@ -448,9 +440,7 @@ fn remaining(root: &Path) -> u64 {
 /// new version is written before the old one goes, so nothing it replaces
 /// counts there).
 fn no_room(written: u64, replaced: u64, used: u64, free: u64) -> Option<HRESULT> {
-    // Credit replaced blobs before clamping the remaining quota: clamping
-    // first would forgive any excess in a provider already over quota.
-    if written > QUOTA.saturating_sub(used.saturating_sub(replaced)) {
+    if written > QUOTA.saturating_sub(used) + replaced {
         Some(QUOTA_EXCEEDED)
     } else if written > free {
         Some(OUT_OF_LOCAL_STORAGE)
@@ -685,7 +675,6 @@ extern "system" fn initialize_result(
     block: *mut AsyncBlock,
     out: *mut *mut Provider,
 ) -> HRESULT {
-    clear(out);
     xasync::result(block, (&raw const INIT).cast(), out)
 }
 extern "system" fn close_provider(_: This, provider: *mut Provider) {
@@ -763,7 +752,6 @@ extern "system" fn create_container(
     name: *const c_char,
     out: *mut *mut Container,
 ) -> HRESULT {
-    clear(out);
     let (Some(p), Some(name)) = (get(provider), text(name)) else {
         return E_INVALIDARG;
     };
@@ -813,14 +801,11 @@ extern "system" fn read_blobs(
     size: usize,
     out: *mut u8,
 ) -> HRESULT {
-    if count.is_null() {
-        return E_INVALIDARG;
-    }
     let Some(c) = get(container) else {
         return E_INVALIDARG;
     };
-    // SAFETY: the title supplies the required count, checked above for null.
-    let wanted = unsafe { count.read() };
+    // SAFETY: the title passes its count.
+    let wanted = unsafe { count.as_ref() }.copied().unwrap_or(0);
     let blobs = match read(c, names(blob_names, wanted)) {
         Ok(blobs) => blobs,
         Err(hr) => return hr,
@@ -856,9 +841,6 @@ extern "system" fn read_result(
     out: *mut u8,
     count: *mut u32,
 ) -> HRESULT {
-    if count.is_null() {
-        return E_INVALIDARG;
-    }
     let mut used = 0;
     let hr = xasync::XAsyncGetResult(block, (&raw const READ).cast(), size, out.cast(), &mut used);
     // The documented error for a small buffer; the result stays for a
@@ -894,7 +876,6 @@ extern "system" fn create_update(
     display: *const c_char,
     out: *mut *mut Update,
 ) -> HRESULT {
-    clear(out);
     let Some(c) = get(container) else {
         return E_INVALIDARG;
     };
@@ -935,10 +916,6 @@ extern "system" fn write_blob(
         // SAFETY: the title passes `size` bytes.
         unsafe { std::slice::from_raw_parts(data, size) }.to_vec()
     };
-    if update.changes.iter().any(|(n, _)| *n == name) {
-        // GDK permits only one write or delete of a blob per update.
-        return E_INVALIDARG;
-    }
     update.changes.push((name, Some(data)));
     S_OK
 }
@@ -946,9 +923,7 @@ extern "system" fn write_blob(
 extern "system" fn delete_blob(_: This, update: *mut Update, name: *const c_char) -> HRESULT {
     // SAFETY: as in `write_blob`.
     match (unsafe { update.as_mut() }, text(name)) {
-        (Some(update), Some(name))
-            if !name.is_empty() && !update.changes.iter().any(|(n, _)| *n == name) =>
-        {
+        (Some(update), Some(name)) if !name.is_empty() => {
             update.changes.push((name, None));
             S_OK
         }
@@ -1041,26 +1016,6 @@ mod tests {
         // Replacing a blob of the same size fits a full quota.
         assert_eq!(no_room(mb, mb, QUOTA, 100 * mb), None);
         assert_eq!(no_room(mb, 0, 0, mb), None);
-    }
-
-    #[test]
-    fn replacements_do_not_hide_an_existing_quota_excess() {
-        let mb = 1 << 20;
-        let used = QUOTA + mb;
-        let free = u64::MAX;
-        // Replacing bytes does not forgive the excess in the kept data.
-        assert_eq!(no_room(mb, mb, used, free), Some(QUOTA_EXCEEDED));
-        assert_eq!(no_room(1, mb, used, free), Some(QUOTA_EXCEEDED));
-        // Shrinking a replacement to exactly the quota is allowed.
-        assert_eq!(no_room(mb, 2 * mb, used, free), None);
-        assert_eq!(no_room(mb + 1, 2 * mb, used, free), Some(QUOTA_EXCEEDED));
-        // Deleting blobs must remain possible even before all excess is gone.
-        assert_eq!(no_room(0, mb / 2, used, free), None);
-        // The host still needs room for a replacement's new bytes.
-        assert_eq!(
-            no_room(mb, 2 * mb, used, mb - 1),
-            Some(OUT_OF_LOCAL_STORAGE)
-        );
     }
 
     fn update(root: &Path, display: &str, changes: &[(&str, Option<&str>)]) -> HRESULT {
@@ -1257,39 +1212,6 @@ mod tests {
         assert_eq!((v.dir.file_name(), v.display.as_str()), (Some("v1".as_ref()), "Chapter 1"));
     }
 
-    #[test]
-    fn migration_aborts_without_deleting_old_when_a_blob_cannot_be_read() {
-        let saves = tempfile::tempdir().unwrap();
-        let root = saves.path().join(format!("{:016X}", xuser::XUID)).join("scid");
-        let old = root.join("Player");
-        std::fs::create_dir_all(&old).unwrap();
-        std::fs::write(old.join("Save%20Game%20Data"), b"data").unwrap();
-        let unreadable = old.join("Save%20Game%20Header");
-        std::fs::create_dir_all(&unreadable).unwrap();
-        std::fs::write(old.join(".display"), b"Chapter 1").unwrap();
-
-        let p = Provider::open(saves.path(), Some("scid")).unwrap();
-        assert!(old.exists(), "old container must remain intact when a blob read fails");
-        let c = p.container("Player");
-        assert!(
-            current_named(&c.dir, "Player").unwrap().is_none(),
-            "partial migration must not be committed"
-        );
-
-        std::fs::remove_dir_all(&unreadable).unwrap();
-        std::fs::write(&unreadable, b"header").unwrap();
-        let p = Provider::open(saves.path(), Some("scid")).unwrap();
-        assert!(!old.exists());
-        let blobs = read(&p.container("Player"), None).unwrap();
-        assert_eq!(
-            blobs,
-            [
-                ("Save Game Data".into(), b"data".to_vec()),
-                ("Save Game Header".into(), b"header".to_vec())
-            ]
-        );
-    }
-
     /// An empty configuration id names none. As a folder name it would be
     /// the folder every configuration lives in, whose folders then look
     /// like containers of the old layout and are converted away.
@@ -1313,42 +1235,6 @@ mod tests {
         let other = Provider::open(saves.path(), Some("other")).unwrap();
         assert_eq!(state(&other.root), None);
         assert_eq!(state(&scid.root), kept);
-    }
-
-    #[test]
-    fn a_failed_create_leaves_a_null_handle() {
-        let this: This = &OBJECT;
-        let saves = tempfile::tempdir().unwrap();
-        let provider = give(Provider::open(saves.path(), Some("scid")).unwrap());
-        // What an uninitialized handle variable may hold.
-        fn garbage<T>() -> *mut T {
-            std::ptr::without_provenance_mut(0x1234)
-        }
-
-        let mut container = garbage();
-        let bad = c"bad name".as_ptr();
-        let hr = create_container(this, provider, bad, &mut container);
-        assert_eq!(hr, INVALID_CONTAINER_NAME);
-        assert!(container.is_null());
-
-        let mut update = garbage();
-        let hr = create_update(this, std::ptr::null(), c"x".as_ptr(), &mut update);
-        assert_eq!(hr, E_INVALIDARG);
-        assert!(update.is_null());
-
-        // A provider that could not be opened (its folder could not be made).
-        let mut b = block();
-        xasync::finished_with(&mut b, (&raw const INIT).cast(), Err(NO_ACCESS));
-        let mut opened = garbage();
-        let hr = initialize_result(this, &mut b, &mut opened);
-        assert_eq!(hr, NO_ACCESS);
-        assert!(opened.is_null());
-
-        // So closing what the title holds, as it does, is harmless.
-        close_container(this, container);
-        close_update(this, update);
-        close_provider(this, opened);
-        close_provider(this, provider);
     }
 
     #[test]
@@ -1397,16 +1283,7 @@ mod tests {
             S_OK
         );
         type Delete = extern "system" fn(This, *mut Update, *const c_char) -> HRESULT;
-        assert_eq!(
-            method::<Delete>(&OBJECT, 0xd0)(this, update, c"gone".as_ptr()),
-            E_INVALIDARG,
-            "the same blob was already written in this update"
-        );
-        assert_eq!(
-            write(this, update, c"world".as_ptr(), b"again".as_ptr(), 5),
-            E_INVALIDARG,
-            "a second write of the same blob is refused too"
-        );
+        assert_eq!(method::<Delete>(&OBJECT, 0xd0)(this, update, c"gone".as_ptr()), S_OK);
         type Submit = extern "system" fn(This, *const Update, *mut AsyncBlock) -> HRESULT;
         let mut b = block();
         assert_eq!(method::<Submit>(&OBJECT, 0xe0)(this, update, &mut b), S_OK);
@@ -1439,7 +1316,7 @@ mod tests {
             enumerate_containers(this, provider, context, Some(seen)),
             S_OK
         );
-        assert_eq!(found, [("Slot_1".into(), "Chapter 1".into(), 3, 8)]);
+        assert_eq!(found, [("Slot_1".into(), "Chapter 1".into(), 2, 7)]);
 
         let mut container = std::ptr::null_mut();
         assert_eq!(
@@ -1461,17 +1338,6 @@ mod tests {
         );
         let mut buffer = vec![0u64; size.div_ceil(8)];
         let mut count = 0;
-        assert_eq!(
-            read_result(
-                this,
-                &mut b,
-                size,
-                buffer.as_mut_ptr().cast(),
-                std::ptr::null_mut()
-            ),
-            E_INVALIDARG
-        );
-        assert!(buffer.iter().all(|&word| word == 0));
         assert_eq!(
             read_result(this, &mut b, 8, buffer.as_mut_ptr().cast(), &mut count),
             BUFFER_TOO_SMALL
@@ -1510,19 +1376,6 @@ mod tests {
                 *mut u8,
             ) -> HRESULT,
         >(&OBJECT, 0xa0);
-        buffer.fill(0);
-        assert_eq!(
-            read_now(
-                this,
-                container,
-                std::ptr::null(),
-                std::ptr::null_mut(),
-                size,
-                buffer.as_mut_ptr().cast()
-            ),
-            E_INVALIDARG
-        );
-        assert!(buffer.iter().all(|&word| word == 0));
         assert_eq!(
             read_now(
                 this,

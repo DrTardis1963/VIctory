@@ -1427,28 +1427,6 @@ mod tests {
     }
 
     #[test]
-    fn run_returns_the_work_result() {
-        extern "system" fn work(_: *mut AsyncBlock) -> HRESULT {
-            E_ABORT
-        }
-        let mut block = AsyncBlock {
-            queue: std::ptr::null(),
-            context: std::ptr::null_mut(),
-            callback: None,
-            internal: [0; 4],
-        };
-        assert_eq!(
-            slot::<extern "system" fn(This, *mut AsyncBlock, Option<Work>) -> HRESULT>(0x30)(
-                &OBJECT,
-                &mut block,
-                Some(work)
-            ),
-            S_OK
-        );
-        assert_eq!(XAsyncGetStatus(&mut block, true), E_ABORT);
-    }
-
-    #[test]
     fn canceling_a_completed_call_leaves_it_alone() {
         static CANCELS: AtomicU32 = AtomicU32::new(0);
         extern "system" fn provider(op: u32, data: *const ProviderData) -> HRESULT {
@@ -1508,6 +1486,28 @@ mod tests {
         );
         assert_eq!((byte, used), (0x5a, 1));
         XTaskQueueCloseHandle(q);
+    }
+
+    #[test]
+    fn run_returns_the_work_result() {
+        extern "system" fn work(_: *mut AsyncBlock) -> HRESULT {
+            E_ABORT
+        }
+        let mut block = AsyncBlock {
+            queue: std::ptr::null(),
+            context: std::ptr::null_mut(),
+            callback: None,
+            internal: [0; 4],
+        };
+        assert_eq!(
+            slot::<extern "system" fn(This, *mut AsyncBlock, Option<Work>) -> HRESULT>(0x30)(
+                &OBJECT,
+                &mut block,
+                Some(work)
+            ),
+            S_OK
+        );
+        assert_eq!(XAsyncGetStatus(&mut block, true), E_ABORT);
     }
 
     #[test]

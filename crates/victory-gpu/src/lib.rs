@@ -15,11 +15,53 @@
 //! share, [`console`] which console model the title sees. Planned:
 //! `present` (swap chain).
 
+// The fork's own lint debt (cool_fox and scarlett code, not ours), allowed in
+// one place rather than edited across their files, so syncs with the fork
+// stay conflict-free. New code of ours keeps to the workspace lints.
+#![allow(
+    dead_code,
+    private_interfaces,
+    unused_assignments,
+    unused_variables,
+    unused_imports,
+    unused_mut,
+    dropping_copy_types,
+    clippy::int_plus_one,
+    clippy::unusual_byte_groupings,
+    clippy::precedence,
+    clippy::needless_borrow,
+    clippy::unnecessary_sort_by,
+    clippy::large_enum_variant,
+    clippy::manual_is_multiple_of,
+    clippy::too_many_arguments,
+    clippy::wrong_self_convention,
+    clippy::unnecessary_cast,
+    clippy::mem_replace_with_default,
+    clippy::if_same_then_else,
+    clippy::cloned_ref_to_slice_refs,
+    clippy::doc_lazy_continuation,
+    clippy::explicit_auto_deref,
+    clippy::borrow_deref_ref,
+    clippy::format_in_format_args,
+    clippy::let_and_return,
+    clippy::map_identity,
+    clippy::needless_option_as_deref
+)]
+
+#[cfg(windows)]
+mod ambient;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
+#[cfg(windows)]
+mod compose;
 pub mod console;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod copystat;
+mod copystep; // (coder W) VICTORY_REFRESH_ACCOUNT=1 (per-copy refresh account)
+#[cfg(all(windows, feature = "diagnostics"))]
+mod faultbook;
+#[cfg(windows)]
+mod cores;
 pub mod descriptor;
 pub mod device;
 #[cfg(windows)]
@@ -27,24 +69,46 @@ mod draw;
 pub mod dxgi;
 pub mod fence;
 pub mod frame;
-mod gpu_record;
-#[cfg(windows)]
-pub mod frametime;
+pub mod chunks; // (fox port A) F21 arena chunk meter (VICTORY_CHUNK_METER)
+#[cfg(windows)] pub mod framelog; // (fox port A) frame log, VICTORY_FRAME_LOG
+pub mod hangwatch; // (fox port A) VICTORY_HANG_WATCH_S
+pub mod lockmeter; // (coder H) F23 engine buffer lock meter (VICTORY_LOCK_METER)
+pub mod knownwrites; // (coder J) own dirty ledger for buffer copies (VICTORY_KNOWN_WRITES=verify|1)
+pub mod hlehooks; // (fox port A) runtime notes with no fox GPU function yet (title_memory_unmapped)
+#[cfg(windows)] pub mod shell; // (fox port A) caption text and the game's logo icons
+#[cfg(all(windows, feature = "diagnostics"))]
+mod book;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod holders; // (fox F) VICTORY_HOLDERS: which buffer of ours lies where in the PC's memory
 #[cfg(windows)]
 mod host;
 #[cfg(windows)]
 mod indirect;
 #[cfg(windows)]
 mod inplace;
+#[cfg(windows)]
+mod land;
 pub mod list;
 pub mod object;
 pub mod pipeline;
 #[cfg(windows)]
+mod picked;
+#[cfg(windows)]
+mod pool;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod popwatch;
+#[cfg(windows)]
 mod primitive;
 pub mod query;
 pub mod queue;
+#[cfg(all(windows, feature = "diagnostics"))]
+pub mod replay;
+#[cfg(windows)]
+mod residency;
 pub mod resource;
 pub mod root;
+#[cfg(windows)]
+mod safecopy;
 #[cfg(windows)]
 mod sampler;
 #[cfg(windows)]
@@ -53,23 +117,59 @@ pub mod shader_cache;
 mod memory;
 #[cfg(windows)]
 mod shadow;
+// (Fox T) VICTORY_REFRESH_STALE=verify: the stale-page refresh's verify harness (W's hook calls it)
+mod stalecheck;
+// (Fox T) VICTORY_NAN_METER=1: NaNs and infinities counted per program where they are stored
+#[cfg(feature = "diagnostics")]
+mod nanmeter;
+#[cfg(windows)]
+mod tiles;
 pub mod signature;
-pub mod stats;
 mod switch;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod ab;
+#[cfg(windows)]
+mod tdr;
 #[cfg(windows)]
 mod texture;
+pub mod timeline;
+#[cfg(windows)]
+pub mod titlewrite;
+#[cfg(windows)]
+mod upload;
 #[cfg(windows)]
 mod watch;
+#[cfg(windows)]
+pub mod loadmeter; // (coder G) VICTORY_LOAD_READ_METER
+#[cfg(windows)]
+pub mod pagekinds; // (coder G) VICTORY_PAGE_KINDS (F24/F25)
+#[cfg(windows)]
+mod texback;
+// (Fox port C2) F11 texture detail meter (VICTORY_TEXTURE_DETAIL, off by default).
+#[cfg(all(windows, feature = "diagnostics"))]
+mod texdetail;
 
 #[cfg(windows)]
 pub use host::on_failure;
-pub use host::set_title_dir;
-#[cfg(all(windows, target_arch = "x86_64"))]
-pub use host::write_title_memory;
+
+/// Whether `switch` is on now, if it is one of those `VICTORY_AB` turns on and
+/// off while the title runs (`ab`).
+#[cfg(all(windows, feature = "diagnostics"))]
+pub fn switched(switch: &str) -> Option<bool> {
+    ab::pick(switch)
+}
+
+/// What the frame is at (`copystat::phase`), for the sampling profiler.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub fn frame_phase() -> u32 {
+    copystat::phase()
+}
 #[cfg(windows)]
-pub use inplace::{title_memory_freeing, title_memory_section, title_memory_view};
+pub use inplace::{title_memory_freeing, title_memory_section, title_memory_section_gone, title_memory_view};
 #[cfg(windows)]
 pub use watch::{
-    title_memory_reading, title_memory_remapped, title_memory_remapping, title_memory_written,
-    writing as kernel_will_write,
+    kernel_writing, title_memory_allocated, title_memory_freed, title_memory_reading, title_memory_remapped,
+    Remapping, title_memory_remapping, title_memory_remapping_in, remap_notes_take, title_memory_splitting, title_memory_unmapping, title_memory_written,
 };
+#[cfg(windows)]
+pub use lockmeter::kernel_will_write; // (coder H) watch::writing, noted for the F23 meter first

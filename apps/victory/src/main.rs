@@ -3,12 +3,19 @@
 //! Every command reads the user's own files and writes only to stdout or to
 //! the user's cache directory (outside the repository).
 
+// The fork's lint debt (not ours), allowed in one place; see victory-gpu.
+#![allow(clippy::manual_is_multiple_of, clippy::large_enum_variant)]
+
 mod census;
 mod inspect;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod replay;
 mod run;
 mod shader;
 mod translate;
 mod triage;
+#[cfg(windows)]
+mod warm;
 
 use std::path::PathBuf;
 
@@ -82,39 +89,51 @@ enum Command {
         /// Print one line per program and outcome.
         #[arg(long)]
         list: bool,
-        /// Write translated shaders into `<cache_dir>/shaders` to warm the
-        /// runtime shader cache ahead of time (any build with the same
-        /// translator sources reads them); shaders already there are skipped.
-        #[arg(long)]
-        write_cache: bool,
-        /// Only the shaders earlier runs used (`used-shaders.txt` in the
-        /// shader cache; every shader while there is no list yet).
-        #[arg(long, requires = "write_cache")]
-        used_only: bool,
-        /// Translate as for a host whose waves are MIN-MAX lanes (32-32 for
-        /// NVIDIA): sets the widest host wave, MAX, as a run on that GPU
-        /// does (this translator does not use MIN). Default: with
-        /// --write-cache, this GPU's.
-        #[arg(long, value_name = "MIN-MAX", value_parser = parse_lanes)]
-        host_lanes: Option<(u32, u32)>,
         /// Worker threads (default: every logical core).
         #[arg(long)]
         jobs: Option<usize>,
+        /// Warm the run's shader cache: a file of shader hashes (the 16
+        /// hex digits a run's log names a shader by, anywhere in a line);
+        /// the containers with those hashes are translated into the
+        /// cache and nothing else is done. Set `VICTORY_HOST_WAVE` and
+        /// `VICTORY_VIEW_LIMIT` to what the run's log says of the host.
+        #[arg(long)]
+        warm: Option<PathBuf>,
         /// Also write every program's outcome to FILE (outside the
         /// repository), for `cargo xtask corpus-diff`.
         #[arg(long, value_name = "FILE")]
         json: Option<PathBuf>,
     },
-    /// Translate the shaders of a title's archives into the cache and make
-    /// their compute pipelines, so that a run finds them there.
-    Warm {
+    /// Translate every shader found (as `translate` finds them) into the
+    /// shader cache, so that no run has to: a few minutes, once per change
+    /// of the translator.
+    Shaders {
         paths: Vec<PathBuf>,
         /// Worker threads (default: every logical core).
         #[arg(long)]
         jobs: Option<usize>,
-        /// Only translate: no host pipelines.
+    },
+    /// Make the host pipelines of every pipeline the title ever created
+    /// (runs with `VICTORY_PIPELINE_BOOK=1` write them down), so that the
+    /// driver's cache on disk has them before a run needs one: once per change
+    /// of the translator or the driver. Goes on where it was stopped.
+    #[cfg(windows)]
+    Warm {
+        /// Processes at once (default: two thirds of the logical cores).
         #[arg(long)]
-        no_pipelines: bool,
+        jobs: Option<usize>,
+        /// At most this many pipelines.
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Those made before too.
+        #[arg(long)]
+        again: bool,
+        /// Only the pipelines earlier runs drew with.
+        #[arg(long)]
+        used: bool,
+        /// (What the processes it starts are given.)
+        #[arg(long, hide = true)]
+        these: Option<String>,
     },
     /// Prepare, map and bind a title executable; with --execute, run it.
     Run {
@@ -136,6 +155,10 @@ enum Command {
         #[arg(last = true)]
         title_args: Vec<String>,
     },
+    /// Run a captured frame's GPU work again (diagnostics builds; see
+    /// docs/replay.md).
+    #[cfg(all(windows, feature = "diagnostics"))]
+    Replay(replay::Replay),
     /// Show the resolved configuration and check it.
     Config,
     /// Summarise a crash bundle (`crash-*.txt` beside `crashes.log`).
@@ -190,10 +213,8 @@ fn main() -> Result<()> {
             validate,
             pipelines,
             list,
-            write_cache,
-            used_only,
-            host_lanes,
             jobs,
+            warm,
             json,
         } => {
             // `VICTORY_VIEW_LIMIT=<null slot>`: translate as on a host whose view heap is capped
@@ -204,19 +225,27 @@ fn main() -> Result<()> {
             if let Some(n) = std::env::var("VICTORY_HOST_WAVE").ok().and_then(|v| v.parse().ok()) {
                 victory_shader::emit::set_host_max_wave(n);
             }
-            translate::run(
-                paths, validate, pipelines, list, write_cache, used_only, host_lanes, jobs, json,
-            )
+            if let Some(file) = warm {
+                return translate::warm(paths, &file, jobs);
+            }
+            translate::run(paths, validate, pipelines, list, jobs, json)
         }
-        Command::Warm { paths, jobs, no_pipelines } => translate::warm(paths, jobs, !no_pipelines),
+        Command::Shaders { paths, jobs } => translate::precompile(paths, jobs),
+        #[cfg(windows)]
+        Command::Warm { jobs, limit, again, used, these } => warm::run(jobs, limit, again, used, these),
         Command::Run {
             exe,
             unimplemented,
             strict,
             execute,
             console,
-            title_args: _,
-        } => run::run(&exe, unimplemented, strict, execute, console),
+            title_args,
+        } => {
+            victory_hle::runtime::set_title_args(title_args);
+            run::run(&exe, unimplemented, strict, execute, console)
+        }
+        #[cfg(all(windows, feature = "diagnostics"))]
+        Command::Replay(options) => replay::run(options),
         Command::Config => show_config(),
         Command::Triage { bundle, decompile } => triage::run(&bundle, decompile),
     }
@@ -252,23 +281,6 @@ fn show_config() -> Result<()> {
         }
     }
     Ok(())
-}
-
-/// `--host-lanes MIN-MAX` (or one size for both).
-fn parse_lanes(s: &str) -> Result<(u32, u32), String> {
-    let (a, b) = s.split_once('-').unwrap_or((s, s));
-    let n = |x: &str| {
-        x.trim()
-            .parse::<u32>()
-            .ok()
-            .filter(|n| n.is_power_of_two() && (4..=128).contains(n))
-            .ok_or_else(|| format!("{x:?} is not a wave size (4 to 128, a power of two)"))
-    };
-    let (a, b) = (n(a)?, n(b)?);
-    if a > b {
-        return Err(format!("{a} is more than {b}"));
-    }
-    Ok((a, b))
 }
 
 /// Paths given on the command line, or the configured game + test titles.

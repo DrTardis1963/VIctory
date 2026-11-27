@@ -66,7 +66,7 @@ fn scalar_name(code: u8) -> String {
     }
 }
 
-pub(super) fn const_name(code: u8) -> String {
+fn const_name(code: u8) -> String {
     match code {
         128..=192 => (i32::from(code) - 128).to_string(),
         193..=208 => (192 - i32::from(code)).to_string(),
@@ -151,7 +151,11 @@ fn operands(inst: &Instruction, name: &str, fields: &Fields) -> String {
                     (_, 0) => soffset.to_string(),
                     _ => format!("{soffset} offset:0x{:06x}", offset & 0x1F_FFFF),
                 };
-                out = format!("{data}, {base}, {off}");
+                out = match name {
+                    // The data is a counter or the wave ID; these have no address.
+                    "s_memtime" | "s_memrealtime" | "s_get_waveid_in_workgroup" => data.to_string(),
+                    _ => format!("{data}, {base}, {off}"),
+                };
             }
             flags(&mut out, cache, false);
         }
@@ -205,7 +209,12 @@ fn operands(inst: &Instruction, name: &str, fields: &Fields) -> String {
             cache,
         } => {
             if let Some(data) = data {
-                out = format!("{data}, {addr}, {rsrc}, {soffset}");
+                // An LDS load returns its data to LDS, so vdata is unused.
+                out = if *lds && name.contains("_load_") {
+                    format!("{addr}, {rsrc}, {soffset}")
+                } else {
+                    format!("{data}, {addr}, {rsrc}, {soffset}")
+                };
                 if *idxen {
                     out.push_str(" idxen");
                 }
@@ -299,7 +308,11 @@ fn operands(inst: &Instruction, name: &str, fields: &Fields) -> String {
                 dst.iter()
                     .map(|o| o.to_string())
                     .chain([addr])
-                    .chain(data.iter().chain(saddr).map(|o| o.to_string())),
+                    .chain(data.iter().map(|o| o.to_string()))
+                    .chain(saddr.map(|o| match o {
+                        Operand::Scalar { code: NULL, .. } => "off".into(),
+                        o => o.to_string(),
+                    })),
             );
             if *offset != 0 {
                 let _ = write!(out, " inst_offset:{offset}");
@@ -320,7 +333,7 @@ fn operands(inst: &Instruction, name: &str, fields: &Fields) -> String {
                 0..=7 => format!("mrt{target}"),
                 8 => "mrtz".into(),
                 9 => "null".into(),
-                12..=16 => format!("pos{}", target - 12),
+                12..=15 => format!("pos{}", target - 12),
                 20 => "prim".into(),
                 32..=63 => format!("param{}", target - 32),
                 _ => format!("<target {target}>"),
@@ -369,7 +382,7 @@ fn flags(out: &mut String, cache: &Cache, dlc_first: bool) {
 }
 
 fn label(inst: &Instruction, imm: u16) -> String {
-    let target = inst.offset as i64 + 4 * inst.words().len() as i64 + 4 * i64::from(imm as i16);
+    let target = inst.offset as i64 + 4 * inst.words.len() as i64 + 4 * i64::from(imm as i16);
     format!("label_{target:04X}")
 }
 
@@ -428,7 +441,7 @@ fn sendmsg(imm: u16) -> String {
     }
 }
 
-pub(super) fn buffer_format(format: u8) -> String {
+fn buffer_format(format: u8) -> String {
     const NAMES: [&str; 78] = [
         "INVALID",
         "8_UNORM",
@@ -590,6 +603,18 @@ fn valu(name: &str, v: &Valu, encoding: Encoding) -> String {
             suffix("bound_ctrl:1");
         }
     }
+    if encoding == Encoding::Vop3p && !mix {
+        // `-src` above covers a source negated in both halves; LLVM syntax
+        // for the one-sided rest.
+        let n = v.src.len();
+        for (field, only) in [("neg_lo", v.neg & !v.neg_hi), ("neg_hi", v.neg_hi & !v.neg)] {
+            if (0..n).any(|i| bit(only, i)) {
+                let bits: Vec<String> =
+                    (0..n).map(|i| u8::from(bit(only, i)).to_string()).collect();
+                suffix(&format!("{field}:[{}]", bits.join(",")));
+            }
+        }
+    }
     if let Some(sdwa) = v.sdwa {
         if v.clamp {
             suffix("clamp");
@@ -610,7 +635,7 @@ fn valu(name: &str, v: &Valu, encoding: Encoding) -> String {
                 unused[usize::from(sdwa.dst_unused & 3)]
             ));
         }
-        for (i, s) in sdwa.src_sel.iter().enumerate() {
+        for (i, s) in sdwa.src_sel.iter().take(v.src.len()).enumerate() {
             if *s != 6 {
                 suffix(&format!("src{i}_sel:{}", sel[usize::from(s & 7)]));
             }
@@ -841,11 +866,45 @@ mod tests {
     }
 
     #[test]
-    fn export_target_16_is_pos4() {
-        // llvm-mc -mcpu=gfx1010: exp pos4 v4, v3, v2, v1
+    fn one_sided_packed_negation_is_printed() {
+        // Encodings from llvm-mc -mcpu=gfx1030. A source negated in both
+        // halves keeps the `-` prefix; one-sided bits get LLVM's suffixes.
+        let got = [
+            one(&[0xCC0F_4001, 0x1A02_0702], true),
+            one(&[0xCC0F_4001, 0x3A02_0702], true),
+            one(&[0xCC0F_4201, 0x1A02_0702], true),
+            one(&[0xCC0F_4101, 0x7A02_0702], true),
+        ];
         assert_eq!(
-            one(&[0xF800_010F, 0x0102_0304], true),
-            "exp pos4, v4, v3, v2, v1"
+            got,
+            [
+                "v_pk_add_f16 v1, v2, v3",
+                "v_pk_add_f16 v1, v2, v3 neg_lo:[1,0]",
+                "v_pk_add_f16 v1, v2, v3 neg_hi:[0,1]",
+                "v_pk_add_f16 v1, -v2, v3 neg_lo:[0,1]",
+            ]
+        );
+    }
+
+    #[test]
+    fn fields_the_instruction_lacks_are_not_printed() {
+        // Encodings from llvm-mc -mcpu=gfx1030; s_get_waveid_in_workgroup is gfx1010 only.
+        let got = [
+            one(&[0xF490_0500, 0], true),
+            one(&[0xF4A8_0140, 0], true),
+            one(&[0xDC30_8000, 0x007D_0002], true),
+            one(&[0xE031_1000, 0x0001_0001], true),
+            one(&[0x7E02_02F9, 0x0005_0602], true),
+        ];
+        assert_eq!(
+            got,
+            [
+                "s_memtime s[20:21]",
+                "s_get_waveid_in_workgroup s5",
+                "global_load_dword v0, v[2:3], off",
+                "buffer_load_dword v1, s[4:7], s0 offen lds",
+                "v_mov_b32 v1, v2 src0_sel:WORD_1",
+            ]
         );
     }
 
