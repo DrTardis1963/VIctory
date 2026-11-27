@@ -16,6 +16,14 @@ fn files(dir: &Path, out: &mut Vec<PathBuf>) {
 }
 
 fn main() {
+    // This crate's test executables export the Agility SDK symbols (from
+    // victory-shader), so on Windows 10 its GPU tests get the SM 6.6 runtime
+    // in `.\D3D12\` beside them.
+    if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
+        for arg in ["/INCLUDE:D3D12SDKVersion", "/INCLUDE:D3D12SDKPath", "/EXPORT:D3D12SDKVersion,DATA", "/EXPORT:D3D12SDKPath,DATA"] {
+            println!("cargo:rustc-link-arg={arg}");
+        }
+    }
     let here = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").unwrap_or_default());
     let crates = here.join("..");
     let root = crates.join("..");

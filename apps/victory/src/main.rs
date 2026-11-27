@@ -3,6 +3,9 @@
 //! Every command reads the user's own files and writes only to stdout or to
 //! the user's cache directory (outside the repository).
 
+// The fork's lint debt (not ours), allowed in one place; see victory-gpu.
+#![allow(clippy::manual_is_multiple_of, clippy::large_enum_variant)]
+
 mod census;
 mod inspect;
 #[cfg(all(windows, feature = "diagnostics"))]
@@ -12,27 +15,6 @@ mod shader;
 mod translate;
 #[cfg(windows)]
 mod warm;
-
-/// (Local test patch, not the fork's) Opts into the D3D12 Agility SDK beside
-/// the executable (`.\D3D12\`): Windows 10's own runtime gives no SM 6.6 device.
-#[cfg(all(target_os = "windows", target_env = "msvc"))]
-mod d3d12_agility {
-    #[repr(transparent)]
-    pub struct SyncPtr(*const u8);
-
-    // SAFETY: `D3D12SDKPath` points to a `'static` NUL-terminated ASCII string.
-    unsafe impl Sync for SyncPtr {}
-
-    #[used]
-    #[allow(non_upper_case_globals)]
-    #[unsafe(no_mangle)]
-    pub static D3D12SDKVersion: u32 = 614;
-
-    #[used]
-    #[allow(non_upper_case_globals)]
-    #[unsafe(no_mangle)]
-    pub static D3D12SDKPath: SyncPtr = SyncPtr(c".\\D3D12\\".as_ptr().cast());
-}
 
 use std::path::PathBuf;
 

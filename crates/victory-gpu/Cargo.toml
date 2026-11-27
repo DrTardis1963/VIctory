@@ -26,6 +26,16 @@ tempfile.workspace = true
 # Debugging switches (frame capture, the host debug layer, per-draw data).
 diagnostics = []
 
+# The recorder tests are empty without `diagnostics`; built empty, they link
+# no victory-shader and the Agility exports of build.rs go unresolved.
+[[test]]
+name = "replay"
+required-features = ["diagnostics"]
+
+[[test]]
+name = "replay_big"
+required-features = ["diagnostics"]
+
 [lints]
 workspace = true
 

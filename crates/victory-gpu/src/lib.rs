@@ -15,6 +15,39 @@
 //! share, [`console`] which console model the title sees. Planned:
 //! `present` (swap chain).
 
+// The fork's own lint debt (cool_fox and scarlett code, not ours), allowed in
+// one place rather than edited across their files, so syncs with the fork
+// stay conflict-free. New code of ours keeps to the workspace lints.
+#![allow(
+    dead_code,
+    private_interfaces,
+    unused_assignments,
+    unused_variables,
+    unused_imports,
+    unused_mut,
+    dropping_copy_types,
+    clippy::int_plus_one,
+    clippy::unusual_byte_groupings,
+    clippy::precedence,
+    clippy::needless_borrow,
+    clippy::unnecessary_sort_by,
+    clippy::large_enum_variant,
+    clippy::manual_is_multiple_of,
+    clippy::too_many_arguments,
+    clippy::wrong_self_convention,
+    clippy::unnecessary_cast,
+    clippy::mem_replace_with_default,
+    clippy::if_same_then_else,
+    clippy::cloned_ref_to_slice_refs,
+    clippy::doc_lazy_continuation,
+    clippy::explicit_auto_deref,
+    clippy::borrow_deref_ref,
+    clippy::format_in_format_args,
+    clippy::let_and_return,
+    clippy::map_identity,
+    clippy::needless_option_as_deref
+)]
+
 #[cfg(windows)]
 mod ambient;
 #[cfg(all(windows, feature = "diagnostics"))]

@@ -11,6 +11,16 @@
 //! Resolution order for every import: an implementation in [`modules`],
 //! then the host if [`HostPolicy`] allows that DLL, then `Missing`.
 
+// The fork's lint debt (not ours), allowed in one place; see victory-gpu.
+#![allow(
+    unused_mut,
+    dead_code,
+    clippy::precedence,
+    clippy::manual_is_multiple_of,
+    clippy::question_mark,
+    clippy::missing_spin_loop
+)]
+
 mod host;
 #[cfg(windows)]
 pub mod readback;

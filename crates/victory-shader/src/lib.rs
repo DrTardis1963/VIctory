@@ -18,6 +18,30 @@ pub mod resource;
 pub mod spill;
 pub mod structure;
 
+/// Opts into the D3D12 Agility SDK beside the executable (`.\D3D12\`), as our
+/// earlier bases do: Windows 10's own runtime gives no SM 6.6 device, refuses
+/// root signatures that index the descriptor heap directly, and the title
+/// stops 25 s in. Exported by the executable (apps/victory/build.rs) and by
+/// this crate's and victory-gpu's test executables (their build.rs).
+#[cfg(all(target_os = "windows", target_env = "msvc"))]
+pub mod d3d12_agility {
+    #[repr(transparent)]
+    pub struct SyncPtr(*const u8);
+
+    // SAFETY: `D3D12SDKPath` points to a `'static` NUL-terminated ASCII string.
+    unsafe impl Sync for SyncPtr {}
+
+    #[used]
+    #[allow(non_upper_case_globals)]
+    #[unsafe(no_mangle)]
+    pub static D3D12SDKVersion: u32 = 614;
+
+    #[used]
+    #[allow(non_upper_case_globals)]
+    #[unsafe(no_mangle)]
+    pub static D3D12SDKPath: SyncPtr = SyncPtr(c".\\D3D12\\".as_ptr().cast());
+}
+
 pub use dxbc::{Container, FourCC, Part};
 pub use dxil::{DxilProgram, ShaderKind, XboxExtras};
 pub use native::{

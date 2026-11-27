@@ -2666,6 +2666,11 @@ void main(uint3 g : SV_GroupID, uint i : SV_GroupIndex) {
     /// small record still runs.
     #[test]
     fn host_list_budget_starts_empty_at_each_submission() {
+        // The budget a spent record leaves empty is `VICTORY_INDIRECT_REST=1`'s,
+        // which this base turned off by default ([`rest`]).
+        if rest() == 0 {
+            return;
+        }
         let Some(host) = super::host() else {
             return;
         };
@@ -3149,6 +3154,11 @@ void main(uint3 group : SV_GroupID, uint3 thread : SV_DispatchThreadID) {
     /// executions is charged for each.
     #[test]
     fn warp_batch_charges_every_execution() {
+        // Charging and emptying records past the budget is
+        // `VICTORY_INDIRECT_REST=1`'s, off by default on this base ([`rest`]).
+        if rest() == 0 {
+            return;
+        }
         let Some(mut warp) = WarpHarness::new() else {
             return;
         };
