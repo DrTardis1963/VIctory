@@ -414,6 +414,17 @@ pub fn run(
         });
         let failed: BTreeMap<&str, usize> =
             t.failed.iter().map(|(r, (n, _))| (r.as_str(), *n)).collect();
+        // This line sets the host by environment (VICTORY_HOST_MAX_WAVE,
+        // VICTORY_VIEW_LIMIT, VICTORY_HOST_RDNA), not --host-lanes.
+        let [max_wave, view_limit, raw_views, rdna] = emit::host_settings();
+        let host = serde_json::json!({
+            "max_wave": max_wave,
+            "lanes": null,
+            "rovs": null,
+            "view_limit": view_limit,
+            "raw_views": raw_views,
+            "rdna": rdna,
+        });
         let report = serde_json::json!({
             "version": 1,
             "paths": paths,
@@ -421,12 +432,9 @@ pub fn run(
             "pipelines": pipelines,
             // What the translation targeted: runs made for different hosts
             // differ for that reason alone (corpus-diff refuses to mix them).
-            "host": {
-                "max_wave": emit::host_max_wave(),
-                "lanes": host_lanes.map(|(min, max)| format!("{min}-{max}")),
-                "rovs": emit::host_rovs(),
-                "view_limit": emit::view_heap_limit(),
-            },
+            // This line sets the host by environment (VICTORY_HOST_MAX_WAVE,
+            // VICTORY_VIEW_LIMIT, VICTORY_HOST_RDNA), not --host-lanes.
+            "host": host,
             "summary": summary,
             "failed": failed,
             "programs": corpus_programs(&t.outcomes),
