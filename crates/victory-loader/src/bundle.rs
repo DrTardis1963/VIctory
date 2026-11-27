@@ -172,10 +172,14 @@ pub(crate) fn write(dir: &std::path::Path, crash: &Crash) -> Option<std::path::P
     None
 }
 
-/// The last HLE calls; a hook point until the call trace exists.
+/// HLE calls kept for a bundle.
+#[cfg(windows)]
+const HLE_CALLS: usize = 64;
+
+/// The last HLE calls, from the call trace's ring.
 #[cfg(windows)]
 fn hle_calls() -> String {
-    "  (no HLE call trace in this build)\n".into()
+    crate::trace::recent_lines(HLE_CALLS)
 }
 
 /// The start of the function holding `pc`, by its image's unwind data.
@@ -305,6 +309,28 @@ mod tests {
         crate::report_crashes();
         // SAFETY: installs a filter that only reports and exits.
         unsafe { SetUnhandledExceptionFilter(Some(title_filter)) };
+        // Two HLE calls for the bundle's trace section (the parent turns
+        // the ring on); the second never returns.
+        extern "system" fn answer(n: u64) -> u64 {
+            n + 1
+        }
+        assert!(crate::trace::wanted(crate::Provenance::Hle, "Answer"));
+        let stub = crate::trace::tests::traced("Answer", answer as *const () as usize);
+        // SAFETY: the stub forwards to `answer`, which has this signature.
+        let call: extern "system" fn(u64) -> u64 = unsafe { std::mem::transmute(stub) };
+        assert_eq!(call(41), 42);
+        extern "system" fn fault(_: u64) -> u64 {
+            // SAFETY: none: it reads address 0x10, which is never mapped, so
+            // the read faults before anything else happens.
+            unsafe {
+                std::arch::asm!("mov {x}, qword ptr [{p}]", p = in(reg) 0x10usize, x = out(reg) _);
+            }
+            0
+        }
+        let stub = crate::trace::tests::traced("Fault", fault as *const () as usize);
+        // SAFETY: the stub forwards to `fault`, which has this signature.
+        let call: extern "system" fn(u64) -> u64 = unsafe { std::mem::transmute(stub) };
+        call(7);
         // SAFETY: none: it reads address 0x10, which is never mapped, so the
         // read faults before anything else happens.
         unsafe {
@@ -320,6 +346,7 @@ mod tests {
         let out = std::process::Command::new(&exe)
             .args(["--exact", "bundle::tests::bundle_child", "--nocapture"])
             .env("VICTORY_BUNDLE_DIR", dir.path())
+            .env(crate::trace::TRACE_ENV, "ring")
             .output()
             .unwrap();
         assert_eq!(out.status.code(), Some(0xC0DE), "{out:?}");
@@ -368,6 +395,21 @@ mod tests {
                 "{section}"
             );
         }
+        // The last HLE calls: one that returned, and the one that faulted.
+        let calls = bundle.section("hle calls");
+        let answer = calls.iter().find(|l| l.contains("test.dll!Answer"));
+        let answer = answer.unwrap_or_else(|| panic!("{calls:?}"));
+        assert!(
+            answer.contains("args=[0x29,") && answer.contains("ret=0x2a"),
+            "{answer}"
+        );
+        let last = calls.last().unwrap();
+        assert!(
+            last.contains("test.dll!Fault") && last.contains("not returned"),
+            "{last}"
+        );
+        // The stack goes through the traced call, back to the test.
+        assert!(bundle.section("report").len() > 4, "{report}");
         // The crash log names the bundle.
         let log = std::fs::read_to_string(dir.path().join("crashes.log")).unwrap();
         assert!(
