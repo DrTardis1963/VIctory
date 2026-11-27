@@ -74,13 +74,21 @@ struct Tally {
     /// With `--list`: one line per program and outcome.
     list: bool,
     lines: Vec<String>,
+    /// With `--json`: (program label, outcome) for every outcome recorded.
+    json: bool,
+    outcomes: Vec<(String, String)>,
 }
 
 impl Tally {
     fn fail(&mut self, reason: String, example: impl FnOnce() -> String) {
-        if self.list {
+        if self.list || self.json {
             let e = example();
-            self.lines.push(format!("{e}  {reason}"));
+            if self.list {
+                self.lines.push(format!("{e}  {reason}"));
+            }
+            if self.json {
+                self.outcomes.push((e.clone(), reason.clone()));
+            }
             self.failed.entry(reason).or_insert((0, e)).0 += 1;
             return;
         }
@@ -88,6 +96,13 @@ impl Tally {
             .entry(reason)
             .or_insert_with(|| (0, example()))
             .0 += 1;
+    }
+
+    /// Records a program's outcome that is not a failure, with `--json`.
+    fn note(&mut self, label: impl FnOnce() -> String, outcome: &str) {
+        if self.json {
+            self.outcomes.push((label(), outcome.to_owned()));
+        }
     }
 
     fn merge(&mut self, other: Tally) {
@@ -134,6 +149,7 @@ impl Tally {
             *self.exports.entry(k).or_default() += n;
         }
         self.lines.extend(other.lines);
+        self.outcomes.extend(other.outcomes);
         for (reason, (n, example)) in other.failed {
             self.failed.entry(reason).or_insert((0, example)).0 += n;
         }
@@ -239,12 +255,16 @@ pub fn run(
     pipelines: bool,
     list: bool,
     jobs: Option<usize>,
+    json: Option<PathBuf>,
 ) -> Result<()> {
     // Dumped shaders and validator reports are game-derived (rule #1).
     if let Some(dir) = std::env::var_os("VICTORY_EMIT_DUMP") {
         victory_core::ensure_outside_repo(Path::new(&dir))?;
     }
     let paths = crate::default_paths(paths)?;
+    if let Some(file) = &json {
+        victory_core::ensure_outside_repo(file)?;
+    }
     // `VICTORY_HOST_MAX_WAVE=32`: translate as for a host whose waves have
     // at most 32 lanes (as the runtime does on such a card).
     if let Some(n) = std::env::var("VICTORY_HOST_MAX_WAVE").ok().and_then(|v| v.parse().ok()) {
@@ -293,6 +313,7 @@ pub fn run(
                     s.spawn(|| {
                         let mut t = Tally {
                             list,
+                            json: json.is_some(),
                             ..Tally::default()
                         };
                         let mut checks = Checks {
@@ -379,6 +400,31 @@ pub fn run(
             };
             println!("pair {v} + {p}: {made}");
         }
+    }
+    if let Some(file) = &json {
+        let summary = serde_json::json!({
+            "containers": t.containers,
+            "duplicates": t.duplicates,
+            "programs": t.programs,
+            "translated": t.translated,
+            // programs, emitted, validated, pipelines
+            "graphics": [t.emit_programs, t.emitted, t.validated, t.pipelines],
+            "compute": [t.cs_programs, t.cs_emitted, t.cs_validated, t.cs_pipelines],
+            "mesh": [t.ms_programs, t.ms_emitted, t.ms_validated, t.ms_pipelines],
+        });
+        let failed: BTreeMap<&str, usize> =
+            t.failed.iter().map(|(r, (n, _))| (r.as_str(), *n)).collect();
+        let report = serde_json::json!({
+            "version": 1,
+            "paths": paths,
+            "validate": validate,
+            "pipelines": pipelines,
+            "summary": summary,
+            "failed": failed,
+            "programs": corpus_programs(&t.outcomes),
+        });
+        std::fs::write(file, serde_json::to_string_pretty(&report)?)?;
+        println!("json         {}", file.display());
     }
     let mut lines = t.lines;
     lines.sort();
@@ -518,6 +564,7 @@ fn translate(
         if t.list {
             t.lines.push(format!("{}  duplicate", example()));
         }
+        t.note(example, "duplicate");
         return;
     }
     let programs = match native_programs(dxil) {
@@ -609,6 +656,7 @@ fn translate_programs(container: &Container, programs: Vec<NativeProgram>, examp
                         Ok(shader) => {
                             census_line(&label(), &p, &program, &shader);
                             *counter(t, p.stage, 1) += 1;
+                            t.note(label, "emitted");
                             check(shader, t, checks, label);
                         }
                         Err(ShaderError::Unsupported { offset, what }) => t
@@ -717,6 +765,7 @@ fn check(
                 if t.list {
                     t.lines.push(format!("{}  pipeline created", label()));
                 }
+                t.note(&label, "pipeline created");
             }
             Err(e) => t.fail(format!("pipeline: {e}"), &label),
         }
@@ -733,6 +782,7 @@ fn check(
             if t.list {
                 t.lines.push(format!("{}  validated", label()));
             }
+            t.note(&label, "validated");
         }
         Err(text) => {
             let first = text
@@ -761,6 +811,70 @@ fn check(
             t.fail(format!("validator: {first}"), label);
         }
     }
+}
+
+/// One entry per program for `--json`, keyed by its label from the
+/// container's hash on (`#<hash> ~<code> <stage>`, the same on every
+/// machine) without an offset. A program is `ok` when it was emitted and no
+/// check failed, `duplicate` when its code was translated under another
+/// container, else `fail` with its first reason.
+fn corpus_programs(outcomes: &[(String, String)]) -> Vec<serde_json::Value> {
+    #[derive(Default)]
+    struct Program {
+        label: String,
+        failures: Vec<String>,
+        emitted: bool,
+        validated: bool,
+        pipeline: bool,
+        duplicate: bool,
+    }
+    let mut programs: BTreeMap<&str, Program> = BTreeMap::new();
+    for (label, outcome) in outcomes {
+        let p = programs.entry(corpus_key(label)).or_default();
+        if p.label.is_empty() {
+            p.label.clone_from(label);
+        }
+        match outcome.as_str() {
+            "emitted" => p.emitted = true,
+            "validated" => p.validated = true,
+            "pipeline created" => p.pipeline = true,
+            "duplicate" => p.duplicate = true,
+            reason => p.failures.push(reason.to_owned()),
+        }
+    }
+    programs
+        .into_iter()
+        .map(|(key, p)| {
+            let stage = key
+                .rsplit(' ')
+                .next()
+                .filter(|s| !s.starts_with(['~', '#']))
+                .unwrap_or("-");
+            let status = match () {
+                () if !p.failures.is_empty() => "fail",
+                () if p.emitted => "ok",
+                () if p.duplicate => "duplicate",
+                () => "fail",
+            };
+            serde_json::json!({
+                "key": key,
+                "stage": stage,
+                "status": status,
+                "reason": p.failures.first(),
+                "emitted": p.emitted,
+                "validated": p.validated,
+                "pipeline": p.pipeline,
+                "label": p.label,
+            })
+        })
+        .collect()
+}
+
+/// A program label's machine-independent part: from ` #<hash>` on, without
+/// ` at 0x<offset>`; the whole label when it has no hash yet.
+fn corpus_key(label: &str) -> &str {
+    let key = label.find(" #").map_or(label, |i| &label[i + 1..]);
+    key.find(" at 0x").map_or(key, |i| &key[..i])
 }
 
 /// Emission counts of `stage`'s kind: 0 programs, 1 emitted, 2 validated,

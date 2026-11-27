@@ -1564,6 +1564,8 @@ mod tests {
                 (blocks * block) as f64 / secs / 1e6,
                 secs * 1e9 / blocks as f64
             );
+            // For `cargo xtask bench`.
+            println!("BENCH bcpack/bc{bc} {:.3} ns/block", secs * 1e9 / blocks as f64);
         }
     }
 
