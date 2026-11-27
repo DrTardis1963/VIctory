@@ -16,6 +16,8 @@ const MAX_ENCODED_RUN: usize = 512;
 
 pub(crate) const ALLOWED_EXTENSIONS: &[&str] = &[
     "rs", "toml", "md", "txt", "lock", "yml", "yaml", "json", "hlsl", "hlsli", "ps1", "cmd", "sh",
+    // The asset-guard write hook (.claude/hooks/asset_guard.py).
+    "py",
 ];
 const ALLOWED_NAMES: &[&str] = &[
     ".gitignore",
