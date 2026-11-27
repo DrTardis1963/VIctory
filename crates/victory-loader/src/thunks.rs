@@ -169,9 +169,27 @@ pub(crate) fn save_ledger() {
     let Some(called) = unimplemented_calls() else {
         return;
     };
-    if let Err(error) = crate::publish::write_if_changed(file, ledger_toml(&called).as_bytes()) {
+    if let Err(error) = write_staged(file, ledger_toml(&called).as_bytes()) {
         tracing::warn!(file = %file.display(), %error, "saving the unimplemented-import ledger");
     }
+}
+
+/// Writes `bytes` to `path` through a staging file of this call's own,
+/// renamed into place; nothing if the file already holds them.
+fn write_staged(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    if std::fs::read(path).is_ok_and(|existing| existing == bytes) {
+        return Ok(());
+    }
+    let staging = path.with_extension(format!(
+        "{}.{}.tmp",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::write(&staging, bytes)?;
+    std::fs::rename(&staging, path).inspect_err(|_| {
+        let _ = std::fs::remove_file(&staging);
+    })
 }
 
 /// The ledger's text: one `[[import]]` table per entry.

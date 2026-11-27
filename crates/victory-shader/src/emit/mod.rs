@@ -85,6 +85,8 @@
 
 mod bitcode;
 mod container;
+#[cfg(test)]
+mod coverage;
 #[cfg(all(test, windows))]
 mod cube_lod_tests;
 #[cfg(all(test, windows))]
