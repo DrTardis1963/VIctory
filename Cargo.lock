@@ -730,6 +730,7 @@ dependencies = [
  "blake3",
  "tempfile",
  "thiserror",
+ "toml",
  "tracing",
  "victory-core",
  "victory-pe",

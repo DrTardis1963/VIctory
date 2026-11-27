@@ -99,6 +99,8 @@ extern "C" fn detach_all() {
         "process exit: ending other threads, detaching title images"
     );
     EXITING.store(true, Ordering::SeqCst);
+    // While no thread has been ended yet, so its lock and the heap are free.
+    crate::thunks::save_ledger();
     // As on Windows, a lock a thread held when it ended stays taken; detach
     // code that waits for one would hang the exit. The watchdog runs before
     // the other threads end: a thread that ends can hold the heap lock or

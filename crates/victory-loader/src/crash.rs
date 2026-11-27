@@ -55,7 +55,7 @@ pub fn log_crashes_to(file: std::path::PathBuf) {
             append_to_log(&format!(
                 "VIctory: panic on thread {:?}: {info}\n{}",
                 std::thread::current().name().unwrap_or("?"),
-                title_output()
+                report_end()
             ));
         }));
     }
@@ -65,13 +65,14 @@ pub fn log_crashes_to(file: std::path::PathBuf) {
 /// log, with the title's last debug output, and prints it.
 pub fn log_crash(text: &str) {
     let text = format!("{text}
-{}", title_output());
+{}", report_end());
     eprint!("{text}");
     append_to_log(&text);
 }
 
 fn append_to_log(text: &str) {
     use std::io::Write;
+    crate::thunks::save_ledger();
     let Some(file) = LOG.get() else { return };
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -106,6 +107,12 @@ fn title_output() -> String {
         return String::new();
     };
     said.iter().map(|l| format!("  title said: {l}\n")).collect()
+}
+
+/// What ends a crash report: the unimplemented imports called so far, then
+/// the title's last debug output.
+fn report_end() -> String {
+    format!("{}{}", crate::thunks::report_lines(), title_output())
 }
 
 /// Installs the handlers; call once before running title code.
@@ -620,7 +627,7 @@ unsafe fn report(what: &str, info: *const EXCEPTION_POINTERS, to_file: bool) {
         line(format!("  #{i:<2} {}", locate(pc as usize)));
     }
     if to_file {
-        let said = title_output();
+        let said = report_end();
         eprint!("{said}");
         text.push_str(&said);
         append_to_log(&text);
