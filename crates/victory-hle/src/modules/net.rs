@@ -35,6 +35,8 @@ const WSAEADDRNOTAVAIL: i32 = 10049;
 const WSAENETUNREACH: i32 = 10051;
 const WSASERVICE_NOT_FOUND: i32 = 10108;
 const WSAHOST_NOT_FOUND: i32 = 11001;
+const ERROR_NETWORK_UNREACHABLE: u32 = 1231;
+const INVALID_HANDLE_VALUE: Handle = !0usize as Handle;
 const ERROR_WINHTTP_CANNOT_CONNECT: u32 = 12029;
 const ERROR_WINHTTP_AUTODETECTION_FAILED: u32 = 12180;
 const AF_INET: u16 = 2;
@@ -834,6 +836,89 @@ pub extern "system" fn WinHttpGetProxySettingsEx(
     no_auto_proxy()
 }
 
+// ICMP from the title is blocked as well (our spine's 174692d5): `iphlpapi.dll`
+// would otherwise be the host's and send echo requests anywhere.
+fn icmp_blocked() -> u32 {
+    once("ICMP egress blocked", "iphlpapi".into());
+    // SAFETY: sets thread-local Win32 error with no pointer dereference.
+    unsafe { SetLastError(ERROR_NETWORK_UNREACHABLE) };
+    0
+}
+
+pub extern "system" fn IcmpCreateFile() -> Handle {
+    once("ICMP handle blocked", "iphlpapi".into());
+    // SAFETY: sets thread-local Win32 error with no pointer dereference.
+    unsafe { SetLastError(ERROR_NETWORK_UNREACHABLE) };
+    INVALID_HANDLE_VALUE
+}
+
+pub extern "system" fn Icmp6CreateFile() -> Handle {
+    IcmpCreateFile()
+}
+
+pub extern "system" fn IcmpSendEcho(
+    _icmp_handle: Handle,
+    _destination_address: u32,
+    _request_data: *const c_void,
+    _request_size: u16,
+    _request_options: *const c_void,
+    _reply_buffer: *mut c_void,
+    _reply_size: u32,
+    _timeout: u32,
+) -> u32 {
+    icmp_blocked()
+}
+
+pub extern "system" fn IcmpSendEcho2(
+    _icmp_handle: Handle,
+    _event: Handle,
+    _apc_routine: *const c_void,
+    _apc_context: *const c_void,
+    _destination_address: u32,
+    _request_data: *const c_void,
+    _request_size: u16,
+    _request_options: *const c_void,
+    _reply_buffer: *mut c_void,
+    _reply_size: u32,
+    _timeout: u32,
+) -> u32 {
+    icmp_blocked()
+}
+
+pub extern "system" fn IcmpSendEcho2Ex(
+    _icmp_handle: Handle,
+    _event: Handle,
+    _apc_routine: *const c_void,
+    _apc_context: *const c_void,
+    _source_address: u32,
+    _destination_address: u32,
+    _request_data: *const c_void,
+    _request_size: u16,
+    _request_options: *const c_void,
+    _reply_buffer: *mut c_void,
+    _reply_size: u32,
+    _timeout: u32,
+) -> u32 {
+    icmp_blocked()
+}
+
+pub extern "system" fn Icmp6SendEcho2(
+    _icmp_handle: Handle,
+    _event: Handle,
+    _apc_routine: *const c_void,
+    _apc_context: *const c_void,
+    _source_address: *const c_void,
+    _destination_address: *const c_void,
+    _request_data: *const c_void,
+    _request_size: u16,
+    _request_options: *const c_void,
+    _reply_buffer: *mut c_void,
+    _reply_size: u32,
+    _timeout: u32,
+) -> u32 {
+    icmp_blocked()
+}
+
 /// Winsock imports by ordinal; the Winsock 1.1 numbers are fixed.
 fn ordinal(name: &'static str, f: usize) -> HleExport {
     HleExport { name, address: f }
@@ -842,7 +927,7 @@ fn ordinal(name: &'static str, f: usize) -> HleExport {
 pub(crate) fn module() -> HleModule {
     HleModule {
         name: "net",
-        dlls: &["ws2_32.dll", "winhttp.dll"],
+        dlls: &["ws2_32.dll", "winhttp.dll", "iphlpapi.dll"],
         exports: vec![
             hle_export!(connect),
             hle_export!(WSAConnect),
@@ -875,6 +960,12 @@ pub(crate) fn module() -> HleModule {
             hle_export!(WinHttpGetProxyForUrlEx),
             hle_export!(WinHttpGetProxyForUrlEx2),
             hle_export!(WinHttpGetProxySettingsEx),
+            hle_export!(IcmpCreateFile),
+            hle_export!(Icmp6CreateFile),
+            hle_export!(IcmpSendEcho),
+            hle_export!(IcmpSendEcho2),
+            hle_export!(IcmpSendEcho2Ex),
+            hle_export!(Icmp6SendEcho2),
             ordinal("#2", bind as *const () as usize),
             ordinal("#4", connect as *const () as usize),
             ordinal("#20", sendto as *const () as usize),
