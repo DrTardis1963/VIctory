@@ -578,7 +578,13 @@ pub(crate) mod tests {
     fn calls_of(name: &str) -> Vec<([u64; 5], Option<u64>)> {
         // SAFETY: a plain query of the calling thread.
         let me = unsafe { GetCurrentThreadId() };
-        let sites = known_sites().unwrap();
+        // Waits for the list: tests running in parallel add sites to it.
+        let sites: HashSet<usize> = SITES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .copied()
+            .collect();
         let head = HEAD.load(Ordering::Acquire);
         let events: Vec<Event> = (head.saturating_sub(RING as u64)..head)
             .filter_map(|i| match read(i) {
