@@ -162,9 +162,14 @@ thread_local! {
 
 /// The milliseconds of every frame the pass that uploads textures picked
 /// by index takes before a shader that picks by index has asked for it
-/// (`VICTORY_EARLY_TEXTURES_MS`, 12; 0: never, as before), and the
+/// (`VICTORY_EARLY_TEXTURES_MS`, 40; 0: never, as before), and the
 /// milliseconds it may take just before a draw of the title's decoration
-/// bake (`VICTORY_BAKE_TEXTURES_MS`, 1500; 0: nothing special).
+/// bake (`VICTORY_BAKE_TEXTURES_MS`, 10000; 0: nothing special).
+///
+/// (cool_fox-willy, Neptune-VE) 12 and 1,500 left a face of coloured noise
+/// and one of blocks in the first cutscene (cool_fox runs cf-skin0/1); 40
+/// and 10,000 baked both whole with no slower frames. The test loop's runs
+/// already set 40 and 10,000 by hand.
 ///
 /// The pass ran only from the first world frame on, where it met some
 /// 24,000 slots at once and needed 60-80 frames for them. The title bakes
@@ -179,7 +184,7 @@ fn early_budgets() -> (u64, u64) {
         let ms = |name: &str, default: u64| {
             std::env::var(name).ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(default)
         };
-        (ms("VICTORY_EARLY_TEXTURES_MS", 12), ms("VICTORY_BAKE_TEXTURES_MS", 1500))
+        (ms("VICTORY_EARLY_TEXTURES_MS", 40), ms("VICTORY_BAKE_TEXTURES_MS", 10000))
     })
 }
 

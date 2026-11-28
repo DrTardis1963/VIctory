@@ -151,8 +151,9 @@ All settings are environment variables read at start; `scripts\play-scarlett.ps1
   read through a view in another format follows its source's writes within a list (the base read a stale copy once
   a frame in the title's lighting filter). `VICTORY_LIST_HOLD=1`: a view copied into a new table is held once
   per list, not once per slot.
-- Picture waits: `VICTORY_BAKE_TEXTURES_MS=10000` (the title's character bake waits up to 10 s for its textures;
-  1.5 s by default: faces and skin came out wrong in some runs) and `VICTORY_PIPELINE_WAIT_MS=500` (a draw waits
+- Picture waits: the title's character bake waits up to 10 s for its textures by default
+  (`VICTORY_BAKE_TEXTURES_MS`; at the old 1.5 s faces and skin came out as noise or blocks) and
+  `VICTORY_PIPELINE_WAIT_MS=500` (a draw waits
   for a pipeline still being made instead of being dropped after 20 ms).
 
 ## What was added to cool_fox
