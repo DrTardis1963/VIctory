@@ -100,6 +100,8 @@ pub fn run(
     victory_hle::modules::files::mount_at('G', title_dir);
     let temp = cfg.data_subdir(&format!("{:08X}/temp", title.id))?;
     victory_hle::modules::files::mount_at('T', &temp);
+    // The stand-in pad's keys, which the player can change while it runs.
+    victory_hle::modules::gameinput::binds::use_file(cfg.data_subdir("input")?.join("keys.txt"));
     victory_hle::runtime::set_title(victory_hle::runtime::Title { storage, ..title });
     victory_hle::console::set(match console {
         Console::SeriesX => victory_hle::console::Console::SeriesX,

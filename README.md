@@ -77,8 +77,21 @@ Good to know:
   (`%LOCALAPPDATA%\victory-scarlett\cache` unless you chose another).
 - **The first session still stutters a little** while the graphics driver builds its own pipelines; later
   sessions are smoother.
-- **Controls:** an Xbox controller works. On the keyboard: W A S D move, I J K L camera, Enter = A, Backspace = B,
-  X and Y, Z / C = left / right trigger, Q / E = LB / RB, arrows = D-pad, Esc = Menu, Tab = View.
+- **Controls:** an Xbox controller works, and so do mouse and keyboard (both at once, too).
+  - **Mouse:** click in the game window to grab the mouse: the cursor disappears and moving the mouse turns
+    the camera. Right button = aim (LT), left button = fire (RT), middle = R3, side buttons = LB / RB. The
+    click that grabs it fires nothing. **Left Alt**, or switching to another window, lets the mouse go.
+    `VICTORY_MOUSE_SENSITIVITY` (default 1; 2 turns twice as fast).
+  - **Keyboard, on foot:** W A S D move, Shift or Enter = A, R or Backspace = B, Space or X = X, F or Y = Y,
+    Tab = LB, Q = RB, U / O = LT / RT, Ctrl or Z = L3, C or H = R3, arrows or 1-4 = D-pad (E = right),
+    Esc or P = Menu, V = View, I J K L = camera.
+  - **Driving:** press **G** to switch to the driving keys (and G again to go back): W = accelerate (RT),
+    S = brake (LT), A / D steer, Space = RB, left or right click = LB. The game cannot tell us when you get
+    in a car, so the switch is yours.
+  - **Change the keys** in `keys.txt` in the data folder's `input` folder
+    (`%LOCALAPPDATA%\victory-scarlett\data\input\keys.txt`): it is made on the first run, lists every key
+    name, and the game picks up a saved change within a second. Delete it to get these keys back.
+  - At a low frame rate a quick tap still counts: a press is held until the game has read it.
 - **Do not use `Play-VIctory.cmd`** for this: that is the base's launcher, with Series S and other settings.
 - **Ray tracing** is off by default (the game's own, much slower). To turn it on, start it from PowerShell:
 
