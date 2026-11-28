@@ -4327,18 +4327,26 @@ impl State {
             Role::Resolve => LIGHT,
             Role::Radiance => RADIANCE,
             Role::Air => AIR,
+            // (Port of BvtterFvcker/VIcious-Scarlett 2137d25b, "Whiplash" floor-reflection
+            // fix, GPL-3.0-or-later.) Where the title's reflections are written.
+            Role::Reflect if crate::ambient::reflect_screen() => crate::ambient::REFLECTIONS_SCREEN,
+            Role::Reflect => crate::ambient::REFLECTIONS,
         };
         let image = entry(ResourceType::Uav, at);
         let depth = match role {
             Role::Resolve => entry(ResourceType::Srv, DEPTH),
-            Role::Radiance | Role::Air => image,
+            Role::Radiance | Role::Air | Role::Reflect => image,
         };
         let (Some((of, image)), Some((seen, depth))) = (image, depth) else {
             once!(?role, "no stand-in for the indirect light: other tables");
             return false;
         };
-        // (R32_UINT holding R9G9B9E5; R11G11B10_FLOAT.)
-        let format = if role == Role::Resolve { 42 } else { 26 };
+        // (R32_UINT holding R9G9B9E5; R11G11B10_FLOAT, also for the screen-space reflections.)
+        let format = match role {
+            Role::Reflect if crate::ambient::reflect_screen() => 26,
+            Role::Resolve | Role::Reflect => 42,
+            _ => 26,
+        };
         let volume = of.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
         if of.Format.0 != format || (seen.Width, seen.Height) != (of.Width, of.Height) || volume != (role == Role::Air) {
             once!(?role, format = of.Format.0, "no stand-in for the indirect light: another image");
@@ -5893,6 +5901,16 @@ impl State {
         // back (`crate::indirect`).
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
+            // (Port of VIcious-Scarlett 2137d25b.) The title dispatches its combined
+            // reflections indirectly: the reflection hold follows them here too.
+            if let Some(role) = p.stages.first().and_then(|s| s.shader.ambient)
+                && role == crate::ambient::Role::Reflect
+                && crate::ambient::on()
+                && self.ambient(list, p, role)
+            {
+                self.host_pipeline = 0;
+                self.host_roots[1] = 0;
+            }
         } else {
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
