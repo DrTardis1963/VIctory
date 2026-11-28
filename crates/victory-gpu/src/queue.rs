@@ -4,6 +4,7 @@
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+use crate::gpu_record::QueueOp as Op;
 use crate::object::{self, E_INVALIDARG, HRESULT, Iid, Object, QUEUE, S_OK, Table, This, guid};
 use crate::resource::PAGEABLE_IIDS;
 
@@ -483,6 +484,11 @@ fn value_met(wait: &crate::list::ValueWait) -> bool {
     wait.met() || (crate::host::late() && crate::host::late_met(wait))
 }
 
+/// A queue's kind, for the GPU command recorder.
+pub(crate) fn kind(this: This) -> Option<u32> {
+    (!this.is_null()).then(|| queue(this).kind)
+}
+
 fn queue<'a>(this: This) -> &'a Queue {
     // SAFETY: called from queue methods only.
     unsafe { &*this.cast::<Queue>() }
@@ -569,6 +575,11 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
     if lists.is_null() {
         return;
     }
+    crate::gpu_record::queue(this, || {
+        // SAFETY: the title passes `count` lists.
+        let lists = unsafe { std::slice::from_raw_parts(lists, count as usize) };
+        Op::Submit(lists.iter().map(|&l| l as usize).collect())
+    });
     let _site = crate::hangwatch::at(&"title call: ExecuteCommandLists (queue::execute)");
     // (Fox port C) The title's submit calls, for the frame log.
     #[cfg(windows)]
@@ -724,6 +735,7 @@ extern "system" fn signal(this: This, fence: This, value: u64) -> HRESULT {
     if fence.is_null() {
         return E_INVALIDARG;
     }
+    crate::gpu_record::queue(this, || Op::Signal { fence: fence as usize, value });
     let _called = crate::timeline::span("the title's queue Signal");
     #[cfg(windows)]
     if behind::on() && !this.is_null() {
@@ -756,6 +768,7 @@ extern "system" fn wait(this: This, fence: This, value: u64) -> HRESULT {
     if fence.is_null() {
         return E_INVALIDARG;
     }
+    crate::gpu_record::queue(this, || Op::Wait { fence: fence as usize, value });
     let _called = crate::timeline::span("the title's queue Wait");
     #[cfg(windows)]
     if !this.is_null() {
@@ -951,6 +964,7 @@ extern "system" fn present(
         release_held(forces());
     }
     let frame = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
+    crate::gpu_record::present(frame);
     if frame.is_power_of_two() {
         let (draws, dispatches) = crate::list::take_counts();
         #[cfg(windows)]

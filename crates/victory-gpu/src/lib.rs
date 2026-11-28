@@ -69,6 +69,7 @@ mod draw;
 pub mod dxgi;
 pub mod fence;
 pub mod frame;
+mod gpu_record;
 pub mod chunks; // (fox port A) F21 arena chunk meter (VICTORY_CHUNK_METER)
 #[cfg(windows)] pub mod framelog; // (fox port A) frame log, VICTORY_FRAME_LOG
 pub mod hangwatch; // (fox port A) VICTORY_HANG_WATCH_S
@@ -125,6 +126,7 @@ mod nanmeter;
 #[cfg(windows)]
 mod tiles;
 pub mod signature;
+pub mod stats;
 mod switch;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod ab;

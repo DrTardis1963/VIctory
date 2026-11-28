@@ -12,6 +12,7 @@
 
 use std::mem::offset_of;
 
+use crate::gpu_record::{Cmd as Rec, cmd as rec};
 use crate::object::{
     self, ALLOCATOR, E_INVALIDARG, HRESULT, Iid, LIST, Object, S_OK, Table, This, guid,
 };
@@ -742,6 +743,7 @@ extern "system" fn list_type(this: This) -> u32 {
     unsafe { (*this.cast::<List>()).kind }
 }
 extern "system" fn close(this: This) -> HRESULT {
+    rec(this, || Rec::Close);
     let _called = crate::timeline::span("the title's Close");
     #[cfg(windows)]
     if let Some(host) = host_list(this) {
@@ -753,6 +755,7 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
     if allocator.is_null() {
         return E_INVALIDARG;
     }
+    rec(this, || Rec::Begin { kind: list_type(this) });
     let _called = crate::timeline::span("the title's list Reset");
     // A wait recorded and never submitted goes with the recording.
     VALUE_WAITS
@@ -865,6 +868,7 @@ const UAV_BARRIER: Barrier = Barrier {
 
 /// Returns the console's barrier "actions" (none).
 extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> u32 {
+    rec(this, || Rec::Barrier { count });
     #[cfg(feature = "diagnostics")]
     let _timed = TitleOp::begin(this, crate::host::passtimes::Kind::TitleBarrier, "barrier");
     #[cfg(windows)]
@@ -960,6 +964,7 @@ extern "system" fn copy_buffer_region(
     src_offset: u64,
     len: u64,
 ) {
+    rec(this, || Rec::Copy("buffer"));
     #[cfg(feature = "diagnostics")]
     let _timed = TitleOp::begin(this, crate::host::passtimes::Kind::TitleCopy, "copy_buffer_region");
     #[cfg(windows)]
@@ -994,6 +999,7 @@ fn unlike(dst: This, src: This) -> bool {
 pub(crate) static SELF_COPIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 extern "system" fn copy_resource(this: This, dst: This, src: This) {
+    rec(this, || Rec::Copy("resource"));
     #[cfg(feature = "diagnostics")]
     let _timed = TitleOp::begin(this, crate::host::passtimes::Kind::TitleCopy, "copy_resource");
     #[cfg(windows)]
@@ -1088,6 +1094,7 @@ extern "system" fn copy_texture_region(
     src: *const CopyLocation,
     source_box: *const [u32; 6],
 ) {
+    rec(this, || Rec::Copy("texture"));
     #[cfg(feature = "diagnostics")]
     let _timed = TitleOp::begin(this, crate::host::passtimes::Kind::TitleCopy, "copy_texture_region");
     #[cfg(windows)]
@@ -1375,6 +1382,7 @@ extern "system" fn resolve(
     src_sub: u32,
     format: u32,
 ) {
+    rec(this, || Rec::Resolve);
     #[cfg(feature = "diagnostics")]
     let _timed = TitleOp::begin(this, crate::host::passtimes::Kind::TitleResolve, "resolve");
     #[cfg(windows)]
@@ -1453,6 +1461,7 @@ extern "system" fn clear_rtv(
     count: u32,
     rects: *const Rect,
 ) {
+    rec(this, || Rec::Clear("rtv"));
     #[cfg(feature = "diagnostics")]
     let _timed = TitleOp::begin(this, crate::host::passtimes::Kind::TitleClear, "clear_rtv");
     #[cfg(windows)]
@@ -1505,6 +1514,7 @@ extern "system" fn clear_dsv(
     count: u32,
     rects: *const Rect,
 ) {
+    rec(this, || Rec::Clear("dsv"));
     #[cfg(feature = "diagnostics")]
     let _timed = TitleOp::begin(this, crate::host::passtimes::Kind::TitleClear, "clear_dsv");
     #[cfg(windows)]
@@ -1546,6 +1556,7 @@ extern "system" fn clear_dsv(
 /// `CopyMemoryToMemoryX(destination, source, size, flags)`: GPU addresses
 /// are title memory, copied at submission like buffer copies (if mapped).
 extern "system" fn copy_memory(this: This, dst: u64, src: u64, len: u64, _flags: u32) {
+    rec(this, || Rec::Copy("memory"));
     #[cfg(feature = "diagnostics")]
     let _timed = TitleOp::begin(this, crate::host::passtimes::Kind::TitleCopy, "copy_memory");
     #[cfg(windows)]
@@ -1652,6 +1663,7 @@ static ALLOCATOR_FUNCTIONS: Table<24> = {
 };
 
 extern "system" fn set_pipeline(this: This, pipeline: This) {
+    rec(this, || Rec::Pipeline(pipeline));
     crate::pipeline::bound(pipeline);
     #[cfg(windows)]
     with_state(this, |_, state| state.set_pipeline(pipeline));
@@ -1758,7 +1770,7 @@ extern "system" fn ignored_state(_: This) {}
 /// set on the host list at once. Without a host GPU these do nothing.
 #[cfg(windows)]
 mod state {
-    use super::{This, with_state};
+    use super::{Rec, This, rec, with_state};
     use crate::draw::{IndexView, VertexView};
     use windows::Win32::Foundation::RECT;
     use windows::Win32::Graphics::Direct3D12::D3D12_VIEWPORT;
@@ -1803,12 +1815,15 @@ mod state {
         with_state(this, |_, s| s.set_heaps(items(heaps, count)));
     }
     pub(super) extern "system" fn compute_table(this: This, slot: u32, handle: u64) {
+        rec(this, || Rec::Root);
         with_state(this, |_, s| s.set_table(true, slot, handle));
     }
     pub(super) extern "system" fn graphics_table(this: This, slot: u32, handle: u64) {
+        rec(this, || Rec::Root);
         with_state(this, |_, s| s.set_table(false, slot, handle));
     }
     pub(super) extern "system" fn compute_constant(this: This, slot: u32, value: u32, offset: u32) {
+        rec(this, || Rec::Root);
         with_state(this, |_, s| s.set_constants(true, slot, &[value], offset));
     }
     pub(super) extern "system" fn graphics_constant(
@@ -1817,6 +1832,7 @@ mod state {
         value: u32,
         offset: u32,
     ) {
+        rec(this, || Rec::Root);
         with_state(this, |_, s| s.set_constants(false, slot, &[value], offset));
     }
     pub(super) extern "system" fn compute_constants(
@@ -1826,6 +1842,7 @@ mod state {
         values: *const u32,
         offset: u32,
     ) {
+        rec(this, || Rec::Root);
         with_state(this, |_, s| {
             s.set_constants(true, slot, items(values, count), offset)
         });
@@ -1837,15 +1854,18 @@ mod state {
         values: *const u32,
         offset: u32,
     ) {
+        rec(this, || Rec::Root);
         with_state(this, |_, s| {
             s.set_constants(false, slot, items(values, count), offset)
         });
     }
     /// Root constant buffer, shader resource and unordered access views.
     pub(super) extern "system" fn compute_view(this: This, slot: u32, address: u64) {
+        rec(this, || Rec::Root);
         with_state(this, |_, s| s.set_view(true, slot, address));
     }
     pub(super) extern "system" fn graphics_view(this: This, slot: u32, address: u64) {
+        rec(this, || Rec::Root);
         with_state(this, |_, s| s.set_view(false, slot, address));
     }
     pub(super) extern "system" fn index_buffer(this: This, view: *const IndexView) {
@@ -1884,6 +1904,11 @@ mod state {
         };
         // SAFETY: the title passes a handle or null.
         let depth = unsafe { depth.as_ref() }.copied().unwrap_or(0);
+        rec(this, || Rec::Targets {
+            count: handles.len() as u32,
+            first: handles.first().copied().unwrap_or(0),
+            depth,
+        });
         with_state(this, |list, s| s.set_targets(list, &handles, depth));
     }
     pub(super) extern "system" fn draw(
@@ -1893,18 +1918,21 @@ mod state {
         first: u32,
         first_instance: u32,
     ) {
+        rec(this, || Rec::Draw { vertices, instances });
         super::count_draw();
         with_state(this, |list, s| {
             s.draw(list, vertices, instances, first, first_instance)
         });
     }
     pub(super) extern "system" fn dispatch(this: This, x: u32, y: u32, z: u32) {
+        rec(this, || Rec::Dispatch { x, y, z });
         super::count_dispatch();
         with_state(this, |list, s| s.dispatch(list, x, y, z, 0));
     }
     /// `DispatchMesh(x, y, z)` (the PC method of List6); the title's mesh
     /// programs take `x` groups only.
     pub(super) extern "system" fn dispatch_mesh(this: This, x: u32, y: u32, z: u32) {
+        rec(this, || Rec::DrawMesh { groups: x });
         super::count_draw();
         if y * z != 1 {
             static ONCE: std::sync::Once = std::sync::Once::new();
@@ -1922,6 +1950,7 @@ mod state {
         indirect: u64,
         _payload: u64,
     ) {
+        rec(this, || Rec::DrawMesh { groups: x });
         super::count_draw();
         if indirect != 0 {
             static ONCE: std::sync::Once = std::sync::Once::new();
@@ -1938,6 +1967,7 @@ mod state {
         base: i32,
         first_instance: u32,
     ) {
+        rec(this, || Rec::DrawIndexed { indices, instances });
         super::count_draw();
         with_state(this, |list, s| {
             s.draw_indexed(list, indices, instances, first, base, first_instance)
@@ -2003,6 +2033,7 @@ extern "system" fn execute_indirect(
     count: This,
     count_offset: u64,
 ) {
+    rec(this, || Rec::Indirect { max });
     count_draw();
     let Some((stride, args)) = crate::signature::layout(signature) else {
         return;
@@ -2255,6 +2286,7 @@ extern "system" fn wait_value64(this: This, address: u64, comparison: u32, refer
 /// first, so only their ordering matters: one barrier on every shader
 /// write (the title's buffer barriers order compute passes).
 extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
+    rec(this, || Rec::Barrier { count });
     #[cfg(feature = "diagnostics")]
     let _timed = TitleOp::begin(this, crate::host::passtimes::Kind::TitleBarrier, "barrier_groups");
     // Diagnostics: counted, and left out under `VICTORY_BARRIER_TEST=groups`.
