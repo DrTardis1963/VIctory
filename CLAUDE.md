@@ -29,13 +29,13 @@ This line (`unified/main`, built on `checkpoint/scarlett-3070`: Yaekai's RTX 307
   - A crash writes `crash-<unix>-<pid>.txt` beside `crashes.log`; `victory triage <bundle> [--decompile]` summarises it (`--decompile` needs Ghidra 12.2 with JDK 25+).
   - `VICTORY_HLE_TRACE=<file outside repo>|ring` (+ `VICTORY_HLE_TRACE_HOST=1`) traces HLE calls; `cargo xtask trace summary <file>` / `trace diff <a> <b>`.
 - `crates/victory-testkit`: synthetic PE32+ images for loader tests.
-- Harness: `cargo xtask harness analyze <log> --out <dir>`, `compare <a> <b>`, `prepare --profile tuned-8gb ...`, `shader <hash> --config <toml>`.
+- Harness: `cargo xtask harness analyze <log> --out <dir>`, `compare <a> <b>`, `prepare --profile tuned-8gb ...`, `shader <hash> --config <toml>`. The report's `"cache"` section reads `cache:` log lines (from `victory_gpu::stats`).
+- GPU command recorder: `VICTORY_GPU_RECORD=<dir outside repo>` records per-frame GPU commands and submissions; `cargo xtask gpu-view <dir>` writes an interactive `view.html` beside the recording.
+- Shader testing tools:
+  - `cargo xtask diff-test [--cases N] [--seed S] [--ignored]`: runs GFX10 compute programs on the reference interpreter (`emit/interp.rs`) and on host D3D12/WARP, comparing outputs.
+  - `cargo xtask fuzz [--cases N] [--seed S]`: runs property tests on random GFX10 words and lowered synthetic programs.
+  - `cargo xtask snapshots [--bless]`: compares lowered synthetic shaders' `dxc -dumpbin` DXIL against `crates/victory-shader/tests/snapshots/`.
 - Project agents in `.claude/agents/` and the `victory-run` skill in `.claude/skills/`.
-
-### Not on this line yet
-These xtask commands exist but the code they read or drive is still only on the old spine (it touches `crates/victory-gpu` and `crates/victory-shader`, which the picture-fix work holds):
-- `cargo xtask gpu-view` (needs the `VICTORY_GPU_RECORD` recorder) and the harness `"cache"` section (needs the `cache:` log lines).
-- `cargo xtask diff-test`, `fuzz`, `snapshots` (need the reference interpreter, fuzzer, synthetic shaders and the GFX10 test assembler).
 
 ## Before every commit
 `cargo xtask gate`, or by hand:
