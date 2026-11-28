@@ -91,10 +91,16 @@ mod coverage;
 mod cube_lod_tests;
 #[cfg(all(test, windows))]
 mod diff_tests;
+#[cfg(test)]
+mod fuzz_tests;
 #[cfg(all(test, windows))]
 mod intersect_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
+#[cfg(test)]
+mod interp;
+#[cfg(all(test, windows))]
+mod interp_tests;
 mod idiom;
 mod link;
 mod lower;
@@ -104,6 +110,10 @@ mod permlane_tests;
 mod rect;
 mod sampler;
 mod shader;
+#[cfg(all(test, windows))]
+mod snapshot_tests;
+#[cfg(test)]
+mod synth;
 mod threading;
 #[cfg(windows)]
 pub mod validator;
